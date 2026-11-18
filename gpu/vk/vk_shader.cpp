@@ -37,6 +37,7 @@
 #include "shader_recompiler/ir_opt/scene_tonemap_pass.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/wg_warp_plan.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
@@ -1261,55 +1262,8 @@ bool mesh_wg_warp_on() {
 }
 
 bool can_workgroup_warp32(const Shader::IR::Program& prog) {
-    if (!mesh_wg_warp_on() || prog.stage != Shader::Stage::Mesh) return false;
-    if (prog.workgroup_size[0] != 32 || prog.workgroup_size[1] != 1 || prog.workgroup_size[2] != 1) return false;
-    if (prog.shared_memory_size != 0 || prog.info.uses_cooperative_matrix || prog.info.uses_fswzadd) return false;
-    int depth = 0;
-    for (const auto& node : prog.syntax_list) {
-        using T = Shader::IR::AbstractSyntaxNode::Type;
-        switch (node.type) {
-        case T::If:
-        case T::Loop:
-            depth++;
-            break;
-        case T::EndIf:
-        case T::Repeat:
-            depth--;
-            if (depth < 0) return false;
-            break;
-        case T::Return:
-        case T::Unreachable:
-            if (depth > 0) return false;
-            break;
-        case T::Block:
-            for (const Shader::IR::Inst& inst : *node.data.block) {
-                using Op = Shader::IR::Opcode;
-                switch (inst.GetOpcode()) {
-                case Op::IsbeReadOutput:
-                    return false;
-                case Op::VoteAll:
-                case Op::VoteAny:
-                case Op::VoteEqual:
-                case Op::SubgroupBallot:
-                case Op::ShuffleIndex:
-                case Op::ShuffleUp:
-                case Op::ShuffleDown:
-                case Op::ShuffleButterfly:
-                case Op::QuadBroadcast:
-                case Op::QuadSwap:
-                case Op::SubgroupBarrier:
-                    if (depth > 0) return false;
-                    break;
-                default:
-                    break;
-                }
-            }
-            break;
-        default:
-            break;
-        }
-    }
-    return depth == 0;
+    if (!mesh_wg_warp_on()) return false;
+    return Shader::Backend::SPIRV::AnalyzeWorkgroupWarpPlan(prog, true).eligible;
 }
 
 // (longshot) What the program cache's records are good for, as far as the translation goes: this translator (LONGSHOT_SHADER_STAMP,
@@ -1323,7 +1277,7 @@ uint64_t translator_stamp() {
         for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)d)[i]) * 1099511628211ull;
     };
     if (mesh_wg_warp_on()) {
-        const uint32_t wg_warp = 0x77677739u;
+        const uint32_t wg_warp = 0x7767773au;
         add(&wg_warp, sizeof wg_warp);
     }
     // (what translates shaders, nx2/build.py: a rebuild of anything else keeps the cache. It was the DLL's bytes, and every build
@@ -1699,11 +1653,19 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             rt.previous_stage_stores.mask.set();
             rt.mesh_fallback = fallback;
             rt.mesh_fallback_capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+            rt.mesh_wg_warp32 = fallback && can_workgroup_warp32(task_t->program);
             const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(fallback ? profile_pinned() : profile_graphics(VK_SHADER_STAGE_TASK_BIT_EXT), rt, task_t->program, bindings);
             kept.push_back(spirv);
             Stage st;
             st.nvn_stage = bank_stage(*task);
             st.info = task_t->program.info;
+            if (rt.mesh_wg_warp32) {
+                st.info.uses_subgroup_vote = false;
+                st.info.uses_subgroup_mask = false;
+                st.info.uses_subgroup_invocation_id = false;
+                st.info.uses_subgroup_shuffles = false;
+                st.info.uses_quad_shuffles = false;
+            }
             st.module = make_module(spirv);
             st.vk_stage = fallback ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_TASK_BIT_EXT;
             st.c1 = task->c1;

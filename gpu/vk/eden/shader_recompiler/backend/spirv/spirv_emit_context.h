@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <unordered_map>
+#include <vector>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
@@ -168,6 +170,34 @@ public:
     ~EmitContext();
 
     [[nodiscard]] Id Def(const IR::Value& value);
+
+    Id AddLabel(Id label) {
+        const Id res{Sirit::Module::AddLabel(label)};
+        current_block_label = res;
+        wg_shfl_cached_block = {};
+        wg_shfl_cached_value = {};
+        return res;
+    }
+
+    Id AddLabel() {
+        return AddLabel(OpLabel());
+    }
+
+    Id NullConstant(Id type_id) {
+        if (type_id.value == U1.value) return false_value;
+        if (type_id.value == U32[1].value) return u32_zero_value;
+        if (type_id.value == F32[1].value) return f32_zero_value;
+        const auto [it, inserted] = null_constants.try_emplace(type_id.value, Id{});
+        if (inserted) {
+            it->second = ConstantNull(type_id);
+        }
+        return it->second;
+    }
+
+    Id EndLabelOf(const IR::Block* block, Id fallback) const {
+        const auto it = block_end_labels.find(block);
+        return (it != block_end_labels.end() && Sirit::ValidId(it->second)) ? it->second : fallback;
+    }
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
@@ -413,6 +443,13 @@ public:
     Id mesh_wg_ballot{};
     Id mesh_wg_shfl{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
+    Id current_block_label{};
+    Id linear_exec_id{};
+    Id wg_shfl_cached_block{};
+    Id wg_shfl_cached_value{};
+    std::unordered_map<const IR::Block*, Id> block_end_labels;
+    std::unordered_map<u32, Id> null_constants;
+    std::vector<IR::Inst*> deferred_ir_phis;
     Id mesh_primitive_indices{};
     MeshInfo mesh_info{};
     u32 mesh_threads{};
@@ -482,6 +519,7 @@ private:
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
+    void DefineWorkgroupWarp();
 };
 
 } // namespace Shader::Backend::SPIRV

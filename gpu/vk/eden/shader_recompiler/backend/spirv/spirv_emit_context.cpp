@@ -590,6 +590,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
         DefineRescalingInputPushConstant();
     }
     DefineMesh(program);
+    DefineWorkgroupWarp();
     DefineLocalMemory(program);
     DefineSharedMemory(program);
     DefineSharedMemoryFunctions(program);
@@ -2358,12 +2359,6 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_primitive_count =
         DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_primitive_count, "isbe_primitive_count");
-    if (runtime_info.mesh_wg_warp32) {
-        mesh_wg_ballot = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
-        Name(mesh_wg_ballot, "wg_ballot");
-        mesh_wg_shfl = DefineVariable(*this, TypeArray(U32[1], Const(32U)), std::nullopt, spv::StorageClass::Workgroup);
-        Name(mesh_wg_shfl, "wg_shfl");
-    }
 
     if (mesh_fallback) {
         return;   // (no mesh outputs here: the epilogue writes records)
@@ -2573,6 +2568,19 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     default:
         break;
     }
+}
+
+void EmitContext::DefineWorkgroupWarp() {
+    if (!runtime_info.mesh_wg_warp32) {
+        return;
+    }
+    if (!Sirit::ValidId(mesh_shared_u32)) {
+        mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
+    }
+    mesh_wg_ballot = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+    Name(mesh_wg_ballot, "wg_ballot");
+    mesh_wg_shfl = DefineVariable(*this, TypeArray(U32[1], Const(32U)), std::nullopt, spv::StorageClass::Workgroup);
+    Name(mesh_wg_shfl, "wg_shfl");
 }
 
 } // namespace Shader::Backend::SPIRV

@@ -7368,7 +7368,7 @@ bool fallback_compute_pipelines(Program& p) {
         si.module = st.module;
         si.pName = "main";
         const compute_pin::Uses u = compute_stage_uses(st, p.shared_memory);
-        const bool simd8_mesh = mesa_intel && st.nvn_stage == 7 && !compute_pin::sees_lanes(u);
+        const bool simd8_mesh = mesa_intel && (st.nvn_stage == 7 || st.nvn_stage == 6) && !compute_pin::sees_lanes(u);
         if (simd8_mesh) pin_subgroup_8(si, 32);
         else pin_subgroup(si, 32);
         compute_describe(p, st);

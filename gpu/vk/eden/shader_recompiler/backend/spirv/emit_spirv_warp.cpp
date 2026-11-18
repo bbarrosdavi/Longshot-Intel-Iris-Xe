@@ -22,6 +22,8 @@ Id WgTid(EmitContext& ctx) {
 }
 
 void WgBarrier(EmitContext& ctx) {
+    ctx.wg_shfl_cached_block = {};
+    ctx.wg_shfl_cached_value = {};
     const Id scope{ctx.Const(static_cast<u32>(spv::Scope::Workgroup))};
     ctx.OpControlBarrier(scope, scope,
                          ctx.Const(static_cast<u32>(spv::MemorySemanticsMask::AcquireRelease |
@@ -29,6 +31,9 @@ void WgBarrier(EmitContext& ctx) {
 }
 
 Id WgBallot(EmitContext& ctx, Id pred) {
+    if (Sirit::ValidId(ctx.linear_exec_id)) {
+        pred = ctx.OpLogicalAnd(ctx.U1, ctx.linear_exec_id, pred);
+    }
     const Id scope{ctx.Const(static_cast<u32>(spv::Scope::Workgroup))};
     const Id tid{WgTid(ctx)};
     const Id bit{ctx.OpSelect(ctx.U32[1], pred, ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(1U), tid),
@@ -42,11 +47,18 @@ Id WgBallot(EmitContext& ctx, Id pred) {
 }
 
 Id WgShuffle(EmitContext& ctx, Id value, Id src_lane) {
-    const Id tid{WgTid(ctx)};
     const Id src{ctx.OpBitwiseAnd(ctx.U32[1], src_lane, ctx.Const(31U))};
+    if (Sirit::ValidId(ctx.current_block_label) &&
+        ctx.wg_shfl_cached_block.value == ctx.current_block_label.value &&
+        ctx.wg_shfl_cached_value.value == value.value) {
+        return ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_shfl, src));
+    }
+    const Id tid{WgTid(ctx)};
     WgBarrier(ctx);
     ctx.OpStore(ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_shfl, tid), value);
     WgBarrier(ctx);
+    ctx.wg_shfl_cached_block = ctx.current_block_label;
+    ctx.wg_shfl_cached_value = value;
     return ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_shfl, src));
 }
 
@@ -198,7 +210,7 @@ Id EmitLaneId(EmitContext& ctx) {
 
 Id EmitVoteAll(EmitContext& ctx, Id pred) {
     if (ctx.runtime_info.mesh_wg_warp32) {
-        return ctx.OpIEqual(ctx.U1, WgBallot(ctx, pred), ctx.Const(0xFFFFFFFFU));
+        return ctx.OpIEqual(ctx.U1, WgBallot(ctx, ctx.OpLogicalNot(ctx.U1, pred)), ctx.u32_zero_value);
     }
     if (!StageSupportsSubgroups(ctx)) {
         return pred;
@@ -236,9 +248,10 @@ Id EmitVoteAny(EmitContext& ctx, Id pred) {
 
 Id EmitVoteEqual(EmitContext& ctx, Id pred) {
     if (ctx.runtime_info.mesh_wg_warp32) {
-        const Id b{WgBallot(ctx, pred)};
-        return ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, b, ctx.u32_zero_value),
-                               ctx.OpIEqual(ctx.U1, b, ctx.Const(0xFFFFFFFFU)));
+        const Id b_t{WgBallot(ctx, pred)};
+        const Id b_f{WgBallot(ctx, ctx.OpLogicalNot(ctx.U1, pred))};
+        return ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, b_t, ctx.u32_zero_value),
+                               ctx.OpIEqual(ctx.U1, b_f, ctx.u32_zero_value));
     }
     if (!StageSupportsSubgroups(ctx)) {
         return ctx.true_value;

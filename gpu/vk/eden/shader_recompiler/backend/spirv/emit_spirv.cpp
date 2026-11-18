@@ -18,6 +18,7 @@
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"   // (longshot)
+#include "shader_recompiler/backend/spirv/wg_warp_plan.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -133,8 +134,44 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     switch (type) {
     case IR::Type::U1:
         return ctx.U1;
+    case IR::Type::U8:
+        return ctx.U8;
+    case IR::Type::U16:
+        return ctx.U16;
     case IR::Type::U32:
         return ctx.U32[1];
+    case IR::Type::U64:
+        return ctx.U64;
+    case IR::Type::F16:
+        return ctx.F16[1];
+    case IR::Type::F32:
+        return ctx.F32[1];
+    case IR::Type::F64:
+        return ctx.F64[1];
+    case IR::Type::U32x2:
+        return ctx.U32[2];
+    case IR::Type::U32x3:
+        return ctx.U32[3];
+    case IR::Type::U32x4:
+        return ctx.U32[4];
+    case IR::Type::F16x2:
+        return ctx.F16[2];
+    case IR::Type::F16x3:
+        return ctx.F16[3];
+    case IR::Type::F16x4:
+        return ctx.F16[4];
+    case IR::Type::F32x2:
+        return ctx.F32[2];
+    case IR::Type::F32x3:
+        return ctx.F32[3];
+    case IR::Type::F32x4:
+        return ctx.F32[4];
+    case IR::Type::F64x2:
+        return ctx.F64[2];
+    case IR::Type::F64x3:
+        return ctx.F64[3];
+    case IR::Type::F64x4:
+        return ctx.F64[4];
     default:
         throw NotImplementedException("Phi node type {}", type);
     }
@@ -142,6 +179,11 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 
 void Traverse(EmitContext& ctx, IR::Program& program) {
     IR::Block* current_block{};
+    const WorkgroupWarpPlan plan{
+        ctx.runtime_info.mesh_wg_warp32 ? AnalyzeWorkgroupWarpPlan(program, true) : WorkgroupWarpPlan{}};
+    std::vector<Id> linear_if_conds(program.syntax_list.size());
+    std::vector<bool> if_was_linear;
+    std::vector<Id> prev_exec_stack;
     // (EvilOOT, RX_VK_BLOCK_PROBE=1 with RX_VK_MISS_LOG=1 and RX_VK_MISS_LOG_PROG=<key>: each block's entries counted, by
     // invocation, in the miss log's words 128 + the block's index in program.blocks: IR::DumpProgram's "Block $n")
     static const bool probe_env{std::getenv("RX_VK_BLOCK_PROBE") != nullptr};
@@ -150,7 +192,8 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
         const auto it{std::find(program.blocks.begin(), program.blocks.end(), b)};
         return static_cast<u32>(it - program.blocks.begin());
     }};
-    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+    for (size_t node_idx = 0; node_idx < program.syntax_list.size(); ++node_idx) {
+        const IR::AbstractSyntaxNode& node{program.syntax_list[node_idx]};
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
             const Id label{node.data.block->Definition<Id>()};
@@ -160,7 +203,8 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             current_block = node.data.block;
             ctx.AddLabel(label);
             bool probed{!probe};
-            for (IR::Inst& inst : node.data.block->Instructions()) {
+            for (auto it = node.data.block->begin(); it != node.data.block->end();) {
+                IR::Inst& inst{*it};
                 if (!probed && inst.GetOpcode() != IR::Opcode::Phi) {   // (after the phis: they must lead the block)
                     probed = true;
                     const u32 at{128U + std::min<u32>(block_index(node.data.block), 4000U)};
@@ -169,15 +213,81 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
                     ctx.OpAtomicIAdd(ctx.U32[1], counter, ctx.Const(static_cast<u32>(spv::Scope::Device)), ctx.u32_zero_value,
                                      ctx.Const(1U));
                 }
+                if (inst.GetOpcode() == IR::Opcode::Phi) {
+                    if (const auto phi_it = plan.linear_phis.find(&inst); phi_it != plan.linear_phis.end()) {
+                        const LinearPhiInfo& info{phi_it->second};
+                        const Id cond_id{linear_if_conds[info.if_node_index]};
+                        const bool zero_is_entry{inst.PhiBlock(0) == info.entry_block};
+                        const Id v_false{ctx.Def(zero_is_entry ? inst.Arg(0) : inst.Arg(1))};
+                        const Id v_true{ctx.Def(zero_is_entry ? inst.Arg(1) : inst.Arg(0))};
+                        const Id res_ty{TypeId(ctx, inst.Flags<IR::Type>())};
+                        inst.SetDefinition<Id>(ctx.OpSelect(res_ty, cond_id, v_true, v_false));
+                        ++it;
+                        continue;
+                    }
+                }
+                if (Sirit::ValidId(ctx.linear_exec_id) && NeedsExecGuard(inst)) {
+                    if (inst.Type() == IR::Type::Void) {
+                        const Id then_lbl{ctx.OpLabel()};
+                        const Id merge_lbl{ctx.OpLabel()};
+                        ctx.OpSelectionMerge(merge_lbl, spv::SelectionControlMask::MaskNone);
+                        ctx.OpBranchConditional(ctx.linear_exec_id, then_lbl, merge_lbl);
+                        ctx.AddLabel(then_lbl);
+                        while (it != node.data.block->end() && NeedsExecGuard(*it) && it->Type() == IR::Type::Void) {
+                            EmitInst(ctx, &*it);
+                            ++it;
+                        }
+                        ctx.OpBranch(merge_lbl);
+                        ctx.AddLabel(merge_lbl);
+                        continue;
+                    }
+                    const Id pre_lbl{ctx.current_block_label};
+                    const Id then_lbl{ctx.OpLabel()};
+                    const Id merge_lbl{ctx.OpLabel()};
+                    ctx.OpSelectionMerge(merge_lbl, spv::SelectionControlMask::MaskNone);
+                    ctx.OpBranchConditional(ctx.linear_exec_id, then_lbl, merge_lbl);
+                    ctx.AddLabel(then_lbl);
+                    EmitInst(ctx, &inst);
+                    const Id post_lbl{ctx.current_block_label};
+                    ctx.OpBranch(merge_lbl);
+                    ctx.AddLabel(merge_lbl);
+                    if (inst.Type() != IR::Type::Void && inst.Type() != IR::Type::Opaque) {
+                        const Id raw_val{inst.Definition<Id>()};
+                        if (Sirit::ValidId(raw_val)) {
+                            const Id res_ty{TypeId(ctx, inst.Type())};
+                            const Id zero_val{ctx.NullConstant(res_ty)};
+                            inst.SetDefinition<Id>(ctx.OpPhi(res_ty, zero_val, pre_lbl, raw_val, post_lbl));
+                        }
+                    }
+                    ++it;
+                    continue;
+                }
                 EmitInst(ctx, &inst);
+                ++it;
             }
+            ctx.block_end_labels[node.data.block] = ctx.current_block_label;
             break;
         }
         case IR::AbstractSyntaxNode::Type::If: {
             const Id if_label{node.data.if_node.body->Definition<Id>()};
             const Id endif_label{node.data.if_node.merge->Definition<Id>()};
-            ctx.OpSelectionMerge(endif_label, spv::SelectionControlMask::MaskNone);
-            ctx.OpBranchConditional(ctx.Def(node.data.if_node.cond), if_label, endif_label);
+            Id cond_id{ctx.Def(node.data.if_node.cond)};
+            const bool is_lin{plan.eligible && node_idx < plan.linearize_if.size() && plan.linearize_if[node_idx]};
+            if_was_linear.push_back(is_lin);
+            if (is_lin) {
+                linear_if_conds[node_idx] = cond_id;
+                prev_exec_stack.push_back(ctx.linear_exec_id);
+                ctx.linear_exec_id = Sirit::ValidId(ctx.linear_exec_id)
+                                         ? ctx.OpLogicalAnd(ctx.U1, ctx.linear_exec_id, cond_id)
+                                         : cond_id;
+                ctx.OpBranch(if_label);
+            } else {
+                if (Sirit::ValidId(ctx.linear_exec_id)) {
+                    cond_id = ctx.OpLogicalAnd(ctx.U1, ctx.linear_exec_id, cond_id);
+                }
+                ctx.OpSelectionMerge(endif_label, spv::SelectionControlMask::MaskNone);
+                ctx.OpBranchConditional(cond_id, if_label, endif_label);
+            }
             break;
         }
         case IR::AbstractSyntaxNode::Type::Loop: {
@@ -196,6 +306,14 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             break;
         }
         case IR::AbstractSyntaxNode::Type::EndIf:
+            if (!if_was_linear.empty()) {
+                const bool was_lin{if_was_linear.back()};
+                if_was_linear.pop_back();
+                if (was_lin) {
+                    ctx.linear_exec_id = prev_exec_stack.back();
+                    prev_exec_stack.pop_back();
+                }
+            }
             if (current_block) {
                 ctx.OpBranch(node.data.end_if.merge->Definition<Id>());
             }
@@ -582,32 +700,19 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
     }
 }
 
-void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
-            // Flatten all leading PHIs from each block into a vector
-            std::vector<IR::Inst*> phi_instructions;
-            for (IR::Block* block : program.blocks) {
-                for (auto it = block->begin(); it != block->end(); ++it) {
-                    if (it->GetOpcode() != IR::Opcode::Phi)
-                        break;
-                    phi_instructions.push_back(&*it);
-                }
-            }
-
-            if (phi_instructions.empty()) {
-                return; // nothing to patch
-            }
-
-            // Start "before" first PHI; advance on phi_arg == 0
-            size_t phi_index = static_cast<size_t>(-1);
-
-            ctx.PatchDeferredPhi([&](size_t phi_arg, Id parent) -> std::pair<Id, Id> {
-                if (phi_arg == 0) {
-                    ++phi_index;
-                }
-                IR::Inst* phi = phi_instructions[phi_index];
-                return { ctx.Def(phi->Arg(phi_arg)), parent };
-            });
+void PatchPhiNodes(IR::Program&, EmitContext& ctx) {
+    if (ctx.deferred_ir_phis.empty()) {
+        return; // nothing to patch
+    }
+    size_t phi_index = static_cast<size_t>(-1);
+    ctx.PatchDeferredPhi([&](size_t phi_arg, Id parent) -> std::pair<Id, Id> {
+        if (phi_arg == 0) {
+            ++phi_index;
         }
+        IR::Inst* phi = ctx.deferred_ir_phis[phi_index];
+        return {ctx.Def(phi->Arg(phi_arg)), ctx.EndLabelOf(phi->PhiBlock(phi_arg), parent)};
+    });
+}
 
 void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::Op>> rewrites) {
     if (rewrites.empty()) {
@@ -712,6 +817,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
 }
 
 Id EmitPhi(EmitContext& ctx, IR::Inst* inst) {
+    ctx.deferred_ir_phis.push_back(inst);
     const size_t num_args{inst->NumArgs()};
     boost::container::small_vector<Id, 32> blocks;
     blocks.reserve(num_args);
