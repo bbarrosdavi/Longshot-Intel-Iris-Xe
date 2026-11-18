@@ -1,0 +1,61 @@
+# ---- never commit the game or anything made from it ----
+# (decompressed modules, the loaded image, lifted C, test builds, romfs/exefs copies, dumps, keys)
+work/
+gen/
+image/
+exefs/
+romfs/
+*.bin
+*.keys
+*.nso
+*.nca
+*.nsp
+*.xci
+gamefile/
+*.nup
+*.nsz
+*.xcz
+# (saves: only the scrubbed ones in assets/saves, CONTRIBUTING.md)
+*.sav
+!/assets/saves/**/*.sav
+
+# ---- build output and caches ----
+build/
+/third_party_objects/
+__pycache__/
+*.pyc
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.sha1
+*.log
+
+# ---- Linux builds ----
+build-linux/
+*.so
+
+# ---- a checkout's own development builds on Windows (scripts/dev_build.py) ----
+build-windows/
+
+# ---- NVIDIA's DLSS SDK (scripts/ngx_sdk.py): NVIDIA's files, never committed ----
+ngx-sdk/
+test-results/
+_deps/
+
+# ---- a link to <build>/compile_commands.json (nx2/build.py write_compdb), for clangd and clang-tidy ----
+/compile_commands.json
+
+# ---- Visual Studio IDE files ----
+.vs/
+.vscode/
+CppProperties.json
+
+# Local dev / incremental build work dirs
+vk-work/
+dev-work/
+out/
