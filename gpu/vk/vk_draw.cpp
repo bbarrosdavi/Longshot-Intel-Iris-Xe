@@ -240,20 +240,24 @@ compute_pin::Uses compute_program_uses(const Program& p, const Stage& st) {
     u.invocations = (uint64_t)p.workgroup[0] * p.workgroup[1] * p.workgroup[2];
     return u;
 }
-/// (longshot) Whether a game compute program's stage is held to 32 lanes: every one, but on Mesa's Intel driver only those that
-/// can tell their lanes (compute_pin.h: held to 32 lanes that compiler takes minutes and gigabytes over a large program, and
-/// the preparation never ended on an Iris Xe). RX_VK_COMPUTE_PIN=all or lanes says so on any GPU
-bool compute_pin_needed(const Program& p) {
+bool compute_pin_8_needed(const Program& p) {
     static const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
     static const compute_pin::Mode mode =
         compute_pin::mode_for(intel_mesa, getenv("RX_VK_COMPUTE_PIN"));
     // (27ee9883e2a20323 8x8x8 and ee7764a6b1ef459c 8x4x4 only emit subgroup ops for Ampere R2UR on values uniform
     // across every 8- and 16-lane slice, and 27ee9883e2a20323's shared memory is strictly per-thread scratch; unpinned
-    // on Mesa Intel so brw compiles SIMD8/SIMD16 without SIMD32 register spilling)
-    if (intel_mesa && mode == compute_pin::Mode::Lanes &&
-        (p.key == 0x27ee9883e2a20323ull || p.key == 0xee7764a6b1ef459cull)) {
-        return false;
-    }
+    // on Mesa Intel ANV still compiled both as SIMD32 with >800 spills, so explicitly pin them to SIMD8)
+    return intel_mesa && mode == compute_pin::Mode::Lanes &&
+           (p.key == 0x27ee9883e2a20323ull || p.key == 0xee7764a6b1ef459cull);
+}
+/// (longshot) Whether a game compute program's stage is held to 32 lanes: every one, but on Mesa's Intel driver only those that
+/// can tell their lanes (compute_pin.h: held to 32 lanes that compiler takes minutes and gigabytes over a large program, and
+/// the preparation never ended on an Iris Xe). RX_VK_COMPUTE_PIN=all or lanes says so on any GPU
+bool compute_pin_needed(const Program& p) {
+    if (compute_pin_8_needed(p)) return false;
+    static const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+    static const compute_pin::Mode mode =
+        compute_pin::mode_for(intel_mesa, getenv("RX_VK_COMPUTE_PIN"));
     const bool known = !p.stages.empty();
     return compute_pin::needed(mode, known, known ? compute_program_uses(p, p.stages[0]) : compute_pin::Uses{});
 }
@@ -278,6 +282,7 @@ void compute_describe(const Program& p, const Stage& st) {
 /// caches for the pipeline the others built
 void pin_compute(VkPipelineShaderStageCreateInfo& st, const Program& p) {
     if (compute_pin_needed(p)) pin_subgroup(st, p.workgroup[0]);
+    else if (compute_pin_8_needed(p)) pin_subgroup_8(st, p.workgroup[0]);
     compute_describe(p, p.stages[0]);
 }
 
@@ -7441,6 +7446,28 @@ bool fallback_pipelines_ready(Program& p) {
     return !p.fallback_compute.empty();
 }
 
+void fallback_stage_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src, VkAccessFlags2 src_acc,
+                            VkPipelineStageFlags2 dst, VkAccessFlags2 dst_acc, const char* why,
+                            VkBuffer buf = VK_NULL_HANDLE, VkDeviceSize size = 0) {
+    GprofSpan gp(cmd, why);
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    if (buf != VK_NULL_HANDLE) {
+        VkBufferMemoryBarrier2 b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+        b.srcStageMask = src, b.srcAccessMask = src_acc;
+        b.dstStageMask = dst, b.dstAccessMask = dst_acc;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = buf, b.offset = 0, b.size = size;
+        d.bufferMemoryBarrierCount = 1, d.pBufferMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &d);
+        return;
+    }
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = src, b.srcAccessMask = src_acc;
+    b.dstStageMask = dst, b.dstAccessMask = dst_acc;
+    d.memoryBarrierCount = 1, d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+}
+
 /// The dispatches of a mesh draw, outside any render pass, and the vertex count its graphics draw then covers.
 bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     if (d.count_addr) {   // (more than one draw in the records: each its own dispatch, not one)
@@ -7476,7 +7503,10 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
         vkCmdUpdateBuffer(cmd, f->records, 0, sizeof(kInitHeader), kInitHeader);
     }
     fallback_draw_records = f->records;
-    full_barrier(cmd);
+    fallback_stage_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                           VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+                           "barrier (mfb header)", f->records, sizeof(uint32_t) * Shader::Backend::SPIRV::MESH_FALLBACK_HEADER_WORDS);
     if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
     push_constants(cmd, p, nullptr, d.first_task, dw().gm_ranges_address);
     size_t stages[2] = {p.stages.size(), p.stages.size()};
@@ -7515,7 +7545,10 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     };
     if (p.fallback_task) {
         if (!send(stages[0], false)) return false;
-        full_barrier(cmd);
+        fallback_stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                               VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+                               "barrier (mfb task->mesh)");
         if (!send(stages[1], true)) return false;
     } else {
         if (!send(stages[0], true)) return false;
