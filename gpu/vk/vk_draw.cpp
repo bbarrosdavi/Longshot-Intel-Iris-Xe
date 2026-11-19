@@ -224,6 +224,18 @@ void pin_subgroup_8(VkPipelineShaderStageCreateInfo& st, uint32_t workgroup_x = 
         st.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
 }
 
+void pin_subgroup_16(VkPipelineShaderStageCreateInfo& st, uint32_t workgroup_x = 0) {
+    static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size16 = [] {
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo r{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+        r.requiredSubgroupSize = 16;
+        return r;
+    }();
+    if (!(dev.sg32_stages & st.stage)) return;
+    st.pNext = &size16;
+    if (workgroup_x && !(workgroup_x % 16) && dev.vk13.computeFullSubgroups)
+        st.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+}
+
 /// (longshot) What a compute stage has that can tell the lanes it runs on (compute_pin.h): its Shader::Info's flags, which
 /// every way a program is made keeps (translated, read from the program cache, read from it without its code), and the
 /// program's shared memory
@@ -280,8 +292,17 @@ void compute_describe(const Program& p, const Stage& st) {
 /// the log. Every maker of a compute program's pipeline comes through here (compute_pipeline_info), so that each asks the
 /// caches for the pipeline the others built
 void pin_compute(VkPipelineShaderStageCreateInfo& st, const Program& p) {
+    static const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+    static const compute_pin::Mode mode =
+        compute_pin::mode_for(intel_mesa, getenv("RX_VK_COMPUTE_PIN"));
     if (compute_pin_needed(p)) pin_subgroup(st, p.workgroup[0]);
     else if (compute_pin_8_needed(p)) pin_subgroup_8(st, p.workgroup[0]);
+    else if (intel_mesa && mode == compute_pin::Mode::Lanes) {
+        if (p.key == 0x6f2a263dfafb02feull || p.key == 0x35de103a233e6361ull)
+            pin_subgroup_16(st, p.workgroup[0]);
+        else if (p.key == 0x48590e0b8589d6caull)
+            pin_subgroup(st, p.workgroup[0]);
+    }
     compute_describe(p, p.stages[0]);
 }
 
@@ -7488,9 +7509,25 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     fallback_payload_address = f->payload_address;
     fallback_records_address = f->records_address;
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+    const bool interrupted_pass = pass().open;
     end_pass(cmd);
-    // (the shared pair: the last fallback draw on it, of any program of this thread, has read it before it is reset)
-    full_barrier(cmd);
+    // (the shared pair: the last fallback draw on it, of any program of this thread, has read it before it is reset;
+    // narrow to compute/VS/indirect/transfer so prior render-pass color/depth writes need not flush before task/mesh compute)
+    static const bool mfb_full_barriers = env_on("RX_VK_MFB_FULL_BARRIER");
+    if (mfb_full_barriers) {
+        full_barrier(cmd);
+    } else {
+        fallback_stage_barrier(
+            cmd,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+            "barrier (mfb pre)");
+    }
     const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
     // (the records' header: the draw's command with no vertices and one instance, the allocator at 0, and the mesh dispatch
     // with no workgroups, its y and z 1. The records past it need nothing: the draw reaches only those taken this time; nor
@@ -7553,7 +7590,16 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     } else {
         if (!send(stages[0], true)) return false;
     }
-    full_barrier(cmd);   // (the records and the draw's command, which the draw reads as indirect arguments)
+    if (mfb_full_barriers) {
+        full_barrier(cmd);   // (the records and the draw's command, which the draw reads as indirect arguments)
+    } else {
+        fallback_stage_barrier(
+            cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT, "barrier (mfb post)");
+        if (interrupted_pass) note_pass_end(cmd);
+    }
     return true;
 }
 } // namespace

@@ -2620,7 +2620,8 @@ int64_t pass_barriers_relaxed() { return st_pass_relaxed.load(std::memory_order_
 void pass_start_barrier(VkCommandBuffer cmd) {
     static const bool game = [] {
         const char* e = getenv("RX_VK_PASS_BARRIER");
-        const bool on = e && !strcmp(e, "game");
+        const bool default_on = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const bool on = e ? !strcmp(e, "game") : default_on;
         if (on) logf("vk: RX_VK_PASS_BARRIER=game: a draw pass right after another, no barrier of the game's between, waits in its fragment stages only");
         return on;
     }();
