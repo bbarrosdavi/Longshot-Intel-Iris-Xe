@@ -1898,8 +1898,8 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
                                  : topo == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
                                              : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
             p.fallback_vertices_per_workgroup = mi.max_primitives * mi.Corners();
-            p.fallback_record_words = 1 + static_cast<u32>(mi.vertex_lines.size()) +
-                                      static_cast<u32>(mi.primitive_lines.size());
+            p.fallback_record_words = std::max<u32>(1u, static_cast<u32>(mi.vertex_lines.size()) +
+                                                            static_cast<u32>(mi.primitive_lines.size()));
             p.fallback_payload_words = mi.payload_words;
         }
         if (fsc) {

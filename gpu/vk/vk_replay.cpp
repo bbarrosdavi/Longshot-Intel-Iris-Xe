@@ -1898,11 +1898,13 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (dry) break;
             {
                 const int32_t bits = payload<int32_t>(a, avail);
-                std::lock_guard lk(st_barrier_flags_mu);
-                st_barrier_flags[bits]++;
+                {
+                    std::lock_guard lk(st_barrier_flags_mu);
+                    st_barrier_flags[bits]++;
+                }
+                end_pass(cmd);
+                nvn_barrier(cmd, bits);
             }
-            end_pass(cmd);
-            full_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");
             st_barriers++;
             break;
         // ---- work ----

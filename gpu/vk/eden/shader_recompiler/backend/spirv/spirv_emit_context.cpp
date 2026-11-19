@@ -2319,6 +2319,8 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         // and record buffers live in the pushed fallback buffers, one slot a workgroup. A mesh program with no task
         // reads the workgroup index from its own payload, as NVN's hardware provides it.
         const Id wg_pointer{TypePointer(spv::StorageClass::Workgroup, U32[1])};
+        mesh_fallback_scratch = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_fallback_scratch, "mfb_scratch");
         if (stage == Stage::Task || !runtime_info.mesh_fallback_task) {
             mesh_payload = DefineVariable(*this, payload_type, std::nullopt, spv::StorageClass::Workgroup);
             Name(mesh_payload, "isbe_payload");

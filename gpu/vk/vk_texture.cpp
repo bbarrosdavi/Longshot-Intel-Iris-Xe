@@ -2576,10 +2576,27 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
 
 std::atomic<uint64_t> work_epoch{0};
 namespace {
+enum BarrierScope : uint32_t {
+    kScopeNone = 0,
+    kScopeFrag = 1u << 0,            // satisfies pass_start_barrier (frag/color/depth + sampled/storage reads)
+    kScopeComputeDirect = 1u << 1,   // satisfies direct compute dispatch (compute R/W + transfer)
+    kScopeCompute = 1u << 2,         // satisfies indirect/direct compute dispatch (compute + indirect + uniform + transfer)
+    kScopeFull = 1u << 3,            // satisfies full_barrier (ALL_COMMANDS -> ALL_COMMANDS)
+};
 // (each thread's own: the display thread's present records barriers too)
-thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;   // (the command buffer this thread's last full barrier went into, and the work count then)
+thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;   // (the command buffer this thread's last barrier went into, and the work count then)
 thread_local uint64_t last_barrier_epoch = 0;
+thread_local uint32_t last_barrier_scope = kScopeNone;
 std::atomic<int64_t> st_barriers_made{0}, st_barriers_left_out{0};
+
+inline uint32_t current_barrier_scope(VkCommandBuffer cmd, uint64_t cur_epoch, bool dedupe) {
+    return (dedupe && cmd == last_barrier_cmd && cur_epoch == last_barrier_epoch) ? last_barrier_scope : kScopeNone;
+}
+inline void record_barrier_scope(VkCommandBuffer cmd, uint32_t prev_scope, uint32_t added_scope) {
+    last_barrier_cmd = cmd;
+    last_barrier_epoch = work_epoch.load(std::memory_order_relaxed);
+    last_barrier_scope = prev_scope | added_scope;
+}
 } // namespace
 void barrier_stats(int64_t* made, int64_t* left_out) {
     *made = st_barriers_made.load(std::memory_order_relaxed), *left_out = st_barriers_left_out.load(std::memory_order_relaxed);
@@ -2591,7 +2608,9 @@ void barrier_stats(int64_t* made, int64_t* left_out) {
 void full_barrier(VkCommandBuffer cmd, const char* why) {
     static const bool off = env_on("RX_VK_BARRIER_DEDUPE_OFF");
     const bool dedupe = !off && !par_active.load(std::memory_order_relaxed);   // (a parallel replay's threads share command buffers and the count)
-    if (dedupe && cmd == last_barrier_cmd && work_epoch.load(std::memory_order_relaxed) == last_barrier_epoch) {
+    const uint64_t cur_epoch = work_epoch.load(std::memory_order_relaxed);
+    const uint32_t prev_scope = current_barrier_scope(cmd, cur_epoch, dedupe);
+    if (prev_scope & kScopeFull) {
         st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -2605,7 +2624,7 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
     d.memoryBarrierCount = 1;
     d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
-    last_barrier_cmd = cmd, last_barrier_epoch = work_epoch.load(std::memory_order_relaxed);
+    record_barrier_scope(cmd, prev_scope, kScopeFrag | kScopeComputeDirect | kScopeCompute | kScopeFull);
 }
 
 namespace {
@@ -2618,6 +2637,7 @@ void note_pass_end(VkCommandBuffer cmd) {
 }
 int64_t pass_barriers_relaxed() { return st_pass_relaxed.load(std::memory_order_relaxed); }
 void pass_start_barrier(VkCommandBuffer cmd) {
+    static const bool dedupe_off = env_on("RX_VK_BARRIER_DEDUPE_OFF");
     static const bool game = [] {
         const char* e = getenv("RX_VK_PASS_BARRIER");
         const bool default_on = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
@@ -2625,8 +2645,14 @@ void pass_start_barrier(VkCommandBuffer cmd) {
         if (on) logf("vk: RX_VK_PASS_BARRIER=game: a draw pass right after another, no barrier of the game's between, waits in its fragment stages only");
         return on;
     }();
-    if (!game || par_active.load(std::memory_order_relaxed) || cmd != last_pass_end_cmd ||
-        work_epoch.load(std::memory_order_relaxed) != last_pass_end_epoch) {
+    const bool par = par_active.load(std::memory_order_relaxed);
+    const uint64_t cur_epoch = work_epoch.load(std::memory_order_relaxed);
+    const uint32_t prev_scope = current_barrier_scope(cmd, cur_epoch, !dedupe_off && !par);
+    if (prev_scope & kScopeFrag) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!game || par || cmd != last_pass_end_cmd || cur_epoch != last_pass_end_epoch) {
         full_barrier(cmd, "barrier (pass start)");
         return;
     }
@@ -2644,7 +2670,7 @@ void pass_start_barrier(VkCommandBuffer cmd) {
     d.memoryBarrierCount = 1;
     d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
-    last_barrier_cmd = VK_NULL_HANDLE;   // (not a full one: the next full barrier is not left out after it)
+    record_barrier_scope(cmd, prev_scope, kScopeFrag);
 }
 
 namespace {
@@ -2655,12 +2681,14 @@ void note_compute_dispatch(VkCommandBuffer cmd) {
     last_compute_only_cmd = cmd;
     last_compute_only_epoch = work_epoch.load(std::memory_order_relaxed);
 }
-void dispatch_barrier(VkCommandBuffer cmd, bool /*indirect*/) {
+void dispatch_barrier(VkCommandBuffer cmd, bool indirect) {
     static const bool full_disp = env_on("RX_VK_DISP_FULL_BARRIER");
     static const bool dedupe_off = env_on("RX_VK_BARRIER_DEDUPE_OFF");
     const bool par = par_active.load(std::memory_order_relaxed);
     const uint64_t cur_epoch = work_epoch.load(std::memory_order_relaxed);
-    if (!dedupe_off && !par && cmd == last_barrier_cmd && cur_epoch == last_barrier_epoch) {
+    const uint32_t prev_scope = current_barrier_scope(cmd, cur_epoch, !dedupe_off && !par);
+    const uint32_t needed = indirect ? kScopeCompute : (kScopeCompute | kScopeComputeDirect);
+    if (prev_scope & needed) {
         st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -2690,11 +2718,116 @@ void dispatch_barrier(VkCommandBuffer cmd, bool /*indirect*/) {
     d.memoryBarrierCount = 1;
     d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
-    last_barrier_cmd = VK_NULL_HANDLE;   // (not a full one: the next full barrier is not left out after it)
+    record_barrier_scope(cmd, prev_scope, kScopeCompute | kScopeComputeDirect);
+}
+
+void nvn_barrier(VkCommandBuffer cmd, int32_t bits) {
+    static const bool full_nvn = env_on("RX_VK_NVN_FULL_BARRIER");
+    static const bool dedupe_off = env_on("RX_VK_BARRIER_DEDUPE_OFF");
+    const bool par = par_active.load(std::memory_order_relaxed);
+    if (full_nvn || par || !bits) {
+        full_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");
+        return;
+    }
+    const uint64_t cur_epoch = work_epoch.load(std::memory_order_relaxed);
+    const uint32_t prev_scope = current_barrier_scope(cmd, cur_epoch, !dedupe_off);
+    if (prev_scope & kScopeFull) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    constexpr int32_t kOrderFrag = NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT;
+    constexpr int32_t kFragOnlyMask = kOrderFrag | NVN_BARRIER_INVALIDATE_TEXTURE_BIT | NVN_BARRIER_INVALIDATE_ZCULL_BIT;
+    constexpr int32_t kIndirectShaderMask = NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT;
+
+    const bool frag_only = (bits & kOrderFrag) != 0 && (bits & ~kFragOnlyMask) == 0;
+    const bool indirect_shader_only = (bits & ~kIndirectShaderMask) == 0;
+
+    if (frag_only && (prev_scope & kScopeFrag)) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (indirect_shader_only && (prev_scope & kScopeCompute) && (prev_scope & kScopeFrag)) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    const bool from_compute_only = cmd == last_compute_only_cmd && cur_epoch == last_compute_only_epoch;
+    const bool from_pass_only = cmd == last_pass_end_cmd && cur_epoch == last_pass_end_epoch;
+
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    if (from_compute_only) {
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    } else if (from_pass_only) {
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_SHADER_WRITE_BIT;
+    } else {
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    }
+
+    uint32_t added_scope = kScopeNone;
+    const char* label = "barrier (nvn prim/tex)";
+    if (frag_only) {
+        label = "barrier (nvn frag)";
+        b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        b.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT;
+        if (bits & NVN_BARRIER_INVALIDATE_TEXTURE_BIT)
+            b.dstAccessMask |= VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        added_scope = kScopeFrag;
+    } else if (indirect_shader_only) {
+        label = from_compute_only ? "barrier (nvn ind/sh c2x)" : "barrier (nvn ind/sh)";
+        b.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                         VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        b.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT |
+                          VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
+                          VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                          VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT;
+        if (bits & NVN_BARRIER_INVALIDATE_SHADER_BIT) {
+            b.dstStageMask |= VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT;
+            b.dstAccessMask |= VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+        }
+        added_scope = kScopeCompute | kScopeComputeDirect | kScopeFrag;
+    } else {
+        label = from_compute_only ? "barrier (nvn prim c2x)" : "barrier (nvn prim/tex)";
+        b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                         VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                          VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        const bool inv_shader = (bits & (NVN_BARRIER_INVALIDATE_SHADER_BIT | NVN_BARRIER_INVALIDATE_TEXTURE_DESCRIPTOR_BIT)) != 0;
+        const bool ord_ind = (bits & NVN_BARRIER_ORDER_INDIRECT_DATA_BIT) != 0;
+        if (inv_shader) b.dstAccessMask |= VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+        if (ord_ind) {
+            b.dstStageMask |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+            b.dstAccessMask |= VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+        }
+        added_scope = kScopeFrag | kScopeComputeDirect | ((inv_shader && ord_ind) ? kScopeCompute : kScopeNone);
+    }
+
+    st_barriers_made.fetch_add(1, std::memory_order_relaxed);
+    GprofSpan gp(cmd, label);
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    record_barrier_scope(cmd, prev_scope, added_scope);
 }
 
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     last_barrier_cmd = VK_NULL_HANDLE;
+    last_barrier_scope = kScopeNone;
     last_pass_end_cmd = VK_NULL_HANDLE;   // (a new recording: its command buffers start afresh, whatever their handles held)
     last_compute_only_cmd = VK_NULL_HANDLE;
     up_cmd = upload;
