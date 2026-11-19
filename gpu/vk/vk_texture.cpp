@@ -2647,9 +2647,56 @@ void pass_start_barrier(VkCommandBuffer cmd) {
     last_barrier_cmd = VK_NULL_HANDLE;   // (not a full one: the next full barrier is not left out after it)
 }
 
+namespace {
+thread_local VkCommandBuffer last_compute_only_cmd = VK_NULL_HANDLE;
+thread_local uint64_t last_compute_only_epoch = 0;
+} // namespace
+void note_compute_dispatch(VkCommandBuffer cmd) {
+    last_compute_only_cmd = cmd;
+    last_compute_only_epoch = work_epoch.load(std::memory_order_relaxed);
+}
+void dispatch_barrier(VkCommandBuffer cmd, bool /*indirect*/) {
+    static const bool full_disp = env_on("RX_VK_DISP_FULL_BARRIER");
+    static const bool dedupe_off = env_on("RX_VK_BARRIER_DEDUPE_OFF");
+    const bool par = par_active.load(std::memory_order_relaxed);
+    const uint64_t cur_epoch = work_epoch.load(std::memory_order_relaxed);
+    if (!dedupe_off && !par && cmd == last_barrier_cmd && cur_epoch == last_barrier_epoch) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (full_disp || par) {
+        full_barrier(cmd, "barrier (dispatch)");
+        return;
+    }
+    const bool c2c = cmd == last_compute_only_cmd && cur_epoch == last_compute_only_epoch;
+    st_barriers_made.fetch_add(1, std::memory_order_relaxed);
+    GprofSpan gp(cmd, c2c ? "barrier (dispatch c2c)" : "barrier (dispatch narrow)");
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    if (c2c) {
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    } else {
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    }
+    // (always include DRAW_INDIRECT and ALL_TRANSFER so a following c2c barrier stays transitive across direct/indirect mixes
+    // and grid_patch_at's vkCmdCopyBuffer)
+    b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
+                      VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT |
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    last_barrier_cmd = VK_NULL_HANDLE;   // (not a full one: the next full barrier is not left out after it)
+}
+
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     last_barrier_cmd = VK_NULL_HANDLE;
     last_pass_end_cmd = VK_NULL_HANDLE;   // (a new recording: its command buffers start afresh, whatever their handles held)
+    last_compute_only_cmd = VK_NULL_HANDLE;
     up_cmd = upload;
     if (value != rec_value) epoch++;   // (a submission's parts check a texture's memory once: nothing is collected between)
     rec_value = value;

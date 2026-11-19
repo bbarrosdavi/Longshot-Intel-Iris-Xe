@@ -7099,24 +7099,30 @@ void occ_draw_counts(uint64_t out[3]) {
 // counterpart (as for the direct draws: drawn from 0).
 namespace {
 constexpr uint64_t kMeshRing = 4ull << 20;
+constexpr uint64_t kMeshRingWrap = (kMeshRing / 48) * 48;   // (48 = lcm(12, 16): every slot stays aligned to {x,1,1} across wraps)
 VkBuffer mesh_ring = VK_NULL_HANDLE;
 VmaAllocation mesh_ring_mem = nullptr;
 std::mutex mesh_ring_mu;
 uint64_t mesh_ring_at = 0;
+bool mesh_ring_inited = false;
 thread_local VkBuffer mesh_conv_buf = VK_NULL_HANDLE;   // (the converted records for the draw in progress)
 thread_local uint64_t mesh_conv_off = 0;
+thread_local bool mesh_conv_interrupted_pass = false;
 bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
     mesh_conv_buf = VK_NULL_HANDLE;
+    mesh_conv_interrupted_pass = false;
     static const uint32_t word = getenv("RX_VK_MESH_IND_COUNT_WORD") ? (uint32_t)atoi(getenv("RX_VK_MESH_IND_COUNT_WORD")) & 3 : 0;
     // (amd-fix: the rewrite with the firsts in the draw does it, RX_VK_MESH_ARGS; this one drew every draw from its first 0)
     static const bool rewrite = getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0;   // (sharkiix version: off, as upstream)
     if (rewrite || !d.mesh || !d.indirect) return false;
-    PROF_EXACT();   // (a pass ended and three barriers: not one of the cheap per-draw steps PROF_DRAW samples)
+    PROF_EXACT();   // (a pass ended and barriers: not one of the cheap per-draw steps PROF_DRAW samples)
     const uint32_t n = (uint32_t)std::clamp(d.max, 1, 4096);
     const uint32_t stride = d.stride > 0 ? (uint32_t)d.stride : 8;
     const BufferRef args = gpu_buffer_bind(d.indirect, (uint64_t)(n - 1) * stride + 4 * (word + 1), false);
     if (!args) return false;
     uint64_t off;
+    bool need_init = false;
+    bool fill_slice = false;
     {
         std::lock_guard lk(mesh_ring_mu);
         if (!mesh_ring) {
@@ -7125,27 +7131,58 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
                                mesh_ring_mem, &unused))
                 return false;
         }
-        const uint64_t bytes = ((uint64_t)n * 12 + 15) & ~15ull;
-        if (mesh_ring_at + bytes > kMeshRing) mesh_ring_at = 0;   // (4 MB: frames of draws before it comes round)
+        if (!mesh_ring_inited) {
+            if (!par_active.load(std::memory_order_relaxed)) {
+                mesh_ring_inited = true;
+                need_init = true;
+            } else {
+                fill_slice = true;
+            }
+        }
+        const uint64_t bytes = (((uint64_t)n * 12 + 47) / 48) * 48;
+        if (mesh_ring_at + bytes > kMeshRingWrap) mesh_ring_at = 0;   // (4 MB: frames of draws before it comes round)
         off = mesh_ring_at;
         mesh_ring_at += bytes;
     }
+    mesh_conv_interrupted_pass = pass().open;
     end_pass(cmd);
     {
+        static const bool mfb_full_barriers = env_on("RX_VK_MFB_FULL_BARRIER");
         GprofSpan gp(cmd, "mfb conv (indirect args)");
         VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
-        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-        mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        if (need_init) {
+            vkCmdFillBuffer(cmd, mesh_ring, 0, kMeshRingWrap, 1u);
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+            vkCmdPipelineBarrier2(cmd, &di);
+        }
+        if (mfb_full_barriers) {
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        } else {
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+            mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        }
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier2(cmd, &di);
-        vkCmdFillBuffer(cmd, mesh_ring, off, (uint64_t)n * 12, 1u);
-        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier2(cmd, &di);
-        std::vector<VkBufferCopy> regions(n);
+        if (fill_slice) {
+            vkCmdFillBuffer(cmd, mesh_ring, off, (uint64_t)n * 12, 1u);
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier2(cmd, &di);
+        }
+        VkBufferCopy small[16];
+        std::vector<VkBufferCopy> heap;
+        VkBufferCopy* regions = small;
+        if (n > 16) {
+            heap.resize(n);
+            regions = heap.data();
+        }
         for (uint32_t i = 0; i < n; i++) regions[i] = {args.offset + (uint64_t)i * stride + 4 * word, off + (uint64_t)i * 12, 4};
-        vkCmdCopyBuffer(cmd, args.buffer, mesh_ring, n, regions.data());
+        vkCmdCopyBuffer(cmd, args.buffer, mesh_ring, n, regions);
         mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
         mb.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, mb.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
         vkCmdPipelineBarrier2(cmd, &di);
@@ -7509,23 +7546,29 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     fallback_payload_address = f->payload_address;
     fallback_records_address = f->records_address;
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
-    const bool interrupted_pass = pass().open;
+    const bool interrupted_pass = pass().open || mesh_conv_interrupted_pass;
+    mesh_conv_interrupted_pass = false;
     end_pass(cmd);
     // (the shared pair: the last fallback draw on it, of any program of this thread, has read it before it is reset;
-    // narrow to compute/VS/indirect/transfer so prior render-pass color/depth writes need not flush before task/mesh compute)
+    // narrow to compute/VS/indirect/transfer when interrupting an open pass so prior render-pass color/depth writes need not
+    // flush before task/mesh compute; include color/depth attachment writes when not interrupting an open pass)
     static const bool mfb_full_barriers = env_on("RX_VK_MFB_FULL_BARRIER");
     if (mfb_full_barriers) {
         full_barrier(cmd);
     } else {
+        VkPipelineStageFlags2 src_stage = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        VkAccessFlags2 src_access = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        if (!interrupted_pass) {
+            src_stage |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            src_access |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        }
         fallback_stage_barrier(
-            cmd,
-            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-            VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            cmd, src_stage, src_access,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                 VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
-                VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+                VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
             "barrier (mfb pre)");
     }
     const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
@@ -7597,7 +7640,8 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
             cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT, "barrier (mfb post)");
+            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT,
+            "barrier (mfb post)");
         if (interrupted_pass) note_pass_end(cmd);
     }
     return true;
@@ -11303,7 +11347,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     }
     // (dispatches after other work wait for it: the WebGPU renderer's dispatches were ordered the same way by
     // wgpu's own tracking, and MKW's compute chains read what the one before wrote)
-    if (work_since_barrier) full_barrier(cmd, "barrier (dispatch)");
+    if (work_since_barrier) dispatch_barrier(cmd, indirect != 0);
     work_since_barrier = true;
     if (!p.stages.empty() && p.stages[0].info.uses_cooperative_matrix) {   // (the game's networks, once each: what they read and write)
         static std::mutex mu;
@@ -11408,6 +11452,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         } else {
             vkCmdDispatch(cmd, x, y, z);
         }
+        note_compute_dispatch(cmd);
     }
     framegen_hud_before(cmd, picture, picture_level);   // (the game's own network drew the gameplay upscale)
     if (dump_on() && dump_ssbo_wanted(p.key)) dump_ssbos(cmd, p, "after");

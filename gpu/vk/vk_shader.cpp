@@ -1349,8 +1349,16 @@ uint64_t translator_stamp() {
         for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)d)[i]) * 1099511628211ull;
     };
     if (mesh_wg_warp_on()) {
-        const uint32_t wg_warp = 0x77677740u;
+        const uint32_t wg_warp = 0x77677741u;
         add(&wg_warp, sizeof wg_warp);
+    }
+    if (const char* e = getenv("RX_VK_LOOP_SAFETY"); e && e[0] != '0') {
+        const uint32_t ls = 0x6c736166u;   // ("lsaf")
+        add(&ls, sizeof ls);
+    }
+    if (const char* e = getenv("RX_VK_NO_CONTRACTION"); e && e[0] == '0') {
+        const uint32_t fma = 0x666d6130u;   // ("fma0")
+        add(&fma, sizeof fma);
     }
     // (what translates shaders, nx2/build.py: a rebuild of anything else keeps the cache. It was the DLL's bytes, and every build
     // lost it)

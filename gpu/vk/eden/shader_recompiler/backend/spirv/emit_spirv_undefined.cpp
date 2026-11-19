@@ -25,7 +25,7 @@ bool UndefIsZero() {
 } // Anonymous namespace
 
 Id EmitUndefU1(EmitContext& ctx) {
-    return UndefIsZero() ? ctx.false_value : ctx.OpUndef(ctx.U1);
+    return (UndefIsZero() || ctx.runtime_info.mesh_wg_warp32) ? ctx.false_value : ctx.OpUndef(ctx.U1);
 }
 
 Id EmitUndefU8(EmitContext&) {
@@ -37,7 +37,7 @@ Id EmitUndefU16(EmitContext&) {
 }
 
 Id EmitUndefU32(EmitContext& ctx) {
-    return UndefIsZero() ? ctx.u32_zero_value : ctx.OpUndef(ctx.U32[1]);
+    return (UndefIsZero() || ctx.runtime_info.mesh_wg_warp32) ? ctx.u32_zero_value : ctx.OpUndef(ctx.U32[1]);
 }
 
 Id EmitUndefU64(EmitContext&) {

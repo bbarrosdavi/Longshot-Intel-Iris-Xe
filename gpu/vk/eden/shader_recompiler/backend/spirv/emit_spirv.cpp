@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <span>
 #include <tuple>
 #include <type_traits>
@@ -331,7 +332,11 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
-            if (!Settings::values.disable_shader_loop_safety_checks) {
+            static const bool loop_safety = [] {
+                const char* e = std::getenv("RX_VK_LOOP_SAFETY");
+                return e && e[0] != '0';
+            }();
+            if (loop_safety && !Settings::values.disable_shader_loop_safety_checks) {
                 const Id pointer_type{ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1])};
                 const Id safety_counter{ctx.AddGlobalVariable(
                     pointer_type, spv::StorageClass::Private, ctx.Const(0x2000u))};

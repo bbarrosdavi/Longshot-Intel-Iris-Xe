@@ -158,6 +158,7 @@ inline bool IsStorageWrite(IR::Opcode op) noexcept {
 inline bool IsUniformPreservingOp(IR::Opcode op) noexcept {
     using Op = IR::Opcode;
     return op == Op::Identity || op == Op::ConditionRef || op == Op::WorkgroupId ||
+           (op >= Op::UndefU1 && op <= Op::UndefU64) ||
            (op >= Op::GetCbufU8 && op <= Op::GetCbufU32x2) ||
            (op >= Op::CompositeConstructU32x2 && op <= Op::UnpackDouble2x32) ||
            (op >= Op::GetZeroFromOp && op <= Op::GetOverflowFromOp) ||
@@ -654,6 +655,11 @@ inline WorkgroupWarpPlan AnalyzeWorkgroupWarpPlan(const IR::Program& prog, bool 
                         // Mesh: reads read-only task payload (uniform when address is uniform).
                         ok = (prog.stage == Stage::Task) ||
                              (prog.stage == Stage::Mesh && detail::InstArgsUniform(inst, uniform_insts));
+                    } else if (!non_unif_cf &&
+                               (op == Op::VoteAll || op == Op::VoteAny || op == Op::VoteEqual ||
+                                op == Op::SubgroupBallot)) {
+                        // Warp-wide reductions return the identical result to all 32 emulated lanes.
+                        ok = true;
                     } else if (detail::IsUniformPreservingOp(op)) {
                         ok = detail::InstArgsUniform(inst, uniform_insts);
                     } else if (!writes_global && written_storage_bindings.empty() && !non_unif_cf &&
