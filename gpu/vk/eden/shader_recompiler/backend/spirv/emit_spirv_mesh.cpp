@@ -753,7 +753,6 @@ void EmitMeshPrologue(EmitContext& ctx) {
         if (ctx.mesh_info.payload_words) {
             ctx.OpStore(SharedWord(ctx, ctx.mesh_payload, ctx.u32_zero_value), WorkgroupId(ctx));
         }
-        Barrier(ctx);
     }
     // Every invocation stores the zero: no branch here, the entry block's label is a phi
     // predecessor for later blocks.

@@ -289,6 +289,7 @@ struct Info {
 
     bool is_task{}; ///< Switch 2 task program (Stage::Task)
     bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)
+    bool wg_warp32{}; ///< Subgroups emulated via workgroup barriers (pin to SIMD8)
     bool uses_workgroup_id{};
     bool uses_local_invocation_id{};
     bool uses_invocation_id{};

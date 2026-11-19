@@ -1255,15 +1255,87 @@ void mesh_nocull(Shader::IR::Program& program, uint64_t code_key) {
 bool mesh_wg_warp_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_MESH_WG_WARP");
-        if (e && *e) return atoi(e) != 0;
+        if (e && *e) {
+            char* end = nullptr;
+            const long v = strtol(e, &end, 10);
+            if (end && *end == '\0') return v != 0;
+            if (!strcmp(e, "off") || !strcmp(e, "false")) return false;
+            return true;
+        }
         return dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
     }();
     return on;
 }
 
-bool can_workgroup_warp32(const Shader::IR::Program& prog) {
+bool wg_key_matches(const char* list, size_t list_len, uint64_t prog_key, uint64_t code_key) {
+    char phex[17], chex[17];
+    snprintf(phex, sizeof phex, "%016llx", (unsigned long long)prog_key);
+    snprintf(chex, sizeof chex, "%016llx", (unsigned long long)code_key);
+    size_t pos = 0;
+    while (pos < list_len) {
+        size_t end = pos;
+        while (end < list_len && list[end] != ',') end++;
+        const size_t n = end - pos;
+        if (n > 0 && n <= 16) {
+            auto match = [&](const char* hex) {
+                for (size_t i = 0; i < n; i++) {
+                    char a = list[pos + i], b = hex[i];
+                    if (a >= 'A' && a <= 'F') a += 'a' - 'A';
+                    if (a != b) return false;
+                }
+                return true;
+            };
+            if (match(phex) || match(chex)) return true;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+
+bool mesh_wg_warp_allow(bool is_compute, uint64_t prog_key, uint64_t code_key, bool* want_log = nullptr) {
     if (!mesh_wg_warp_on()) return false;
-    return Shader::Backend::SPIRV::AnalyzeWorkgroupWarpPlan(prog, true).eligible;
+    const char* e = getenv("RX_VK_MESH_WG_WARP");
+    if (!e || !*e) return true;
+    const size_t elen = strlen(e);
+    size_t pos = 0;
+    while (pos < elen) {
+        size_t end = pos;
+        while (end < elen && e[end] != ';') end++;
+        const size_t n = end - pos;
+        if (n == 4 && !strncmp(e + pos, "mesh", 4) && is_compute) return false;
+        if (n == 7 && !strncmp(e + pos, "compute", 7) && !is_compute) return false;
+        if (n == 3 && !strncmp(e + pos, "log", 3)) {
+            if (want_log) *want_log = true;
+        } else if (n > 5 && !strncmp(e + pos, "skip:", 5)) {
+            if (wg_key_matches(e + pos + 5, n - 5, prog_key, code_key)) return false;
+        } else if (n > 5 && !strncmp(e + pos, "only:", 5)) {
+            if (!wg_key_matches(e + pos + 5, n - 5, prog_key, code_key)) return false;
+        }
+        pos = end + 1;
+    }
+    return true;
+}
+
+bool can_workgroup_warp32(const Shader::IR::Program& prog, uint64_t prog_key = 0, uint64_t code_key = 0) {
+    bool want_log = false;
+    if (!mesh_wg_warp_allow(false, prog_key, code_key, &want_log)) return false;
+    const auto plan = Shader::Backend::SPIRV::AnalyzeWorkgroupWarpPlan(prog, true);
+    if (want_log) {
+        if (plan.eligible) {
+            logf("vk: wg_warp32 stage=%d prog=%016llx code=%016llx %ux%ux%u shared=%u",
+                 (int)prog.stage, (unsigned long long)prog_key, (unsigned long long)code_key,
+                 prog.workgroup_size[0], prog.workgroup_size[1], prog.workgroup_size[2],
+                 prog.shared_memory_size);
+        } else if (prog.info.uses_subgroup_vote || prog.info.uses_subgroup_mask ||
+                   prog.info.uses_subgroup_invocation_id || prog.info.uses_subgroup_shuffles ||
+                   prog.info.uses_quad_shuffles) {
+            logf("vk: wg_warp32 REJECT stage=%d prog=%016llx code=%016llx %ux%ux%u shared=%u why=%s",
+                 (int)prog.stage, (unsigned long long)prog_key, (unsigned long long)code_key,
+                 prog.workgroup_size[0], prog.workgroup_size[1], prog.workgroup_size[2],
+                 prog.shared_memory_size, plan.reject_reason ? plan.reject_reason : "unknown");
+        }
+    }
+    return plan.eligible;
 }
 
 // (longshot) What the program cache's records are good for, as far as the translation goes: this translator (LONGSHOT_SHADER_STAMP,
@@ -1277,7 +1349,7 @@ uint64_t translator_stamp() {
         for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)d)[i]) * 1099511628211ull;
     };
     if (mesh_wg_warp_on()) {
-        const uint32_t wg_warp = 0x7767773au;
+        const uint32_t wg_warp = 0x77677740u;
         add(&wg_warp, sizeof wg_warp);
     }
     // (what translates shaders, nx2/build.py: a rebuild of anything else keeps the cache. It was the DLL's bytes, and every build
@@ -1426,9 +1498,63 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                     Shader::Optimization::g_gm_port_this = false;
                 }
             } reset_table;
+            const size_t q_at0 = questions_at;
+            const size_t q_out0 = questions_out ? questions_out->size() : 0;
             auto t = translate(env, false);
-            questions += env.texture_questions;
+            int tex_q = env.texture_questions;
             Shader::RuntimeInfo rt{};
+            bool want_log = false;
+            const bool skip_wg_warp =
+                p.key == 0x27ee9883e2a20323ull || p.key == 0xee7764a6b1ef459cull ||
+                !mesh_wg_warp_allow(true, p.key, csc->key, &want_log);
+            if (!skip_wg_warp) {
+                auto plan = Shader::Backend::SPIRV::AnalyzeWorkgroupWarpPlan(t->program, true);
+                if (!plan.eligible && plan.had_early_return) {
+                    const size_t q_at1 = questions_at;
+                    std::vector<uint8_t> tmp_q;
+                    std::vector<uint8_t>* orig_q_out = questions_out;
+                    if (orig_q_out) {
+                        tmp_q.assign(orig_q_out->begin(), orig_q_out->begin() + q_out0);
+                        questions_out = &tmp_q;
+                    }
+                    questions_at = q_at0;
+                    bool keep1 = false;
+                    try {
+                        Env env1{s, *csc, Shader::Stage::Compute};
+                        auto t1 = translate(env1, false, true);
+                        auto plan1 = Shader::Backend::SPIRV::AnalyzeWorkgroupWarpPlan(t1->program, true);
+                        if (plan1.eligible) {
+                            t = std::move(t1);
+                            tex_q = env1.texture_questions;
+                            plan = std::move(plan1);
+                            keep1 = true;
+                            if (orig_q_out) *orig_q_out = std::move(tmp_q);
+                        } else {
+                            plan.reject_reason = plan1.reject_reason ? plan1.reject_reason : "one_exit_fail";
+                        }
+                    } catch (...) {
+                    }
+                    questions_out = orig_q_out;
+                    if (!keep1) questions_at = q_at1;
+                }
+                rt.mesh_wg_warp32 = plan.eligible;
+                if (want_log) {
+                    if (plan.eligible) {
+                        logf("vk: wg_warp32 compute prog=%016llx code=%016llx %ux%ux%u shared=%u",
+                             (unsigned long long)p.key, (unsigned long long)csc->key,
+                             t->program.workgroup_size[0], t->program.workgroup_size[1], t->program.workgroup_size[2],
+                             t->program.shared_memory_size);
+                    } else if (t->program.info.uses_subgroup_vote || t->program.info.uses_subgroup_mask ||
+                               t->program.info.uses_subgroup_invocation_id || t->program.info.uses_subgroup_shuffles ||
+                               t->program.info.uses_quad_shuffles) {
+                        logf("vk: wg_warp32 REJECT compute prog=%016llx code=%016llx %ux%ux%u shared=%u why=%s",
+                             (unsigned long long)p.key, (unsigned long long)csc->key,
+                             t->program.workgroup_size[0], t->program.workgroup_size[1], t->program.workgroup_size[2],
+                             t->program.shared_memory_size, plan.reject_reason ? plan.reject_reason : "unknown");
+                    }
+                }
+            }
+            questions += tex_q;
             dump_ir(p, "compute", t->program);   // (before the SPIR-V: the programs it fails on are the ones to read)
             if (getenv("RX_VK_IR"))
                 logf("vk: compute %016llx: workgroup %ux%ux%u, shared memory %u bytes, local memory %u", (unsigned long long)p.key,
@@ -1470,6 +1596,14 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             Stage st;
             st.nvn_stage = 5;
             st.info = t->program.info;
+            if (rt.mesh_wg_warp32) {
+                st.info.wg_warp32 = true;
+                st.info.uses_subgroup_vote = false;
+                st.info.uses_subgroup_mask = false;
+                st.info.uses_subgroup_invocation_id = false;
+                st.info.uses_subgroup_shuffles = false;
+                st.info.uses_quad_shuffles = false;
+            }
             st.module = make_module(spirv);
             kept.push_back(spirv);
             st.vk_stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1653,13 +1787,14 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             rt.previous_stage_stores.mask.set();
             rt.mesh_fallback = fallback;
             rt.mesh_fallback_capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
-            rt.mesh_wg_warp32 = fallback && can_workgroup_warp32(task_t->program);
+            rt.mesh_wg_warp32 = fallback && can_workgroup_warp32(task_t->program, p.key, task->key);
             const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(fallback ? profile_pinned() : profile_graphics(VK_SHADER_STAGE_TASK_BIT_EXT), rt, task_t->program, bindings);
             kept.push_back(spirv);
             Stage st;
             st.nvn_stage = bank_stage(*task);
             st.info = task_t->program.info;
             if (rt.mesh_wg_warp32) {
+                st.info.wg_warp32 = true;
                 st.info.uses_subgroup_vote = false;
                 st.info.uses_subgroup_mask = false;
                 st.info.uses_subgroup_invocation_id = false;
@@ -1698,13 +1833,14 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         mrt.mesh_fallback_task = task_t != nullptr;
         mrt.mesh_fallback_task_threads = task_t ? task_t->program.workgroup_size[0] : 0;
         mrt.mesh_fallback_layout = fallback ? mesh_fallback_layout() : 0;
-        mrt.mesh_wg_warp32 = fallback && can_workgroup_warp32(mesh_t->program);
+        mrt.mesh_wg_warp32 = fallback && can_workgroup_warp32(mesh_t->program, p.key, mesh.key);
         const std::vector<uint32_t> mspirv = Shader::Backend::SPIRV::EmitSPIRV(fallback ? profile_pinned() : profile_graphics(VK_SHADER_STAGE_MESH_BIT_EXT), mrt, mesh_t->program, bindings);
         kept.push_back(mspirv);
         Stage ms;
         ms.nvn_stage = bank_stage(mesh);
         ms.info = mesh_t->program.info;
         if (mrt.mesh_wg_warp32) {
+            ms.info.wg_warp32 = true;
             ms.info.uses_subgroup_vote = false;
             ms.info.uses_subgroup_mask = false;
             ms.info.uses_subgroup_invocation_id = false;

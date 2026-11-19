@@ -176,6 +176,10 @@ public:
         current_block_label = res;
         wg_shfl_cached_block = {};
         wg_shfl_cached_value = {};
+        wg_shfl_cached_slot = {};
+        wg_ballot_cached_block = {};
+        wg_ballot_cached_pred = {};
+        wg_ballot_cached_result = {};
         return res;
     }
 
@@ -442,11 +446,21 @@ public:
     Id mesh_fallback_epilogue_line{};   ///< (longshot) the Soa records' line, WriteFallbackLines' inner loop index, as above
     Id mesh_wg_ballot{};
     Id mesh_wg_shfl{};
+    Id wg_ballot_slot{};
+    Id wg_shfl_slot{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
+    u32 mesh_wg_warps{1};
+    u32 wg_size_x{1};
+    u32 wg_size_y{1};
+    u32 wg_size_z{1};
     Id current_block_label{};
     Id linear_exec_id{};
     Id wg_shfl_cached_block{};
     Id wg_shfl_cached_value{};
+    Id wg_shfl_cached_slot{};
+    Id wg_ballot_cached_block{};
+    Id wg_ballot_cached_pred{};
+    Id wg_ballot_cached_result{};
     std::unordered_map<const IR::Block*, Id> block_end_labels;
     std::unordered_map<u32, Id> null_constants;
     std::vector<IR::Inst*> deferred_ir_phis;
@@ -519,7 +533,7 @@ private:
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
-    void DefineWorkgroupWarp();
+    void DefineWorkgroupWarp(const IR::Program& program);
 };
 
 } // namespace Shader::Backend::SPIRV

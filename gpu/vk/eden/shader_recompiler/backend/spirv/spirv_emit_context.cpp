@@ -590,7 +590,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
         DefineRescalingInputPushConstant();
     }
     DefineMesh(program);
-    DefineWorkgroupWarp();
+    DefineWorkgroupWarp(program);
     DefineLocalMemory(program);
     DefineSharedMemory(program);
     DefineSharedMemoryFunctions(program);
@@ -2570,16 +2570,27 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     }
 }
 
-void EmitContext::DefineWorkgroupWarp() {
+void EmitContext::DefineWorkgroupWarp(const IR::Program& program) {
     if (!runtime_info.mesh_wg_warp32) {
         return;
     }
+    wg_size_x = program.workgroup_size[0];
+    wg_size_y = program.stage == Stage::Compute ? program.workgroup_size[1] : 1U;
+    wg_size_z = program.stage == Stage::Compute ? program.workgroup_size[2] : 1U;
+    const u32 total_threads{wg_size_x * wg_size_y * wg_size_z};
+    mesh_wg_warps = std::max(1U, (total_threads + 31U) / 32U);
     if (!Sirit::ValidId(mesh_shared_u32)) {
         mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
     }
-    mesh_wg_ballot = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+    // Wrap Workgroup array elements in a fresh OpTypeStruct so Sirit never aliases them with
+    // ArrayStride-decorated push-constant/UBO/shared arrays of matching length.
+    // 2 ping-pong slots x mesh_wg_warps x 4 SIMD8 subgroups for ballot; 2 x mesh_wg_warps x 32 for shuffle.
+    const Id wg_word_t{TypeStruct(U32[1])};
+    mesh_wg_ballot = DefineVariable(*this, TypeArray(wg_word_t, Const(2U * mesh_wg_warps * 4U)),
+                                    std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_wg_ballot, "wg_ballot");
-    mesh_wg_shfl = DefineVariable(*this, TypeArray(U32[1], Const(32U)), std::nullopt, spv::StorageClass::Workgroup);
+    mesh_wg_shfl = DefineVariable(*this, TypeArray(wg_word_t, Const(2U * mesh_wg_warps * 32U)),
+                                  std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_wg_shfl, "wg_shfl");
 }
 

@@ -244,11 +244,10 @@ bool compute_pin_8_needed(const Program& p) {
     static const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
     static const compute_pin::Mode mode =
         compute_pin::mode_for(intel_mesa, getenv("RX_VK_COMPUTE_PIN"));
-    // (27ee9883e2a20323 8x8x8 and ee7764a6b1ef459c 8x4x4 only emit subgroup ops for Ampere R2UR on values uniform
-    // across every 8- and 16-lane slice, and 27ee9883e2a20323's shared memory is strictly per-thread scratch; unpinned
-    // on Mesa Intel ANV still compiled both as SIMD32 with >800 spills, so explicitly pin them to SIMD8)
+    // Wait until a shader passes SPIR-V workgroup-warp lowering or is explicitly safe at SIMD8.
     return intel_mesa && mode == compute_pin::Mode::Lanes &&
-           (p.key == 0x27ee9883e2a20323ull || p.key == 0xee7764a6b1ef459cull);
+           (p.key == 0x27ee9883e2a20323ull || p.key == 0xee7764a6b1ef459cull ||
+            (!p.stages.empty() && p.stages[0].info.wg_warp32));
 }
 /// (longshot) Whether a game compute program's stage is held to 32 lanes: every one, but on Mesa's Intel driver only those that
 /// can tell their lanes (compute_pin.h: held to 32 lanes that compiler takes minutes and gigabytes over a large program, and
@@ -7368,7 +7367,8 @@ bool fallback_compute_pipelines(Program& p) {
         si.module = st.module;
         si.pName = "main";
         const compute_pin::Uses u = compute_stage_uses(st, p.shared_memory);
-        const bool simd8_mesh = mesa_intel && (st.nvn_stage == 7 || st.nvn_stage == 6) && !compute_pin::sees_lanes(u);
+        const bool simd8_mesh = mesa_intel && (st.nvn_stage == 7 || st.nvn_stage == 6) &&
+                                (st.info.wg_warp32 || !compute_pin::sees_lanes(u));
         if (simd8_mesh) pin_subgroup_8(si, 32);
         else pin_subgroup(si, 32);
         compute_describe(p, st);

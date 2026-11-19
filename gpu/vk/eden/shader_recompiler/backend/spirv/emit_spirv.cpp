@@ -184,6 +184,7 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
     std::vector<Id> linear_if_conds(program.syntax_list.size());
     std::vector<bool> if_was_linear;
     std::vector<Id> prev_exec_stack;
+    bool wg_slots_declared{false};
     // (EvilOOT, RX_VK_BLOCK_PROBE=1 with RX_VK_MISS_LOG=1 and RX_VK_MISS_LOG_PROG=<key>: each block's entries counted, by
     // invocation, in the miss log's words 128 + the block's index in program.blocks: IR::DumpProgram's "Block $n")
     static const bool probe_env{std::getenv("RX_VK_BLOCK_PROBE") != nullptr};
@@ -202,6 +203,16 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (!wg_slots_declared) {
+                wg_slots_declared = true;
+                if (ctx.runtime_info.mesh_wg_warp32) {
+                    const Id fn_u32{ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1])};
+                    ctx.wg_ballot_slot =
+                        ctx.AddLocalVariable(fn_u32, spv::StorageClass::Function, ctx.u32_zero_value);
+                    ctx.wg_shfl_slot =
+                        ctx.AddLocalVariable(fn_u32, spv::StorageClass::Function, ctx.u32_zero_value);
+                }
+            }
             bool probed{!probe};
             for (auto it = node.data.block->begin(); it != node.data.block->end();) {
                 IR::Inst& inst{*it};
@@ -275,11 +286,11 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             const bool is_lin{plan.eligible && node_idx < plan.linearize_if.size() && plan.linearize_if[node_idx]};
             if_was_linear.push_back(is_lin);
             if (is_lin) {
-                linear_if_conds[node_idx] = cond_id;
                 prev_exec_stack.push_back(ctx.linear_exec_id);
                 ctx.linear_exec_id = Sirit::ValidId(ctx.linear_exec_id)
                                          ? ctx.OpLogicalAnd(ctx.U1, ctx.linear_exec_id, cond_id)
                                          : cond_id;
+                linear_if_conds[node_idx] = ctx.linear_exec_id;
                 ctx.OpBranch(if_label);
             } else {
                 if (Sirit::ValidId(ctx.linear_exec_id)) {
@@ -626,6 +637,11 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         info.loads[IR::Attribute::DrawID] || (ctx.wants_mesh_first && !ctx.mesh_fallback)) {
         ctx.AddExtension("SPV_KHR_shader_draw_parameters");
         ctx.AddCapability(spv::Capability::DrawParameters);
+    }
+    if (ctx.runtime_info.mesh_wg_warp32 && profile.support_vote &&
+        profile.SupportsSubgroupStage(ctx.stage)) {
+        ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
+        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
     }
     if (!ctx.runtime_info.mesh_wg_warp32 &&
         (info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
