@@ -514,6 +514,7 @@ SW(RX_VK_NO_PROGRAM_CACHE, kill, bool, "program cache and pipeline notes read an
 SW(RX_VK_NO_STATE_LIST, kill, bool, "pipeline state list recorded and prepared from", "1 turns off recording pipeline states to the state list and preparing pipelines from it.")
 SW(RX_VK_NO_SUBGROUP_PIN, kill, bool, "subgroup size pinned to 32 where the device supports size control", "Stops pinning shader stages to a subgroup size of 32.")
 SW(RX_VK_NO_WRITEBACK, attempt, bool, "off: GPU writes are copied back to guest memory", "GPU writes to mirrored pools are not copied back to guest memory (an experiment, for A/B).")
+SW(RX_VK_NVN_NARROW, attempt, bool, "off: every barrier of the game's (nvnCommandBufferBarrier) is a full barrier", "Narrows each game barrier to the stages its NVN bits name.")
 SW(RX_VK_OCC_COPY, hw, bool, "on for Intel discrete cards on Intel's Windows driver, off elsewhere; always off with parallel replay", "1 copies occlusion results to a host buffer on any GPU, 0 reads them from the query pool.")
 SW(RX_VK_OCC_DRY, diag, bool, "off", "Occlusion queries are made and read but the reports are left at 4096, to time the queries alone.")
 SW(RX_VK_OCC_FIXED, attempt, int, "unset: real queries; the fallback fixed value is 4096", "Every samples-passed report reads this fixed value and real queries are off; -1 uses the per-draw count.")

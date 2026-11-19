@@ -2647,12 +2647,16 @@ void pass_start_barrier(VkCommandBuffer cmd) {
     }();
     const bool par = par_active.load(std::memory_order_relaxed);
     const uint64_t cur_epoch = work_epoch.load(std::memory_order_relaxed);
+    // (fragments only is enough right after a pass ended; after anything else (a dispatch, a copy) the start needs the full barrier.
+    // A fragments-only barrier just before, the game's ORDER_FRAGMENTS among them, does not stand in for it: the next pass's vertex
+    // stage and indirect reads ran over a dispatch still writing, and the GPU hung)
+    const bool relaxed = game && !par && cmd == last_pass_end_cmd && cur_epoch == last_pass_end_epoch;
     const uint32_t prev_scope = current_barrier_scope(cmd, cur_epoch, !dedupe_off && !par);
-    if (prev_scope & kScopeFrag) {
+    if (prev_scope & (relaxed ? kScopeFrag : kScopeFull)) {
         st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (!game || par || cmd != last_pass_end_cmd || cur_epoch != last_pass_end_epoch) {
+    if (!relaxed) {
         full_barrier(cmd, "barrier (pass start)");
         return;
     }
@@ -2722,10 +2726,11 @@ void dispatch_barrier(VkCommandBuffer cmd, bool indirect) {
 }
 
 void nvn_barrier(VkCommandBuffer cmd, int32_t bits) {
-    static const bool full_nvn = env_on("RX_VK_NVN_FULL_BARRIER");
+    // (narrowed by the game's bits only with RX_VK_NVN_NARROW=1: on Iris Xe it gained no frame time, and the runs with it hung the GPU)
+    static const bool narrow_nvn = env_on("RX_VK_NVN_NARROW");
     static const bool dedupe_off = env_on("RX_VK_BARRIER_DEDUPE_OFF");
     const bool par = par_active.load(std::memory_order_relaxed);
-    if (full_nvn || par || !bits) {
+    if (!narrow_nvn || par || !bits) {
         full_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");
         return;
     }
