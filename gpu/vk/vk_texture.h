@@ -27,6 +27,7 @@ struct Texture {
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageUsageFlags usage = 0;
     VkImageCreateFlags create_flags = 0;   // (longshot: as its image was made, for the compaction's copy of it)
+    uint8_t fmt_list_kind = 0;             // (VkImageFormatListCreateInfo class attached at creation, 0 = none)
     uint32_t width = 1, height = 1, depth = 1, levels = 1, layers = 1;   // the image's (after skip)
     uint32_t skip = 0;        // top levels of the texture left out (huge textures: RX_VK_TEX_MAX_DIM, _MAX_MB)
     // (a huge array kept whole as a sparse resident image instead: each layer gets device memory when it is first
@@ -113,6 +114,8 @@ void texture_resident_flush(Texture* tex);
 /// What the replay's recording is: the main command buffer, and the one uploads and new images' layout changes go to
 /// (submitted right before it, so nothing has to end a render pass for them)
 void texture_begin_recording(VkCommandBuffer upload_cmd, uint64_t value);
+using TextureDemoteCmdFn = VkCommandBuffer (*)();
+void texture_set_demote_cmd_fn(TextureDemoteCmdFn fn);
 /// true when anything was recorded into the upload command buffer since texture_begin_recording
 bool texture_uploads_recorded();
 /// The recording's upload command buffer, to record into (its first use orders it after the work before)

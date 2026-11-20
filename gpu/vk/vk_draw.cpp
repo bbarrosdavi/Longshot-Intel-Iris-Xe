@@ -3660,7 +3660,7 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
                      has_view && v.set_format ? v.format : 0, has_view && v.set_target ? v.target : -1, (int)want, (int)use);
         }
     }
-    handle_hits()[key] = {view, tex, dgen, level, version, texture_epoch(), use == ViewUse::Sample || use == ViewUse::Storage};
+    handle_hits()[key] = {view, tex, texture_destroy_generation(), level, version, texture_epoch(), use == ViewUse::Sample || use == ViewUse::Storage};
     if (tex_out) *tex_out = tex;
     if (level_out) *level_out = level;
     return view;
@@ -5122,10 +5122,12 @@ struct IndexBind {
 int64_t st_desc_reused;
 
 thread_local uint64_t targets_serial = ~0ull;   // (the state's render targets resolved once per NOP_SET_RT)
+thread_local uint64_t targets_dgen = ~0ull;
 thread_local Targets cached_targets;
 
 Targets targets(NvnState& s) {
-    if (targets_serial == s.rt_serial) return cached_targets;
+    const uint64_t cur_dgen = texture_destroy_generation();
+    if (targets_serial == s.rt_serial && targets_dgen == cur_dgen) return cached_targets;
     ParLock lk;
     Targets at;
     at.n = std::clamp(s.rt.n, 0, 8);
@@ -5178,6 +5180,7 @@ Targets targets(NvnState& s) {
         }
     }
     targets_serial = s.rt_serial;
+    targets_dgen = texture_destroy_generation();
     cached_targets = at;
     return at;
 }
@@ -5944,6 +5947,11 @@ void clear_stats(int64_t* clears, int64_t* masked) {
 }
 
 namespace {
+VkCommandBuffer demote_cmd_outside_pass() {
+    if (!rec_cmd) return VK_NULL_HANDLE;
+    end_pass(rec_cmd);
+    return rec_cmd;
+}
 } // namespace
 
 void draw_flush_recording(int slot) {
@@ -5960,6 +5968,7 @@ void draw_flush_recording(int slot) {
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     rec_cmd = cmd;
     rec_value = value;
+    texture_set_demote_cmd_fn(demote_cmd_outside_pass);
     ParLock lk;
     if ((size_t)slot >= res.size()) res.resize((size_t)slot + 1);
     RecordingRes& r = res[slot];
@@ -8049,7 +8058,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         static int logged;
         if (logged++ < 5) logf("vk: a draw with patches");
     }
-    const Targets at = bare_targets(s, targets(s));
+    Targets at = bare_targets(s, targets(s));
     if (!at.width || !at.height) SKIP_HERE();
     // (longshot) the scene's camera and depth for the temporal upscalers: NVIDIA DLSS and AMD FSR 4 (vk_temporal.cpp) and AMD
     // FSR 3.1 (vk_fsr3_inputs.cpp). The vertex stage's uniform buffer 3 (NVN's binding 0)
@@ -8376,6 +8385,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_N(FC_BUILDS, 1);
         trace_tex_hit = nullptr, trace_tex_mask = 0;
         build_descriptors(s, p);   // (textures first used here are uploaded by the recording's upload command buffer)
+        if (texture_destroy_generation() != dgen) at = bare_targets(s, targets(s));
         cb.desc.gm_ranges = dw().gm_ranges_address;
         FINE_N(FC_WRITES, (int64_t)dw().writes.size());
         static std::string last_logged;
@@ -8509,7 +8519,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_BINDDESC);
         if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p)) SKIP_HERE();
         cb.desc.valid = true, cb.desc.prog = &p, cb.desc.bind = s.bind_gen, cb.desc.reg = reg_gen;
-        cb.desc.ub = ub_gen, cb.desc.dgen = dgen;
+        cb.desc.ub = ub_gen, cb.desc.dgen = texture_destroy_generation();
         cb.desc.fp_on = desc_fp_on;
         if (desc_fp_on)   // (Descriptor reuse: what its handles resolved; the next such draw may keep it through other slots' churn)
             cb.desc.fp = desc_fp(), cb.desc.fp_dummy = desc_fp_dummy, cb.desc.samp = desc_samp_seen,
