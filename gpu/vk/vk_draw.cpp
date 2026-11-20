@@ -4189,6 +4189,7 @@ void dump_ssbos(VkCommandBuffer cmd, const Program& p, const char* when) {
     }
 }
 
+bool pending_clear_tracks(const Texture* tex);
 void build_descriptors(const NvnState& s, const Program& p) {
     // (longshot) the thread's writer asked for once: each dw() is a thread-local lookup, a call in a shared library, and a
     // build made dozens of them
@@ -4595,7 +4596,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                (unsigned long long)p.key, k, handle, tex ? tex->id : 0, (unsigned long long)(tex ? tex->gpu : 0),
                                tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
                                (void*)view, view ? "" : " (dummy)");
-                if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
+                if (view && tex && (tex->gpu_written || pending_clear_tracks(tex))) draw_sampled().push_back(tex);
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
                 // (an image of one level: no anisotropy of the row's, sampler_make)
                 out.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth, tex && tex->levels <= 1), view,
@@ -5101,6 +5102,20 @@ struct PendingClear {
     uint32_t stencil_val = 0;
 };
 TLS_OBJECT(pending_clear, PendingClear)
+inline bool pending_clear_has(const PendingClear& pc, const Texture* tex) {
+    if (!pc.active || !tex) return false;
+    if (pc.at.depth == tex && (pc.depth_clear || pc.stencil_clear)) return true;
+    for (int i = 0; i < pc.at.n; i++)
+        if (pc.at.color[i] == tex && (pc.color_mask & (1u << i))) return true;
+    return false;
+}
+bool pending_clear_tracks(const Texture* tex) { return pending_clear_has(pending_clear(), tex); }
+inline bool pending_clear_untouched(const PendingClear& pc, const std::vector<const Texture*>& sampled) {
+    if (!pc.active) return true;
+    for (const Texture* t : sampled)
+        if (pending_clear_has(pc, t)) return false;
+    return true;
+}
 inline bool targets_equal(const Targets& a, const Targets& b) {
     if (a.n != b.n || a.depth_view != b.depth_view || a.width != b.width || a.height != b.height ||
         a.has_block_images != b.has_block_images)
@@ -6128,6 +6143,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     cur = &r;
     pass() = Pass{};
     pending_clear() = PendingClear{};
+    mfb_batch_end();
     work_since_barrier = false;
     bound().reset();
     descriptors_disturbed();
@@ -7268,7 +7284,7 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
         mesh_ring_at += bytes;
     }
     mesh_conv_interrupted_pass = pass().open;
-    end_pass(cmd);
+    if (pass().open) end_pass(cmd);
     {
         static const bool mfb_full_barriers = env_on("RX_VK_MFB_FULL_BARRIER");
         GprofSpan gp(cmd, "mfb conv (indirect args)");
@@ -7383,7 +7399,10 @@ struct FallbackBuffers {
     uint64_t records_bytes = 0, payload_bytes = 0;
 };
 // (grown pairs stay: a command buffer recorded before the growth may still read them)
-TLS_OBJECT(fallback_buffers, std::vector<FallbackBuffers>)
+// (Batch 10E: fixed 12-slot outer array per recording thread so slot growth never invalidates earlier slot pointers)
+constexpr size_t kMaxMfbBatchSlots = 12;
+using FallbackSlotArray = std::array<std::vector<FallbackBuffers>, kMaxMfbBatchSlots>;
+TLS_OBJECT(fallback_buffer_slots, FallbackSlotArray)
 thread_local VkBuffer fallback_draw_records = VK_NULL_HANDLE;   // (the last fallback_record's: its header is the draw's command)
 
 uint32_t fallback_task_groups(const Program& p) {
@@ -7396,8 +7415,8 @@ uint64_t fallback_buffer_address(VkBuffer buffer) {
     return vkGetBufferDeviceAddress(dev.device, &info);
 }
 
-bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
-    if (!p.fallback_vertices_per_workgroup || !p.fallback_record_words) return false;
+bool fallback_buffers_slot(size_t slot, const Program& p, FallbackBuffers*& out) {
+    if (slot >= kMaxMfbBatchSlots || !p.fallback_vertices_per_workgroup || !p.fallback_record_words) return false;
     const uint64_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     // (the header, the draw's command, the allocator and the mesh dispatch, and then a fixed area every program takes records
     // from, a primitive's corners at a time: only the primitives the mesh workgroups output, not a slot's worst case each.
@@ -7409,7 +7428,7 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     // (the map, a slot a started mesh workgroup, and a payload a task workgroup, its threads' meshlets sharing it)
     const uint64_t threads = std::max(1u, p.fallback_task_threads);
     const uint64_t payload = p.fallback_task ? capacity * 4 + (capacity + threads - 1) / threads * (uint64_t)p.fallback_payload_words * 4 : 0;
-    auto& sets = fallback_buffers();
+    auto& sets = fallback_buffer_slots()[slot];
     for (auto it = sets.rbegin(); it != sets.rend(); ++it) {
         if (it->records && it->records_bytes >= records && (!payload || (it->payload && it->payload_bytes >= payload))) {
             out = &*it;
@@ -7456,6 +7475,10 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     sets.push_back(f);
     out = &sets.back();
     return true;
+}
+
+bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
+    return fallback_buffers_slot(0, p, out);
 }
 
 bool fallback_compute_pipelines(Program& p) {
@@ -7671,7 +7694,11 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     const bool interrupted_pass = pass().open || mesh_conv_interrupted_pass;
     mesh_conv_interrupted_pass = false;
-    end_pass(cmd);
+    if (pass().open) {
+        end_pass(cmd);
+    } else if (pending_clear().active && !pending_clear_untouched(pending_clear(), gfx_sampled())) {
+        flush_pending_clears(cmd);
+    }
     // (the shared pair: the last fallback draw on it, of any program of this thread, has read it before it is reset;
     // narrow to compute/VS/indirect/transfer when interrupting an open pass so prior render-pass color/depth writes need not
     // flush before task/mesh compute; include color/depth attachment writes when not interrupting an open pass)
@@ -8155,13 +8182,521 @@ static bool fallback_list_held(uint64_t list) {
     return false;
 }
 
-void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+namespace {
+struct MfbBatchItem {
+    Program* prog = nullptr;
+    FallbackBuffers* fb = nullptr;
+    DrawArgs d{};
+    size_t stage_task = 0;
+    size_t stage_mesh = 0;
+    BufferRef ind_args{};
+    uint32_t ind_n = 0;
+    uint32_t ind_stride = 8;
+    uint64_t mesh_conv_off = 0;
+    uint64_t indirect_input = 0;
+    uint64_t gm_ranges = 0;
+    DescWriter dw{};
+    VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    std::vector<const Texture*> sampled;
+    std::vector<uint64_t> fp;
+    bool fp_dummy = false;
+    bool fp_on = false;
+    uint64_t samp = 0;
+    uint64_t destroy = 0;
+};
+
+struct MfbBatchState {
+    std::vector<MfbBatchItem> items;
+    int count = 0;
+    Targets at{};
+    uint64_t dgen_start = 0;
+    uint16_t written_mask = 0;
+    bool flushed = false;
+};
+TLS_OBJECT(mfb_batch, MfbBatchState)
+
+std::atomic<int64_t> st_mfb_batches{0};
+std::atomic<int64_t> st_mfb_batched_draws{0};
+std::atomic<int64_t> st_mfb_clears_kept{0};
+
+bool alloc_batch_desc_set(const Program& p, MfbBatchItem& item) {
+    if (p.push || item.dw.writes.empty()) {
+        item.desc_set = VK_NULL_HANDLE;
+        return true;
+    }
+    if (g_fine) {
+        fine_n[FC_POOL_SETS]++;
+        for (const VkWriteDescriptorSet& w : item.dw.writes) fine_n[FC_POOL_DESCS] += w.descriptorCount;
+    }
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = cur->extra.empty() ? cur->pool : cur->extra.back();
+    if (!ai.descriptorPool) return false;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &p.set_layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(dev.device, &ai, &set) != VK_SUCCESS) {
+        const VkDescriptorPool pool = make_pool();
+        if (!pool) return false;
+        ai.descriptorPool = pool;
+        if (vkAllocateDescriptorSets(dev.device, &ai, &set) != VK_SUCCESS) {
+            vkDestroyDescriptorPool(dev.device, pool, nullptr);
+            return false;
+        }
+        try {
+            cur->extra.push_back(pool);
+            pools_extra.fetch_add(1, std::memory_order_relaxed);
+        } catch (const std::exception&) {
+            vkDestroyDescriptorPool(dev.device, pool, nullptr);
+            return false;
+        }
+    }
+    for (auto& w : item.dw.writes) w.dstSet = set;
+    vkUpdateDescriptorSets(dev.device, (uint32_t)item.dw.writes.size(), item.dw.writes.data(), 0, nullptr);
+    item.desc_set = set;
+    return true;
+}
+
+bool bind_batch_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program& p, const MfbBatchItem& item) {
+    if (item.dw.writes.empty()) return true;
+    if (item.desc_set) {
+        pushed()[bp == VK_PIPELINE_BIND_POINT_COMPUTE].cmd = VK_NULL_HANDLE;
+        vkCmdBindDescriptorSets(cmd, bp, p.layout, 0, 1, &item.desc_set, 0, nullptr);
+        return true;
+    }
+    std::swap(dw(), const_cast<DescWriter&>(item.dw));
+    const bool ok = bind_descriptors(cmd, bp, p);
+    std::swap(dw(), const_cast<DescWriter&>(item.dw));
+    dw().prog = nullptr;
+    return ok;
+}
+} // namespace
+
+int mfb_batch_limit() {
+    static const int cfg = [] {
+        if (!dev.mesh_fallback && !dev.task_mesh_fallback) return 0;
+        const char* e = getenv("RX_VK_MFB_BATCH");
+        if (e) {
+            const int n = std::clamp(atoi(e), 0, 12);
+            logf("vk: RX_VK_MFB_BATCH=%d (override)", n);
+            return n;
+        }
+        uint64_t used = 0, budget = 0;
+        const bool have = vram_usage(&used, &budget);
+        const uint64_t budget_mb = have ? (budget >> 20) : 0;
+        const int def = budget_mb >= 4500 ? 4 : budget_mb >= 3500 ? 2 : 0;
+        if (def >= 2)
+            logf("vk: RX_VK_MFB_BATCH=%d (default, VRAM allowance %llu MB)", def, (unsigned long long)budget_mb);
+        return def;
+    }();
+    if (cfg < 2) return 0;
+    static const bool disabled_env =
+        (getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0) ||
+        env_on("RX_VK_BARRIER_EVERY_DRAW") ||
+        (getenv("RX_VK_NO_MESH") && atoi(getenv("RX_VK_NO_MESH")) != 0) ||
+        (getenv("RX_VK_SKIP_PROG") && strcmp(getenv("RX_VK_SKIP_PROG"), "-") != 0) ||
+        (getenv("RX_VK_SKIP_CODE") && *getenv("RX_VK_SKIP_CODE"));
+    if (disabled_env || dump_on() || probe_on() || stats_frame_now()) return 0;
+    return cfg;
+}
+
+void mfb_batch_begin() {
+    MfbBatchState& b = mfb_batch();
+    b.count = 0;
+    b.dgen_start = texture_destroy_generation();
+    b.written_mask = 0;
+    b.flushed = false;
+}
+
+void mfb_batch_end() {
+    MfbBatchState& b = mfb_batch();
+    b.count = 0;
+    b.flushed = false;
+}
+
+int mfb_batch_add(NvnState& s, const DrawArgs& d) {
+    MfbBatchState& b = mfb_batch();
+    const int limit = mfb_batch_limit();
+    if (limit < 2 || b.count >= limit || !d.mesh || d.count_addr) return -1;
+    Targets at = bare_targets(s, targets(s));
+    if (!at.width || !at.height) return -1;
+    if (b.count > 0 && !targets_equal(b.at, at)) return -1;
+    uint8_t types[8];
+    color_types_of(at, types);
+    const Program* cp;
+    {
+        PROF_HOT(PROF_PROGRAM);
+        ParLock lk(true);
+        cp = program_for(s, ProgramKind::Mesh, types);
+    }
+    if (!cp || !cp->ready.load(std::memory_order_acquire) || cp->failed) return -1;
+    if (!cp->fallback || skip_live(cp->key) || cp->key == 0x3427a1dbefd5e02cull) return -1;
+    Program& p = const_cast<Program&>(*cp);
+    if (writes_memory(p)) return -1;
+    if (p.fallback_task && !d.indirect) {
+        const int batch_size = (int)fallback_task_groups(p);
+        if (!batch_size || d.groups[0] > batch_size) return -1;
+    }
+    if (p.compute_state.load(std::memory_order_acquire) != 2 || p.fallback_compute.empty()) return -1;
+    size_t stages[2] = {p.stages.size(), p.stages.size()};
+    for (size_t i = 0; i < p.stages.size(); i++) {
+        if (p.stages[i].vk_stage != VK_SHADER_STAGE_COMPUTE_BIT) continue;
+        if (stages[0] == p.stages.size()) stages[0] = i;
+        else stages[1] = i;
+    }
+    const size_t st_task = p.fallback_task ? stages[0] : p.stages.size();
+    const size_t st_mesh = p.fallback_task ? stages[1] : stages[0];
+    if (p.fallback_task && (st_task >= p.fallback_compute.size() || !p.fallback_compute[st_task])) return -1;
+    if (st_mesh >= p.fallback_compute.size() || !p.fallback_compute[st_mesh]) return -1;
+    if (!p.layout) {
+        ParLock lk;
+        ensure_layout(p);
+    }
+    const VkPrimitiveTopology topo = pipeline_topology(p, kMeshDrawTopology);
+    PipeEntry* pe = graphics_pipeline(p, s, at, topo, types);
+    if (!pe || !pe->ready.load(std::memory_order_acquire) || !pe->pipeline.load(std::memory_order_acquire)) return -1;
+    const FallbackRole role = fallback_role_of(p, s, at, d);
+    if (role == FallbackRole::DepthOnly && fallback_list_held(d.indirect)) return -1;
+
+    BufferRef ind_args{};
+    uint32_t ind_n = 0, ind_stride = 8;
+    uint64_t indirect_input = 0;
+    if (d.indirect) {
+        static const uint32_t word = getenv("RX_VK_MESH_IND_COUNT_WORD") ? (uint32_t)atoi(getenv("RX_VK_MESH_IND_COUNT_WORD")) & 3 : 0;
+        ind_n = (uint32_t)std::clamp(d.max, 1, 4096);
+        ind_stride = d.stride > 0 ? (uint32_t)d.stride : 8;
+        ind_args = gpu_buffer_bind(d.indirect, (uint64_t)(ind_n - 1) * ind_stride + 4 * (word + 1), false);
+        if (!ind_args) return -1;
+        if (p.fallback_task) {
+            const BufferRef input = gpu_buffer_bind(d.indirect, 8, false);
+            const VkDeviceAddress input_base = input ? fallback_buffer_address(input.buffer) : 0;
+            indirect_input = input_base ? input_base + input.offset : 0;
+        }
+    }
+
+    const int slot_idx = b.count;
+    FallbackBuffers* fb = nullptr;
+    if (!fallback_buffers_slot((size_t)slot_idx, p, fb)) return -1;
+
+    const uint64_t dgen_before = texture_destroy_generation();
+    {
+        PROF_HOT(PROF_DESC);
+        FINE_N(FC_BUILDS, 1);
+        trace_tex_hit = nullptr, trace_tex_mask = 0;
+        build_descriptors(s, p);
+        FINE_N(FC_WRITES, (int64_t)dw().writes.size());
+    }
+    const uint64_t dgen_after = texture_destroy_generation();
+    if (dgen_after != dgen_before) {
+        if (slot_idx > 0) {
+            dw().prog = nullptr;
+            return -1;
+        }
+        at = bare_targets(s, targets(s));
+        b.dgen_start = dgen_after;
+    } else if (slot_idx > 0 && dgen_after != b.dgen_start) {
+        dw().prog = nullptr;
+        return -1;
+    }
+    for (const auto& w : dw().writes) {
+        if (w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+            for (uint32_t k = 0; k < w.descriptorCount; k++) {
+                if (!w.pImageInfo[k].sampler) {
+                    dw().prog = nullptr;
+                    return -1;
+                }
+            }
+        }
+    }
+
+    // Never reorder a draw whose task/mesh/fragment stages sample a target written by an earlier draw in the same batch.
+    if (slot_idx > 0 && b.written_mask) {
+        for (const Texture* t : draw_sampled()) {
+            int k = at.depth == t ? 8 : -1;
+            for (int i = 0; i < at.n && k < 0; i++)
+                if (at.color[i] == t) k = i;
+            if (k >= 0 && (b.written_mask >> k & 1)) {
+                dw().prog = nullptr;
+                return -1;
+            }
+        }
+    }
+    uint16_t item_writes = 0;
+    for (int i = 0; i < at.n; i++)
+        if (at.color[i] && target_write_mask(p, s, i)) item_writes |= (uint16_t)(1u << i);
+    if (at.depth && s.ds.dw) item_writes |= 1u << 8;
+
+    if ((size_t)slot_idx >= b.items.size()) b.items.resize((size_t)slot_idx + 1);
+    MfbBatchItem& it = b.items[slot_idx];
+    it.prog = &p;
+    it.fb = fb;
+    it.d = d;
+    it.stage_task = st_task;
+    it.stage_mesh = st_mesh;
+    it.ind_args = ind_args;
+    it.ind_n = ind_n;
+    it.ind_stride = ind_stride;
+    it.mesh_conv_off = 0;
+    it.indirect_input = indirect_input;
+    it.gm_ranges = dw().gm_ranges_address;
+    it.desc_set = VK_NULL_HANDLE;
+    std::swap(it.dw, dw());
+    dw().prog = nullptr;
+    std::swap(it.sampled, draw_sampled());
+    it.fp_on = desc_fp_on;
+    if (desc_fp_on) {
+        it.fp = desc_fp();
+        it.fp_dummy = desc_fp_dummy;
+        it.samp = desc_samp_seen;
+        it.destroy = desc_destroy_seen;
+    } else {
+        it.fp.clear();
+        it.fp_dummy = false;
+        it.samp = 0;
+        it.destroy = 0;
+    }
+
+    if (slot_idx == 0) b.at = at;
+    b.written_mask |= item_writes;
+    b.count++;
+    return slot_idx;
+}
+
+bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
+    MfbBatchState& b = mfb_batch();
+    if (b.count < 2) return false;
+
+    // 1. Pre-allocate any non-push descriptor sets and mesh_ring BEFORE recording anything on cmd.
+    bool any_indirect = false;
+    bool any_task = false;
+    for (int i = 0; i < b.count; i++) {
+        MfbBatchItem& it = b.items[i];
+        any_indirect |= (it.d.indirect != 0);
+        any_task |= it.prog->fallback_task;
+        if (!alloc_batch_desc_set(*it.prog, it)) return false;
+    }
+
+    bool need_init = false;
+    bool fill_slice = false;
+    if (any_indirect) {
+        std::lock_guard lk(mesh_ring_mu);
+        if (!mesh_ring) {
+            void* unused = nullptr;
+            if (!create_buffer(kMeshRing, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false,
+                               mesh_ring, mesh_ring_mem, &unused))
+                return false;
+        }
+        if (!mesh_ring_inited) {
+            if (!par_active.load(std::memory_order_relaxed)) {
+                mesh_ring_inited = true;
+                need_init = true;
+            } else {
+                fill_slice = true;
+            }
+        }
+        for (int i = 0; i < b.count; i++) {
+            MfbBatchItem& it = b.items[i];
+            if (!it.d.indirect) continue;
+            const uint64_t bytes = (((uint64_t)it.ind_n * 12 + 47) / 48) * 48;
+            if (mesh_ring_at + bytes > kMeshRingWrap) mesh_ring_at = 0;
+            it.mesh_conv_off = mesh_ring_at;
+            mesh_ring_at += bytes;
+        }
+    }
+
+    // 2. Close open pass once, or keep pending_clear() alive if no batched item samples the cleared target(s).
+    bool interrupted_pass = false;
+    if (pass().open) {
+        const Pass& ps = pass();
+        bool reads_open_written = false;
+        if (ps.written) {
+            for (int i = 0; i < b.count && !reads_open_written; i++) {
+                for (const Texture* t : b.items[i].sampled) {
+                    int k = ps.depth_tex == t ? 8 : -1;
+                    for (int c = 0; c < ps.n && k < 0; c++)
+                        if (ps.tex[c] == t) k = c;
+                    if (k >= 0 && (ps.written >> k & 1)) {
+                        reads_open_written = true;
+                        break;
+                    }
+                }
+            }
+        }
+        interrupted_pass = !reads_open_written;
+        end_pass(cmd);
+    } else if (pending_clear().active) {
+        bool untouched = true;
+        for (int i = 0; i < b.count && untouched; i++)
+            untouched = pending_clear_untouched(pending_clear(), b.items[i].sampled);
+        if (!untouched) {
+            flush_pending_clears(cmd);
+        } else {
+            st_mfb_clears_kept.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    static const bool mfb_full_barriers = env_on("RX_VK_MFB_FULL_BARRIER");
+    static const uint32_t ind_word = getenv("RX_VK_MESH_IND_COUNT_WORD") ? (uint32_t)atoi(getenv("RX_VK_MESH_IND_COUNT_WORD")) & 3 : 0;
+
+    // 3. One combined pre-barrier + mesh_ring init/copies + records header updates.
+    if (need_init) {
+        vkCmdFillBuffer(cmd, mesh_ring, 0, kMeshRingWrap, 1u);
+        fallback_stage_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                               VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+                               "barrier (mfb batch ring init)");
+    }
+    if (mfb_full_barriers) {
+        full_barrier(cmd);
+    } else {
+        VkPipelineStageFlags2 src_stage = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        VkAccessFlags2 src_access = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        if (!interrupted_pass) {
+            src_stage |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            src_access |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        }
+        fallback_stage_barrier(
+            cmd, src_stage, src_access,
+            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT |
+                VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+            "barrier (mfb batch pre)");
+    }
+
+    {
+        GprofSpan gp(cmd, "mfb batch conv+fill");
+        if (fill_slice) {
+            for (int i = 0; i < b.count; i++) {
+                const MfbBatchItem& it = b.items[i];
+                if (it.d.indirect) vkCmdFillBuffer(cmd, mesh_ring, it.mesh_conv_off, (uint64_t)it.ind_n * 12, 1u);
+            }
+            fallback_stage_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                   "barrier (mfb batch ring fill)");
+        }
+        static constexpr uint32_t kInitHeader[8] = {0, 1, 0, 0, 0, 0, 1, 1};
+        VkBufferCopy small[16];
+        std::vector<VkBufferCopy> heap;
+        for (int i = 0; i < b.count; i++) {
+            const MfbBatchItem& it = b.items[i];
+            if (it.d.indirect) {
+                VkBufferCopy* regions = small;
+                if (it.ind_n > 16) {
+                    heap.resize(it.ind_n);
+                    regions = heap.data();
+                }
+                for (uint32_t r = 0; r < it.ind_n; r++)
+                    regions[r] = {it.ind_args.offset + (uint64_t)r * it.ind_stride + 4 * ind_word,
+                                  it.mesh_conv_off + (uint64_t)r * 12, 4};
+                vkCmdCopyBuffer(cmd, it.ind_args.buffer, mesh_ring, it.ind_n, regions);
+            }
+            vkCmdUpdateBuffer(cmd, it.fb->records, 0, sizeof(kInitHeader), kInitHeader);
+        }
+    }
+
+    // 4. One barrier making all mesh_ring copies + all records headers visible to compute & draw indirect.
+    fallback_stage_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                           VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+                           "barrier (mfb batch header)");
+
+    const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+    VkPipeline last_cs_pipe = VK_NULL_HANDLE;
+
+    // 5. All mfb_task dispatches back-to-back (overlap across EUs).
+    if (any_task) {
+        for (int i = 0; i < b.count; i++) {
+            const MfbBatchItem& it = b.items[i];
+            const Program& p = *it.prog;
+            if (!p.fallback_task) continue;
+            if (!bind_batch_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p, it)) continue;
+            fallback_payload_address = it.fb->payload_address;
+            fallback_records_address = it.fb->records_address;
+            fallback_indirect_input = it.indirect_input;
+            push_constants(cmd, p, nullptr, it.d.first_task, it.gm_ranges);
+            const VkPipeline pipe = p.fallback_compute[it.stage_task];
+            char label[64] = "mfb";
+            if (gprof_on()) snprintf(label, sizeof label, "mfb_task prog %016llx", (unsigned long long)p.key);
+            GprofSpan gp(cmd, label);
+            if (pipe != last_cs_pipe) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+                last_cs_pipe = pipe;
+            }
+            if (it.d.indirect) {
+                vkCmdDispatchIndirect(cmd, mesh_ring, it.mesh_conv_off);
+            } else {
+                const uint32_t groups = (uint32_t)std::clamp(it.d.groups[0], 0, (int)capacity);
+                const uint32_t most = (uint32_t)std::max(1u, capacity / std::max(1u, p.fallback_task_threads));
+                const uint32_t n = std::min(groups, most);
+                if (n) vkCmdDispatch(cmd, n, 1, 1);
+            }
+        }
+        // One task->mesh barrier covering all payload + dispatch header writes.
+        fallback_stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                               VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+                               "barrier (mfb batch task->mesh)");
+    }
+
+    // 6. All mfb_mesh dispatches back-to-back (overlap across EUs).
+    for (int i = 0; i < b.count; i++) {
+        const MfbBatchItem& it = b.items[i];
+        const Program& p = *it.prog;
+        if (!bind_batch_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p, it)) continue;
+        fallback_payload_address = it.fb->payload_address;
+        fallback_records_address = it.fb->records_address;
+        fallback_indirect_input = it.indirect_input;
+        push_constants(cmd, p, nullptr, it.d.first_task, it.gm_ranges);
+        const VkPipeline pipe = p.fallback_compute[it.stage_mesh];
+        char label[64] = "mfb";
+        if (gprof_on()) snprintf(label, sizeof label, "mfb_mesh prog %016llx", (unsigned long long)p.key);
+        GprofSpan gp(cmd, label);
+        if (pipe != last_cs_pipe) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+            last_cs_pipe = pipe;
+        }
+        if (p.fallback_task) {
+            vkCmdDispatchIndirect(cmd, it.fb->records, (VkDeviceSize)Shader::Backend::SPIRV::MESH_FALLBACK_DISPATCH_WORD * 4);
+        } else if (it.d.indirect) {
+            vkCmdDispatchIndirect(cmd, mesh_ring, it.mesh_conv_off);
+        } else {
+            const uint32_t groups = (uint32_t)std::clamp(it.d.groups[0], 0, (int)capacity);
+            if (groups) vkCmdDispatch(cmd, groups, 1, 1);
+        }
+    }
+
+    // 7. One post-barrier making all K records buffers + indirect draw headers visible to the single render pass.
+    if (mfb_full_barriers) {
+        full_barrier(cmd);
+    } else {
+        fallback_stage_barrier(
+            cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT,
+            "barrier (mfb batch post)");
+        if (interrupted_pass) note_pass_end(cmd);
+    }
+
+    dw().prog = nullptr;
+    b.flushed = true;
+    const int64_t nb = st_mfb_batches.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int64_t nd = st_mfb_batched_draws.fetch_add(b.count, std::memory_order_relaxed) + b.count;
+    if (nb == 1 || nb % 600 == 0)
+        logf("vk: mfb batch: %lld batches, %lld batched draws (avg %.2f/batch), %lld pending clears kept",
+             (long long)nb, (long long)nd, (double)nd / (double)nb,
+             (long long)st_mfb_clears_kept.load(std::memory_order_relaxed));
+    return true;
+}
+
+static void draw_impl(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, const MfbBatchItem* pre) {
     Pass& ps = pass();   // (once: the accessor is a call and a thread-local read at each use. The same object for the thread's life: draw_begin_recording resets it in place)
     CmdBound& cb = bound();   // (once, as the pass: what the command buffer has bound)
     PROF_HOT(PROF_DRAW);
     FINE_N(FC_DRAWS, 1);
     stats_tick();
-    mesh_indirect_convert(cmd, d);   // (EvilOOT: before the pass opens; sets mesh_conv_buf for the mesh draw below)
+    if (!pre) mesh_indirect_convert(cmd, d);   // (EvilOOT: before the pass opens; sets mesh_conv_buf for the mesh draw below)
     VkPrimitiveTopology topo = kMeshDrawTopology;
     if (!d.mesh && !topology(d.prim, topo)) {
         static int logged[32];
@@ -8485,16 +9020,20 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 if (d.is_written) return true;
         return false;
     }();
-    const bool same_desc = !no_reuse && !early_rebind && cb.desc.valid && cb.desc.prog == &p && cb.desc.bind == s.bind_gen &&
+    if (pre && pre->prog != &p) pre = nullptr;
+    const bool same_desc = !pre && !no_reuse && !early_rebind && cb.desc.valid && cb.desc.prog == &p && cb.desc.bind == s.bind_gen &&
                            cb.desc.ub == ub_gen && cb.desc.dgen == dgen &&
                            (slotgen ? cb.desc.fp_on && desc_slots_kept(cb.desc, reg_gen) : cb.desc.reg == reg_gen) &&
                            (!p.fallback || dw().prog == &p);
-    if (p.fallback && !same_desc && dw().prog != &p && cb.desc.valid && cb.desc.prog == &p) {
+    if (!pre && p.fallback && !same_desc && dw().prog != &p && cb.desc.valid && cb.desc.prog == &p) {
         static std::atomic<int> told{0};
         if (told++ < 3) logf("vk: fallback: %016llx's descriptors built again after a dispatch", (unsigned long long)p.key);
     }
     if (same_desc && slotgen && cb.desc.reg != reg_gen) st_desc_slotgen_saves++;   // (the global check would have rebuilt)
-    if (!same_desc) {
+    if (pre) {
+        cb.desc.gm_ranges = pre->gm_ranges;
+        gfx_sampled() = pre->sampled;
+    } else if (!same_desc) {
         PROF_HOT(PROF_DESC);
         FINE_N(FC_BUILDS, 1);
         trace_tex_hit = nullptr, trace_tex_mask = 0;
@@ -8519,7 +9058,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (dump_on()) log_dump_draw(s, p, d);
     PROF_HOT(PROF_CMDS);
     texture_watch_prog(p.key);
-    if (!same_desc) gfx_sampled() = draw_sampled();
+    if (!pre && !same_desc) gfx_sampled() = draw_sampled();
     static const bool barrier_every = env_on("RX_VK_BARRIER_EVERY_DRAW");   // (an experiment: a pass each)
     if (barrier_every) end_pass(cmd);
     reactive_scene_draw(cmd, p, s, at);
@@ -8593,13 +9132,21 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
     }
     const FallbackRole fallback_role = p.fallback && d.mesh ? fallback_role_of(p, s, at, d) : FallbackRole::None;
-    if (fallback_role == FallbackRole::DepthOnly && fallback_list_held(d.indirect)) SKIP_HERE();
-    if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) {
-        if (fallback_role == FallbackRole::Colour && p.compute_state.load(std::memory_order_acquire) == 1)
-            fallback_list_hold(d.indirect, true);
-        SKIP_HERE();
+    if (pre) {
+        fallback_draw_records = pre->fb->records;
+        fallback_records_address = pre->fb->records_address;
+        fallback_payload_address = pre->fb->payload_address;
+        fallback_indirect_input = pre->indirect_input;
+        if (fallback_role == FallbackRole::Colour) fallback_list_hold(d.indirect, false);
+    } else {
+        if (fallback_role == FallbackRole::DepthOnly && fallback_list_held(d.indirect)) SKIP_HERE();
+        if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) {
+            if (fallback_role == FallbackRole::Colour && p.compute_state.load(std::memory_order_acquire) == 1)
+                fallback_list_hold(d.indirect, true);
+            SKIP_HERE();
+        }
+        if (fallback_role == FallbackRole::Colour) fallback_list_hold(d.indirect, false);
     }
-    if (fallback_role == FallbackRole::Colour) fallback_list_hold(d.indirect, false);
     {
         FINE_SCOPE(FT_HAZARD);
         begin_pass(cmd, at);
@@ -8629,7 +9176,16 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             cb.vertex_set.on = false;
         }
     }
-    if (!same_desc) {
+    if (pre) {
+        FINE_SCOPE(FT_BINDDESC);
+        if (!bind_batch_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p, *pre)) SKIP_HERE();
+        cb.desc.valid = true, cb.desc.prog = &p, cb.desc.bind = s.bind_gen, cb.desc.reg = reg_gen;
+        cb.desc.ub = ub_gen, cb.desc.dgen = texture_destroy_generation();
+        cb.desc.fp_on = pre->fp_on;
+        if (pre->fp_on)
+            cb.desc.fp = pre->fp, cb.desc.fp_dummy = pre->fp_dummy, cb.desc.samp = pre->samp,
+            cb.desc.destroy = pre->destroy;
+    } else if (!same_desc) {
         FINE_SCOPE(FT_BINDDESC);
         if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p)) SKIP_HERE();
         cb.desc.valid = true, cb.desc.prog = &p, cb.desc.bind = s.bind_gen, cb.desc.reg = reg_gen;
@@ -8960,6 +9516,16 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);
     }
     st_draws++, ps.draws++;
+}
+
+void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    draw_impl(cmd, s, d, nullptr);
+}
+
+void draw_mfb_batched(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, int slot) {
+    MfbBatchState& b = mfb_batch();
+    const MfbBatchItem* pre = (b.flushed && slot >= 0 && slot < b.count) ? &b.items[slot] : nullptr;
+    draw_impl(cmd, s, d, pre);
 }
 
 /// A dispatch over 2 ms is logged, 60 times, and only while RX_VK_SLOW_DISPATCH is set. Off, the clock is not read.

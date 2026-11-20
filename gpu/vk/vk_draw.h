@@ -66,6 +66,13 @@ bool stream_holds(const uint8_t* base, uint64_t at, uint64_t n);
 /// The open render pass ends (before transfers, clears, barriers and the recording's end)
 void end_pass(VkCommandBuffer cmd);
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d);
+/// (Batch 10E, RX_VK_MFB_BATCH) Batches consecutive compute mesh fallback draws into one compute pre-pass + one render pass.
+int mfb_batch_limit();
+void mfb_batch_begin();
+int mfb_batch_add(NvnState& s, const DrawArgs& d);
+bool mfb_batch_flush_compute(VkCommandBuffer cmd);
+void draw_mfb_batched(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, int slot);
+void mfb_batch_end();
 /// (longshot) the occlusion queries draw() left unbegun since the last call, by why: the draw returned before drawing, its
 /// vertex input was not all bound, a mesh fallback's task batches (vk_replay.cpp's RX_VK_OCC_LOG line)
 void occ_draw_counts(uint64_t out[3]);
