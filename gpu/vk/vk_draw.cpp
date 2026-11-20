@@ -5090,6 +5090,44 @@ struct Pass {
     uint16_t written = 0;                  // (its targets written so far: colour i bit i, depth bit 8)
 };
 TLS_OBJECT(pass, Pass)
+struct PendingClear {
+    bool active = false;
+    Targets at{};
+    uint8_t color_mask = 0;
+    VkClearColorValue color_val[8]{};
+    bool depth_clear = false;
+    bool stencil_clear = false;
+    float depth_val = 1.0f;
+    uint32_t stencil_val = 0;
+};
+TLS_OBJECT(pending_clear, PendingClear)
+inline bool targets_equal(const Targets& a, const Targets& b) {
+    if (a.n != b.n || a.depth_view != b.depth_view || a.width != b.width || a.height != b.height ||
+        a.has_block_images != b.has_block_images)
+        return false;
+    for (int i = 0; i < a.n; i++)
+        if (a.color_view[i] != b.color_view[i]) return false;
+    return true;
+}
+inline bool targets_match_pass(const Pass& ps, const Targets& at) {
+    if (!ps.open || ps.depth != at.depth_view || ps.n != at.n || ps.width != at.width || ps.height != at.height)
+        return false;
+    for (int i = 0; i < at.n; i++)
+        if (ps.color[i] != at.color_view[i]) return false;
+    return true;
+}
+inline bool load_op_clear_on() {
+    static const bool on = !env_on("RX_VK_NO_LOAD_OP_CLEAR");
+    return on;
+}
+void begin_pass(VkCommandBuffer cmd, const Targets& at);
+void flush_pending_clears(VkCommandBuffer cmd) {
+    PendingClear& pc = pending_clear();
+    if (!pc.active) return;
+    const Targets at = pc.at;
+    begin_pass(cmd, at);
+    end_pass(cmd);
+}
 thread_local bool work_since_barrier = false;   // (GPU work recorded since the last full barrier: a dispatch orders after it)
 // what the command buffer has bound (draws skip what is already there): CmdBound, below, with the types it is made of
 /// The descriptors the graphics bind point has: what they were built from
@@ -5208,6 +5246,18 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
                 ps.height == at.height;
     for (int i = 0; i < at.n && same; i++) same = ps.color[i] == at.color_view[i];
     if (same) return;
+    PendingClear consumed{};
+    {
+        PendingClear& pc = pending_clear();
+        if (pc.active) {
+            if (targets_equal(pc.at, at)) {
+                consumed = pc;
+                pc.active = false;
+            } else {
+                flush_pending_clears(cmd);
+            }
+        }
+    }
     end_pass(cmd);
     if (at.has_block_images) {
         full_barrier(cmd, "barrier (before BC slice loads)");
@@ -5223,11 +5273,20 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     bool marks = !texture_marked(at.depth);
     for (int i = 0; i < at.n && !marks; i++) marks = !texture_marked(at.color[i]);
     ParLock lk(marks);
+    int fused_clears = 0;
+    uint16_t fused_written = 0;
     for (int i = 0; i < at.n; i++) {
         ca[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         ca[i].imageView = at.color_view[i];
         ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        if (consumed.active && (consumed.color_mask & (1u << i))) {
+            ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            ca[i].clearValue.color = consumed.color_val[i];
+            fused_written |= (uint16_t)(1u << i);
+            fused_clears++;
+        } else {
+            ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         ps.color[i] = at.color_view[i];
         ps.block_image[i] = at.block_image[i];
@@ -5237,11 +5296,22 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     }
     for (int i = at.n; i < 8; i++) ps.color[i] = VK_NULL_HANDLE;
     VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingAttachmentInfo sa{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (at.depth) {
         da.imageView = at.depth_view;
         da.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        da.loadOp = (consumed.active && consumed.depth_clear) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        da.clearValue.depthStencil = {consumed.depth_val, consumed.stencil_val};
+        sa.imageView = at.depth_view;
+        sa.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        sa.loadOp = (consumed.active && consumed.stencil_clear) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        sa.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        sa.clearValue.depthStencil = {consumed.depth_val, consumed.stencil_val};
+        if (consumed.active && (consumed.depth_clear || consumed.stencil_clear)) {
+            fused_written |= (uint16_t)(1u << 8);
+            fused_clears++;
+        }
         texture_written(at.depth, "a pass's depth target");
         texture_rendered(at.depth);
     }
@@ -5255,12 +5325,12 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     ri.colorAttachmentCount = (uint32_t)at.n;
     ri.pColorAttachments = ca;
     if (at.depth && depth_aspect(at.depth_format)) ri.pDepthAttachment = &da;
-    if (at.depth && has_stencil(at.depth_format)) ri.pStencilAttachment = &da;
+    if (at.depth && has_stencil(at.depth_format)) ri.pStencilAttachment = &sa;
     gprof_begin(cmd);
     ps.draws = 0, ps.format0 = at.n ? at.color_format[0] : at.depth_format;
     ps.wm_or = 0, ps.wm_n = 0;
-    ps.clears = 0, ps.first_prog = 0;
-    ps.sampled.clear(), ps.sampled_targets = 0, ps.written = 0;
+    ps.clears = fused_clears, ps.first_prog = 0;
+    ps.sampled.clear(), ps.sampled_targets = 0, ps.written = fused_written;
     vkCmdBeginRendering(cmd, &ri);
     ps.open = true;
     st_passes++;
@@ -5884,11 +5954,28 @@ void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float
     if (!mask) return;
     const Targets at = targets(s);
     if (index < 0 || index >= at.n || !at.color_view[index]) return;
-    clear_after_draws(cmd);
-    begin_pass(cmd, at);
     const uint32_t lw = at.width, lh = at.height;
     const VkRect2D rect = clear_rect(s, lw, lh);
     if (!rect.extent.width || !rect.extent.height) return;
+    clear_after_draws(cmd);
+    if (load_op_clear_on() && mask == 0xF && !at.has_block_images &&
+        rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == lw && rect.extent.height == lh) {
+        if (pass().open && !targets_match_pass(pass(), at)) end_pass(cmd);
+        if (!pass().open) {
+            PendingClear& pc = pending_clear();
+            if (pc.active && !targets_equal(pc.at, at)) flush_pending_clears(cmd);
+            if (!pc.active) {
+                pc = PendingClear{};
+                pc.active = true;
+                pc.at = at;
+            }
+            pc.color_mask |= (uint8_t)(1u << index);
+            std::memcpy(&pc.color_val[index], rgba, 16);
+            st_clears++;
+            return;
+        }
+    }
+    begin_pass(cmd, at);
     st_clears++, pass().clears++;
     if (mask == 0xF) {
         VkClearAttachment ca{};
@@ -5929,10 +6016,33 @@ void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool dep
         static int logged;
         if (logged++ < 4) logf("vk: stencil clear with write mask %#x: cleared whole", stencil_mask);
     }
-    clear_after_draws(cmd);
-    begin_pass(cmd, at);
     const VkRect2D rect = clear_rect(s, at.width, at.height);
     if (!rect.extent.width || !rect.extent.height) return;
+    clear_after_draws(cmd);
+    if (load_op_clear_on() && !at.has_block_images &&
+        rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == at.width && rect.extent.height == at.height) {
+        if (pass().open && !targets_match_pass(pass(), at)) end_pass(cmd);
+        if (!pass().open) {
+            PendingClear& pc = pending_clear();
+            if (pc.active && !targets_equal(pc.at, at)) flush_pending_clears(cmd);
+            if (!pc.active) {
+                pc = PendingClear{};
+                pc.active = true;
+                pc.at = at;
+            }
+            if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                pc.depth_clear = true;
+                pc.depth_val = std::clamp(depth, 0.0f, 1.0f);
+            }
+            if (aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
+                pc.stencil_clear = true;
+                pc.stencil_val = stencil & 0xFF;
+            }
+            st_clears++;
+            return;
+        }
+    }
+    begin_pass(cmd, at);
     VkClearAttachment ca{};
     ca.aspectMask = aspect;
     ca.clearValue.depthStencil = {std::clamp(depth, 0.0f, 1.0f), stencil & 0xFF};
@@ -6017,6 +6127,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     r.ub_snap_epoch = ++ub_snap_epochs;   // (the uniform copies of the slot's last recording are no longer given out)
     cur = &r;
     pass() = Pass{};
+    pending_clear() = PendingClear{};
     work_since_barrier = false;
     bound().reset();
     descriptors_disturbed();
@@ -6266,7 +6377,10 @@ TLS_OBJECT(dump_mesh_indirect, std::vector<std::pair<uint64_t, uint64_t>>)   // 
 } // namespace
 void end_pass(VkCommandBuffer cmd) {
     Pass& ps = pass();   // (once: the accessor is a call and a thread-local read at each use. The same object for the thread's life: draw_begin_recording resets it in place)
-    if (!ps.open) return;
+    if (!ps.open) {
+        if (pending_clear().active) flush_pending_clears(cmd);
+        return;
+    }
     vkCmdEndRendering(cmd);
     ps.open = false;
     note_pass_end(cmd);   // (before the dumps and probes below: they record work, and the next pass's barrier is then a full one)

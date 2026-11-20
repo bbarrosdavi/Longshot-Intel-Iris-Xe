@@ -54,6 +54,7 @@
 
 #include "vk_paths.h"
 #include "vk_internal.h"
+#include "vk_custom_spv.h"
 #include "flat_map.h"
 #include "vk_jobs.h"
 #include "vk_draw.h"
@@ -1378,6 +1379,8 @@ uint64_t translator_stamp() {
         const uint32_t nw = 0x6e776f30u;   // ("nwo0")
         add(&nw, sizeof nw);
     }
+    const uint32_t cs = env_on("RX_VK_NO_CUSTOM_SHADERS") ? 0x63737030u : 0x63737031u;   // ("csp0" / "csp1")
+    add(&cs, sizeof cs);
     // (what translates shaders, nx2/build.py: a rebuild of anything else keeps the cache. It was the DLL's bytes, and every build
     // lost it)
     const uint64_t translator = LONGSHOT_SHADER_STAMP;
@@ -1607,7 +1610,15 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 if ((!kept_one && (Shader::Backend::SPIRV::mma_software || dev.policy.networks_left_out)) || env_on("RX_VK_NO_F16") || !dev.vk12.shaderFloat16)
                     throw std::runtime_error(network_left_out);
             }
-            const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(profile_pinned(), rt, t->program, bindings);
+            std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(profile_pinned(), rt, t->program, bindings);
+            bool used_custom_spv = false;
+            if (p.key == 0xab7699ee7f536755ull && !env_on("RX_VK_NO_CUSTOM_SHADERS")) {
+                spirv.assign(std::begin(kCustomSpv_ab7699ee), std::end(kCustomSpv_ab7699ee));
+                used_custom_spv = true;
+                static std::atomic<bool> logged_ab76{false};
+                if (!logged_ab76.exchange(true))
+                    logf("vk: custom SPIR-V override active for ab7699ee7f536755 (subgroupAdd + SLM workgroup reduction)");
+            }
             // (EvilOOT) RX_VK_DUMP_SPV=<folder>: the SPIR-V of the programs RX_VK_MISS_LOG_PROG names (all: unset), for spirv-val
             if (const char* dir = getenv("RX_VK_DUMP_SPV"); dir && Shader::Optimization::g_nvn2_miss_log_this) {
                 char path[512];
@@ -1624,8 +1635,8 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             Stage st;
             st.nvn_stage = 5;
             st.info = t->program.info;
-            if (rt.mesh_wg_warp32) {
-                st.info.wg_warp32 = true;
+            if (rt.mesh_wg_warp32 || used_custom_spv) {
+                if (rt.mesh_wg_warp32) st.info.wg_warp32 = true;
                 st.info.uses_subgroup_vote = false;
                 st.info.uses_subgroup_mask = false;
                 st.info.uses_subgroup_invocation_id = false;
