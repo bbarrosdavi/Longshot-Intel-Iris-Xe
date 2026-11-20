@@ -10,7 +10,7 @@ namespace Shader::IR {
 
 namespace Detail {
 
-OpcodeMeta META_TABLE[543] = {
+OpcodeMeta META_TABLE[545] = {
 #define OPCODE(name_token, type_token, ...)                                                        \
     {                                                                                              \
         .name{#name_token},                                                                        \
@@ -21,7 +21,7 @@ OpcodeMeta META_TABLE[543] = {
 #undef OPCODE
 };
 
-u8 NUM_ARGS[543] = {
+u8 NUM_ARGS[545] = {
 #define OPCODE(name_token, type_token, ...) u8(CalculateNumArgsOf(Opcode::name_token)),
 #include "opcodes.inc"
 #undef OPCODE

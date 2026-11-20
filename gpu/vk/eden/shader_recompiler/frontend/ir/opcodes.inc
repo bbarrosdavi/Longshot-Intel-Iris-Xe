@@ -590,6 +590,8 @@ OPCODE(ShuffleIndex,                                        U32,            U32,
 OPCODE(ShuffleUp,                                           U32,            U32,            U32,            U32,            U32,                            )
 OPCODE(ShuffleDown,                                         U32,            U32,            U32,            U32,            U32,                            )
 OPCODE(ShuffleButterfly,                                    U32,            U32,            U32,            U32,            U32,                            )
+OPCODE(SubgroupBroadcastFirstU32,                           U32,            U32,                                                                            )
+OPCODE(SubgroupReduceU32,                                   U32,            U32,            U32,                                                            )
 OPCODE(MatrixMulAddF16,                                     U32x2,          U32x4,          U32x2,          U32x2,                                          )
 OPCODE(QuadBroadcast,                                       U32,            U32,            U32,                                                                    )
 OPCODE(QuadSwap,                                            U32,            U32,            U32,                                                                    )

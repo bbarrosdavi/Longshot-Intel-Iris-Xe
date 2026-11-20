@@ -37,6 +37,10 @@ static_assert(sizeof(Instruction) == 16);
 // (vk_coopmat.cpp): HMMA.16816.F16 then lowers to the HMMA_nx2 pseudo instruction (one subgroup
 // matrix multiply on the host's tensor cores) instead of the shuffle expansion.
 inline thread_local bool native_matrix_multiply = false;
+// (longshot-iris) Native SPIR-V subgroup BroadcastFirst (R2UR_nx2) and Reduce (REDUX_nx2) instead of
+// 16-inst R2UR / 32-lane unrolled REDUX expansions; set when the host supports SubgroupArithmetic + Ballot
+// with warp size <= 32 (Intel Iris Xe, NVIDIA).
+inline bool native_warp_ops = false;
 
 // (longshot) Native programs whose GPRs reach the lowering's reserved registers (the uniform bank at R216-R245, R239's
 // uniform predicates, the scratch R246-R254): OoT's big vertex and mesh programs use ~249 GPRs. Their high GPRs (from
@@ -981,6 +985,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 target = uniform_register(static_cast<u32>(dest));
             if (target == ~0U || target == 255 || insn.words[1] || insn.words[2] != 0x000e0000)
                 return fail(index, "native register-to-uniform mode");
+            if (native_warp_ops && native_predicate == 7) {
+                // Unconditional R2UR -> single R2UR_nx2 (BroadcastFirst, or elided when warp-uniform).
+                emit(0xef08000000070000ULL | target | (u64{insn.Bits(24, 8)} << 8));
+                break;
+            }
             save_predicate();
             emit(0x50d8000000070000ULL | 250 | (u64{native_predicate} << 39) |
                  (u64{6} << 45) | (u64{1} << 48));
@@ -1347,6 +1356,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (target == ~0U || target == 255 || insn.words[1] ||
                 (mode != 0xc000 && !maximum && !minimum && !logical) || native_predicate != 7)
                 return fail(index, "native warp sum mode");
+            if (native_warp_ops) {
+                // 0=Add, 1=UMin, 2=SMin, 3=UMax, 4=SMax, 5=Or, 6=Xor
+                const u32 op_mode = minimum ? (flip ? 2U : 1U)
+                                  : maximum ? (flip ? 4U : 3U)
+                                  : logical == 1U ? 5U
+                                  : logical == 2U ? 6U
+                                  : 0U;
+                emit(0xef00000000070000ULL | target | (u64{source} << 8) | (u64{op_mode} << 20));
+                break;
+            }
             const auto flip_sign = [&](u32 reg) {   // (LOP32I.XOR reg, 0x80000000)
                 emit(0x0400000000070000ULL | reg | (u64{reg} << 8) | (u64{0x80000000U} << 20) | (u64{2} << 53));
             };

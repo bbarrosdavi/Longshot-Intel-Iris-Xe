@@ -635,6 +635,8 @@ Id EmitShuffleDown(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clam
                    Id segmentation_mask);
 Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
                         Id segmentation_mask);
+Id EmitSubgroupBroadcastFirstU32(EmitContext& ctx, Id value);
+Id EmitSubgroupReduceU32(EmitContext& ctx, IR::Inst* inst, Id value, Id mode);
 Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane);
 Id EmitMatrixMulAddF16(EmitContext& ctx, Id a, Id b, Id c);
 void DefineSoftwareMatrixFunction(EmitContext& ctx);

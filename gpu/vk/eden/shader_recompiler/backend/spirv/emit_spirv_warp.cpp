@@ -609,6 +609,152 @@ Id EmitDPdyCoarse(EmitContext& ctx, Id op_a) {
     return ctx.OpDPdyCoarse(ctx.F32[1], op_a);
 }
 
+Id EmitSubgroupBroadcastFirstU32(EmitContext& ctx, Id value) {
+    if (!StageSupportsSubgroups(ctx)) {
+        return value;
+    }
+    if (!ctx.runtime_info.mesh_wg_warp32) {
+        ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
+        return ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], SubgroupScope(ctx), value);
+    }
+    // wg_warp32 (SIMD8): 4 subgroups of 8 lanes per 32-lane warp.
+    const Id tid{WgTid(ctx)};
+    const Id bslot{ctx.OpLoad(ctx.U32[1], ctx.wg_ballot_slot)};
+    ctx.OpStore(ctx.wg_ballot_slot, ctx.OpBitwiseXor(ctx.U32[1], bslot, ctx.Const(1U)));
+    const Id bbase{ctx.mesh_wg_warps <= 1U
+                       ? ctx.OpShiftLeftLogical(ctx.U32[1], bslot, ctx.Const(2U))
+                       : ctx.OpShiftLeftLogical(
+                             ctx.U32[1],
+                             ctx.OpIAdd(ctx.U32[1],
+                                        ctx.OpIMul(ctx.U32[1], bslot, ctx.Const(ctx.mesh_wg_warps)),
+                                        WgWarpId(ctx)),
+                             ctx.Const(2U))};
+    if (!Sirit::ValidId(ctx.linear_exec_id)) {
+        // Uniform control flow: all 32 warp lanes are active; lane 0 publishes value directly.
+        const Id is_lane0{ctx.OpIEqual(ctx.U1, tid, ctx.u32_zero_value)};
+        const Id then_lbl{ctx.OpLabel()};
+        const Id merge_lbl{ctx.OpLabel()};
+        ctx.OpSelectionMerge(merge_lbl, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(is_lane0, then_lbl, merge_lbl);
+        ctx.AddLabel(then_lbl);
+        ctx.OpStore(ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot, bbase, ctx.u32_zero_value),
+                    value);
+        ctx.OpBranch(merge_lbl);
+        ctx.AddLabel(merge_lbl);
+        WgBarrier(ctx);
+        return ctx.OpLoad(
+            ctx.U32[1],
+            ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot, bbase, ctx.u32_zero_value));
+    }
+    // Linearized divergent If: find lowest active lane in each 8-lane sub-warp, publish mask+value.
+    const Id sub_ballot{ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.linear_exec_id)};
+    const Id sub_mask{ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], sub_ballot, 0U),
+                                       ctx.Const(0xFFu))};
+    const Id sub_lsb{ctx.OpBitwiseAnd(
+        ctx.U32[1], ctx.OpGroupNonUniformBallotFindLSB(ctx.U32[1], SubgroupScope(ctx), sub_ballot),
+        ctx.Const(7U))};
+    const Id sub_val{ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, sub_lsb)};
+    const Id sub_id{ctx.OpShiftRightLogical(ctx.U32[1], tid, ctx.Const(3U))};
+    const Id sslot{ctx.OpLoad(ctx.U32[1], ctx.wg_shfl_slot)};
+    ctx.OpStore(ctx.wg_shfl_slot, ctx.OpBitwiseXor(ctx.U32[1], sslot, ctx.Const(1U)));
+    const Id is_sub_leader{
+        ctx.OpIEqual(ctx.U1, ctx.OpBitwiseAnd(ctx.U32[1], tid, ctx.Const(7U)), ctx.u32_zero_value)};
+    const Id then_lbl{ctx.OpLabel()};
+    const Id merge_lbl{ctx.OpLabel()};
+    ctx.OpSelectionMerge(merge_lbl, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(is_sub_leader, then_lbl, merge_lbl);
+    ctx.AddLabel(then_lbl);
+    ctx.OpStore(ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot,
+                                  ctx.OpIAdd(ctx.U32[1], bbase, sub_id), ctx.u32_zero_value),
+                sub_mask);
+    ctx.OpStore(WgShflPtr(ctx, sslot, sub_id), sub_val);
+    ctx.OpBranch(merge_lbl);
+    ctx.AddLabel(merge_lbl);
+    WgBarrier(ctx);
+    const Id m0{ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot, bbase, ctx.u32_zero_value))};
+    const Id m1{ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot, ctx.OpIAdd(ctx.U32[1], bbase, ctx.Const(1U)), ctx.u32_zero_value))};
+    const Id m2{ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot, ctx.OpIAdd(ctx.U32[1], bbase, ctx.Const(2U)), ctx.u32_zero_value))};
+    const Id v0{ctx.OpLoad(ctx.U32[1], WgShflPtr(ctx, sslot, ctx.u32_zero_value))};
+    const Id v1{ctx.OpLoad(ctx.U32[1], WgShflPtr(ctx, sslot, ctx.Const(1U)))};
+    const Id v2{ctx.OpLoad(ctx.U32[1], WgShflPtr(ctx, sslot, ctx.Const(2U)))};
+    const Id v3{ctx.OpLoad(ctx.U32[1], WgShflPtr(ctx, sslot, ctx.Const(3U)))};
+    const Id r23{ctx.OpSelect(ctx.U32[1], ctx.OpINotEqual(ctx.U1, m2, ctx.u32_zero_value), v2, v3)};
+    const Id r123{ctx.OpSelect(ctx.U32[1], ctx.OpINotEqual(ctx.U1, m1, ctx.u32_zero_value), v1, r23)};
+    return ctx.OpSelect(ctx.U32[1], ctx.OpINotEqual(ctx.U1, m0, ctx.u32_zero_value), v0, r123);
+}
+
+Id EmitSubgroupReduceU32(EmitContext& ctx, IR::Inst* inst, Id value, Id) {
+    if (!StageSupportsSubgroups(ctx)) {
+        return value;
+    }
+    const u32 mode = inst->Arg(1).U32();
+    ctx.AddCapability(spv::Capability::GroupNonUniformArithmetic);
+    auto native_reduce = [&](Id v) -> Id {
+        switch (mode) {
+        case 1U: return ctx.OpGroupNonUniformUMin(ctx.U32[1], SubgroupScope(ctx), spv::GroupOperation::Reduce, v);
+        case 2U: return ctx.OpGroupNonUniformSMin(ctx.U32[1], SubgroupScope(ctx), spv::GroupOperation::Reduce, v);
+        case 3U: return ctx.OpGroupNonUniformUMax(ctx.U32[1], SubgroupScope(ctx), spv::GroupOperation::Reduce, v);
+        case 4U: return ctx.OpGroupNonUniformSMax(ctx.U32[1], SubgroupScope(ctx), spv::GroupOperation::Reduce, v);
+        case 5U: return ctx.OpGroupNonUniformBitwiseOr(ctx.U32[1], SubgroupScope(ctx), spv::GroupOperation::Reduce, v);
+        case 6U: return ctx.OpGroupNonUniformBitwiseXor(ctx.U32[1], SubgroupScope(ctx), spv::GroupOperation::Reduce, v);
+        default: return ctx.OpGroupNonUniformIAdd(ctx.U32[1], SubgroupScope(ctx), spv::GroupOperation::Reduce, v);
+        }
+    };
+    if (!ctx.runtime_info.mesh_wg_warp32) {
+        return native_reduce(value);
+    }
+    // wg_warp32 (SIMD8): 1 native SIMD8 reduction -> 4-word SLM publish -> 1 barrier -> 3-op combine.
+    const u32 ident = mode == 1U ? 0xFFFFFFFFu
+                    : mode == 2U ? 0x7FFFFFFFu
+                    : mode == 4U ? 0x80000000u
+                    : 0U;
+    const Id v{Sirit::ValidId(ctx.linear_exec_id)
+                   ? ctx.OpSelect(ctx.U32[1], ctx.linear_exec_id, value, ctx.Const(ident))
+                   : value};
+    const Id sub_res{native_reduce(v)};
+    const Id tid{WgTid(ctx)};
+    const Id sub_id{ctx.OpShiftRightLogical(ctx.U32[1], tid, ctx.Const(3U))};
+    const Id bslot{ctx.OpLoad(ctx.U32[1], ctx.wg_ballot_slot)};
+    ctx.OpStore(ctx.wg_ballot_slot, ctx.OpBitwiseXor(ctx.U32[1], bslot, ctx.Const(1U)));
+    const Id bbase{ctx.mesh_wg_warps <= 1U
+                       ? ctx.OpShiftLeftLogical(ctx.U32[1], bslot, ctx.Const(2U))
+                       : ctx.OpShiftLeftLogical(
+                             ctx.U32[1],
+                             ctx.OpIAdd(ctx.U32[1],
+                                        ctx.OpIMul(ctx.U32[1], bslot, ctx.Const(ctx.mesh_wg_warps)),
+                                        WgWarpId(ctx)),
+                             ctx.Const(2U))};
+    const Id is_sub_leader{
+        ctx.OpIEqual(ctx.U1, ctx.OpBitwiseAnd(ctx.U32[1], tid, ctx.Const(7U)), ctx.u32_zero_value)};
+    const Id then_lbl{ctx.OpLabel()};
+    const Id merge_lbl{ctx.OpLabel()};
+    ctx.OpSelectionMerge(merge_lbl, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(is_sub_leader, then_lbl, merge_lbl);
+    ctx.AddLabel(then_lbl);
+    ctx.OpStore(ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot,
+                                  ctx.OpIAdd(ctx.U32[1], bbase, sub_id), ctx.u32_zero_value),
+                sub_res);
+    ctx.OpBranch(merge_lbl);
+    ctx.AddLabel(merge_lbl);
+    WgBarrier(ctx);
+    const Id r0{ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot, bbase, ctx.u32_zero_value))};
+    const Id r1{ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot, ctx.OpIAdd(ctx.U32[1], bbase, ctx.Const(1U)), ctx.u32_zero_value))};
+    const Id r2{ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot, ctx.OpIAdd(ctx.U32[1], bbase, ctx.Const(2U)), ctx.u32_zero_value))};
+    const Id r3{ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(ctx.mesh_shared_u32, ctx.mesh_wg_ballot, ctx.OpIAdd(ctx.U32[1], bbase, ctx.Const(3U)), ctx.u32_zero_value))};
+    auto combine = [&](Id a, Id b) -> Id {
+        switch (mode) {
+        case 1U: return ctx.OpUMin(ctx.U32[1], a, b);
+        case 2U: return ctx.OpSMin(ctx.U32[1], a, b);
+        case 3U: return ctx.OpUMax(ctx.U32[1], a, b);
+        case 4U: return ctx.OpSMax(ctx.U32[1], a, b);
+        case 5U: return ctx.OpBitwiseOr(ctx.U32[1], a, b);
+        case 6U: return ctx.OpBitwiseXor(ctx.U32[1], a, b);
+        default: return ctx.OpIAdd(ctx.U32[1], a, b);
+        }
+    };
+    return combine(combine(r0, r1), combine(r2, r3));
+}
+
 // (longshot) HMMA in software (mma_software.h): the 32 lanes' fragments through subgroup operations in one helper function,
 // accumulated with FMA in f32 and rounded to f16 after every 8 columns of K, as HMMA.F16 does. It needs no cooperative matrices
 // (RX_VK_MMA_SOFTWARE=1, vk_coopmat.cpp); the form is the one vk_coopmat.cpp's self-test chose for this device (mma_software_form).

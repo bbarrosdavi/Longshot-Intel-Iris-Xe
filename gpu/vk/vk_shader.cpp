@@ -274,6 +274,20 @@ Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area) {
             }
         }
     }
+    static const bool init_native_warp = [] {
+        VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &sg;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        constexpr VkSubgroupFeatureFlags req =
+            VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT;
+        const bool ok = !dev.policy.warp64 && ((sg.supportedOperations & req) == req) &&
+                        !env_on("RX_VK_NO_NATIVE_WARP_OPS");
+        Shader::Ampere::native_warp_ops = ok;
+        if (ok) logf("vk: native warp ops (REDUX_nx2 / R2UR_nx2 + uniform warp elision): on");
+        return ok;
+    }();
+    (void)init_native_warp;
     const auto lowered = Shader::Ampere::LowerToMaxwell(native);
     if (lowered && lowered.register_map_words) {   // (longshot) which programs run with extended registers
         static std::atomic<int> logged{0};
@@ -1360,6 +1374,10 @@ uint64_t translator_stamp() {
         const uint32_t fma = 0x666d6130u;   // ("fma0")
         add(&fma, sizeof fma);
     }
+    if (env_on("RX_VK_NO_NATIVE_WARP_OPS")) {
+        const uint32_t nw = 0x6e776f30u;   // ("nwo0")
+        add(&nw, sizeof nw);
+    }
     // (what translates shaders, nx2/build.py: a rebuild of anything else keeps the cache. It was the DLL's bytes, and every build
     // lost it)
     const uint64_t translator = LONGSHOT_SHADER_STAMP;
@@ -1512,8 +1530,10 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             int tex_q = env.texture_questions;
             Shader::RuntimeInfo rt{};
             bool want_log = false;
+            const bool need_linear_2d = t->program.workgroup_size[1] > 1U || t->program.workgroup_size[2] > 1U;
             const bool skip_wg_warp =
                 p.key == 0x27ee9883e2a20323ull || p.key == 0xee7764a6b1ef459cull ||
+                (need_linear_2d && !dev.compute_deriv_linear) ||
                 !mesh_wg_warp_allow(true, p.key, csc->key, &want_log);
             if (!skip_wg_warp) {
                 auto plan = Shader::Backend::SPIRV::AnalyzeWorkgroupWarpPlan(t->program, true);

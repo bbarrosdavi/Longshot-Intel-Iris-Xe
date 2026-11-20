@@ -40,6 +40,8 @@ inline bool IsWarpSyncOp(IR::Opcode op) noexcept {
     case Op::ShuffleUp:
     case Op::ShuffleDown:
     case Op::ShuffleButterfly:
+    case Op::SubgroupBroadcastFirstU32:
+    case Op::SubgroupReduceU32:
     case Op::QuadBroadcast:
     case Op::QuadSwap:
     case Op::SubgroupBarrier:
@@ -254,7 +256,7 @@ inline WorkgroupWarpPlan AnalyzeWorkgroupWarpPlan(const IR::Program& prog, bool 
         total_threads = 32U;
     } else if (prog.stage == Stage::Compute) {
         total_threads = prog.workgroup_size[0] * prog.workgroup_size[1] * prog.workgroup_size[2];
-        if (total_threads < 32U || total_threads > 256U || (total_threads % 32U) != 0U ||
+        if (total_threads < 32U || total_threads > 512U || (total_threads % 32U) != 0U ||
             (prog.workgroup_size[0] % 8U) != 0U) {
             return fail("comp_wg_shape");
         }
@@ -655,10 +657,12 @@ inline WorkgroupWarpPlan AnalyzeWorkgroupWarpPlan(const IR::Program& prog, bool 
                         // Mesh: reads read-only task payload (uniform when address is uniform).
                         ok = (prog.stage == Stage::Task) ||
                              (prog.stage == Stage::Mesh && detail::InstArgsUniform(inst, uniform_insts));
-                    } else if (!non_unif_cf &&
+                    } else if (num_warps == 1U && !non_unif_cf &&
                                (op == Op::VoteAll || op == Op::VoteAny || op == Op::VoteEqual ||
-                                op == Op::SubgroupBallot)) {
-                        // Warp-wide reductions return the identical result to all 32 emulated lanes.
+                                op == Op::SubgroupBallot || op == Op::SubgroupBroadcastFirstU32 ||
+                                op == Op::SubgroupReduceU32)) {
+                        // Warp-wide reductions are identical across all 32 lanes of a warp,
+                        // which is workgroup-uniform ONLY when the workgroup has a single warp.
                         ok = true;
                     } else if (detail::IsUniformPreservingOp(op)) {
                         ok = detail::InstArgsUniform(inst, uniform_insts);

@@ -2128,6 +2128,14 @@ U32 IREmitter::ShuffleButterfly(const IR::U32& value, const IR::U32& index, cons
     return Inst<U32>(Opcode::ShuffleButterfly, value, index, clamp, seg_mask);
 }
 
+U32 IREmitter::SubgroupBroadcastFirstU32(const IR::U32& value) {
+    return Inst<U32>(Opcode::SubgroupBroadcastFirstU32, value);
+}
+
+U32 IREmitter::SubgroupReduceU32(const IR::U32& value, const IR::U32& mode) {
+    return Inst<U32>(Opcode::SubgroupReduceU32, value, mode);
+}
+
 Value IREmitter::MatrixMulAddF16(const Value& a, const Value& b, const Value& c) {
     return Inst(Opcode::MatrixMulAddF16, a, b, c);
 }

@@ -429,6 +429,14 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
         execution_model = spv::ExecutionModel::GLCompute;
         ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, workgroup_size[0],
                              workgroup_size[1], workgroup_size[2]);
+        if (ctx.runtime_info.mesh_wg_warp32 && (workgroup_size[1] > 1U || workgroup_size[2] > 1U)) {
+            // (longshot-iris) Force X-major linear invocation-to-subgroup mapping so SIMD8
+            // hardware subgroups match contiguous 8-lane slices of the emulated 32-lane warp
+            // even on 2D/3D image/texture compute shaders (where ANV defaults to 1x4 TileY).
+            ctx.AddExtension("SPV_KHR_compute_shader_derivatives");
+            ctx.AddCapability(spv::Capability::ComputeDerivativeGroupLinearKHR);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::DerivativeGroupLinearKHR);
+        }
         break;
     }
     case Stage::VertexB:
