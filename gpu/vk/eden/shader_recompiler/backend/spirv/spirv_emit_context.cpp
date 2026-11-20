@@ -1176,6 +1176,20 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     static const bool follow_stores{env_on("RX_VK_FOLLOW_STORES")};
     constexpr u32 kGuestZeroSlotIndex = static_cast<u32>(((8ull << 30) + (4ull << 30)) >> 12);   // 0x300000U
     constexpr unsigned long long kGuestZeroPageOffset = (static_cast<unsigned long long>(kGuestZeroSlotIndex) + 8ull) * 8ull;
+    const Id zero{u32_zero_value};
+    size_t miss_index{SIZE_MAX};
+    for (size_t i = 0; i < info.storage_buffers_descriptors.size(); ++i) {
+        const auto& d{info.storage_buffers_descriptors[i]};
+        if (d.count == 1 && d.cbuf_index == 0 && d.cbuf_offset == 0xff0U) {
+            miss_index = i;
+        }
+    }
+    if (miss_index != SIZE_MAX && Sirit::ValidId(ssbos[miss_index].U32)) {
+        probe_log = ssbos[miss_index].U32;
+    }
+    const bool can_direct_guest{follow_pointers && gp_level >= 2 && wants_guest_pages &&
+                                rescaling_push_constants.value != 0 && miss_index == SIZE_MAX};
+    const bool direct_stores{follow_stores || (direct_guest_stores && can_direct_guest)};
     const auto guest_lookup = [&](Id addr, u32 size, auto&& hit) {
         if (!follow_pointers || gp_level < 2 || !wants_guest_pages || rescaling_push_constants.value == 0) return;
         const Id table{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
@@ -1186,6 +1200,26 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id in_b{OpIEqual(U1, addr_hi, Const(0x7fU))};
         const Id pgoff_raw{OpBitwiseAnd(U32[1], addr_lo, Const(0xfffU))};
         const Id fits{OpULessThanEqual(U1, pgoff_raw, Const(0x1000U - size))};
+        if (direct_guest_stores && can_direct_guest) {
+            const Id valid{OpLogicalAnd(U1, OpLogicalOr(U1, in_a, in_b), fits)};
+            const Id pgoff_pg{OpShiftRightLogical(U32[1], addr_lo, Const(12U))};
+            const Id idx_a{OpBitwiseOr(U32[1], OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], addr_hi, Const(1U)), Const(20U)), pgoff_pg)};
+            const Id idx_b{OpBitwiseOr(U32[1], Const(0x200000U), pgoff_pg)};
+            const Id raw_idx32{OpSelect(U32[1], in_a, idx_a, idx_b)};
+            const Id idx32{OpSelect(U32[1], valid, raw_idx32, Const(kGuestZeroSlotIndex))};
+            const Id slot{OpIAdd(U64, table, OpUConvert(U64, OpShiftLeftLogical(U32[1], idx32, Const(3U))))};
+            const Id page{psb_load(U64, slot, 8U)};
+            const Id zero_page{OpIAdd(U64, table, Constant(U64, u64{kGuestZeroPageOffset}))};
+            const Id mapped{OpINotEqual(U1, page, zero_page)};
+            const Id hit_label{OpLabel()};
+            const Id done_label{OpLabel()};
+            OpSelectionMerge(done_label, spv::SelectionControlMask::MaskNone);
+            OpBranchConditional(mapped, hit_label, done_label);
+            AddLabel(hit_label);
+            hit(OpIAdd(U64, page, OpUConvert(U64, pgoff_raw)));
+            AddLabel(done_label);
+            return;
+        }
         const Id valid{OpLogicalAnd(U1, OpLogicalAnd(U1, OpINotEqual(U1, table, Constant(U64, u64{0})), OpLogicalOr(U1, in_a, in_b)), fits)};
         const Id check_label{OpLabel()};
         const Id done_label{OpLabel()};
@@ -1210,17 +1244,6 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         OpBranch(done_label);
         AddLabel(done_label);
     };
-    const Id zero{u32_zero_value};
-    size_t miss_index{SIZE_MAX};
-    for (size_t i = 0; i < info.storage_buffers_descriptors.size(); ++i) {
-        const auto& d{info.storage_buffers_descriptors[i]};
-        if (d.count == 1 && d.cbuf_index == 0 && d.cbuf_offset == 0xff0U) {
-            miss_index = i;
-        }
-    }
-    if (miss_index != SIZE_MAX && Sirit::ValidId(ssbos[miss_index].U32)) {
-        probe_log = ssbos[miss_index].U32;
-    }
     const auto record_miss{[&](Id addr) {
         if (miss_index == SIZE_MAX || !Sirit::ValidId(ssbos[miss_index].U32)) {
             return;
@@ -1248,7 +1271,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     const bool use_gm_ranges{profile.unified_descriptor_binding && wants_gm_ranges &&
                              rescaling_push_constants.value != 0};
     const bool need_read_range{use_gm_ranges && any_load && (!follow_pointers || gp_level < 2 || !wants_guest_pages)};
-    const bool need_gm_range{need_read_range || (use_gm_ranges && any_write && !follow_stores)};
+    const bool need_gm_range{need_read_range || (use_gm_ranges && any_write && !direct_stores)};
 
     Id gm_hdr_ptr{}, gm_hdr_u32p{}, gm_rng_ptr{}, gm_rng_u64p{};
     if (need_gm_range) {
@@ -1409,7 +1432,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id addr{OpFunctionParameter(U64)};
         const Id data{OpFunctionParameter(type)};
         AddLabel();
-        if (!follow_stores) {
+        if (!direct_stores) {
             range_lookup(resolve_gm_range_func, addr, 1U << shift, [&](Id target) {
                 OpStore(psb_member(type, target), data, spv::MemoryAccessMask::Aligned, 4U);
                 OpReturn();
@@ -1447,7 +1470,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
             OpReturnValue((this->*atomics[i])(U32[1], psb_member(U32[1], target), scope, u32_zero_value, value));
         }};
-        if (!follow_stores) {
+        if (!direct_stores) {
             range_lookup(resolve_gm_range_func, addr, 4U, emit_at);
         }
         guest_lookup(addr, 4U, [&](Id target) {
@@ -1470,7 +1493,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
             return OpAtomicCompareExchange(U32[1], pointer, scope, u32_zero_value, u32_zero_value, value, comparator);
         }};
-        if (!follow_stores) {
+        if (!direct_stores) {
             range_lookup(resolve_gm_range_func, addr, 4U, [&](Id target) {
                 OpReturnValue(cas(psb_member(U32[1], target)));
             });
@@ -1523,7 +1546,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             OpBranch(begin_label);
         }};
         const Id aligned{OpBitwiseAnd(U64, addr, Constant(U64, ~u64{3}))};
-        if (!follow_stores) {
+        if (!direct_stores) {
             range_lookup(resolve_gm_range_func, aligned, 4U, [&](Id target) {
                 cas_loop(psb_member(U32[1], target));
             });
@@ -1580,7 +1603,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             if (native_f32_add) native_add(psb_member(F32[1], target));
             else cas_loop(psb_member(U32[1], target));
         }};
-        if (!follow_stores) {
+        if (!direct_stores) {
             range_lookup(resolve_gm_range_func, addr, 4U, emit_fadd);
         }
         guest_lookup(addr, 4U, [&](Id target) {

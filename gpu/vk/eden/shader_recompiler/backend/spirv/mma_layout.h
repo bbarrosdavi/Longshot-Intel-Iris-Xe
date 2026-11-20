@@ -45,5 +45,9 @@ inline bool nan_bits = false;
 // compiler did not finish in minutes, and every compute pipeline queued behind it on Intel's one build thread waited:
 // mesh-drawn rocks and doors white, the forest grey. In a loop: 12 s. On for Intel's Mesa driver (vk_coopmat.cpp); RX_VK_GM_LOOP=0 or 1
 inline bool global_table_loop = false;
+// (longshot-iris) When the host has no VRAM mirrors (!dev.policy.mirrors, dma-buf in-place guest memory),
+// every bound buffer's device address matches guest_pages: global writes and atomics skip the gm_ranges linear loop
+// and resolve directly via guest_pages (1 branch via kGuestZeroSlotIndex). RX_VK_NO_DIRECT_GM_STORES=1 disables it.
+inline bool direct_guest_stores = false;
 
 } // namespace Shader::Backend::SPIRV

@@ -1431,6 +1431,7 @@ uint64_t translator_stamp() {
         const uint32_t flags = (position_invariant ? 1u : 0u) | (frag_nan_guard ? 2u : 0u) | (mma_software ? 4u : 0u) |
                                (global_table_loop ? 8u : 0u) | (fetch_bounds ? 16u : 0u) | (nan_bits ? 32u : 0u) |
                                (profile().need_gather_subpixel_offset ? 64u : 0u) | (fetch_bounds_buffers ? 128u : 0u) |
+                               (direct_guest_stores ? 4096u : 0u) |
                                // (and the software multiplies' form, vk_coopmat.cpp choose_software_form: 0 for the loop, as before)
                                (mma_software ? mma_software_form << 8 | (mma_software_form && mma_software_quad ? 1024u : 0u) : 0u);
         add(&flags, sizeof flags);

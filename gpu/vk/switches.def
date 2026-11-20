@@ -674,6 +674,7 @@ SW(RX_VK_VRAM_MB, hw, int, "by rule from the driver's allowance, the card's VRAM
 SW(RX_VK_WAIT_GPU, attempt, int, "0: the replay is not held to the GPU", "<frames> keeps the replay no further ahead of the GPU than that many frames (at most 8).")
 SW(RX_VK_NO_CUSTOM_SHADERS, kill, bool, "off", "=1 disables optimized hand-written SPIR-V shader overrides (e.g. ab7699ee cubemap reduction).")
 SW(RX_VK_NO_LOAD_OP_CLEAR, kill, bool, "off", "=1 disables fusing full-target color/depth clears into VK_ATTACHMENT_LOAD_OP_CLEAR.")
+SW(RX_VK_NO_DIRECT_GM_STORES, kill, bool, "off: direct guest_pages stores when mirrors=0", "1 disables skipping the gm_ranges linear search on global writes and atomics when mirrors=0.")
 SW(RX_VK_WAIT_HOLD_US, tune, int, "3000 microseconds", "How long a game wait that needs stopped work gives another queue's submit before forcing it on.")
 SW(RX_VK_WARP64, hw, bool, "long warp path where the GPU's subgroups can exceed 32 lanes, except in stages pinned to 32", "0 or 1 forces the graphics stages' long warp path off or on, whatever the GPU.")
 SW(RX_VK_WATCH_ADDRS, diag, string, "empty: none watched", "Watches fixed guest addresses (hex list) in the measured statistics frame.")
