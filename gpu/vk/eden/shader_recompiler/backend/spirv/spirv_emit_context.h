@@ -488,6 +488,12 @@ public:
     // (longshot) a GPU without VK_EXT_mesh_shader: Task and Mesh are compute shaders. Their stage buffer outputs go to
     // the payload, map and record buffers, pushed as device addresses; a generated vertex stage reads the records.
     bool mesh_fallback{};
+    bool mesh_fallback_cull{};
+    std::array<u32, 4> mesh_fallback_pos_lines{~0U, ~0U, ~0U, ~0U};
+    Id mesh_fallback_live_count{};
+    Id mesh_fallback_tri_slots{};
+    u32 mesh_fallback_cull_member_index{};
+    Id mesh_fallback_cull_words_type{};
     bool wants_mesh_fallback{};
     Id mesh_fallback_word_ptr{};   ///< PhysicalStorageBuffer pointer to a block of one u32
     u32 mesh_fallback_payload_member_index{};

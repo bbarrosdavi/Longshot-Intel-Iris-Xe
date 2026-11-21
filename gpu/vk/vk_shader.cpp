@@ -1331,6 +1331,18 @@ bool mesh_wg_warp_on() {
     return on;
 }
 
+bool mesh_fallback_cull_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_MFB_CULL");
+        const bool v = (e && *e) ? (atoi(e) != 0) : (dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA);
+        Shader::Backend::SPIRV::mesh_fallback_cull = v;
+        if (v) logf("vk: mesh fallback per-triangle culling on (RX_VK_MFB_CULL)");
+        return v;
+    }();
+    Shader::Backend::SPIRV::mesh_fallback_cull = on;
+    return on;
+}
+
 bool wg_key_matches(const char* list, size_t list_len, uint64_t prog_key, uint64_t code_key) {
     char phex[17], chex[17];
     snprintf(phex, sizeof phex, "%016llx", (unsigned long long)prog_key);
@@ -1416,6 +1428,12 @@ uint64_t translator_stamp() {
         const uint32_t wg_warp = 0x77677741u;
         add(&wg_warp, sizeof wg_warp);
     }
+    if (mesh_fallback_cull_on()) {
+        const uint32_t mfb_cull = 0x6d666263u;   // ("mfbc")
+        add(&mfb_cull, sizeof mfb_cull);
+    }
+    const uint32_t fnan_v2 = 0x666e6733u;   // ("fng3": single EmitSetFragColor OpNMin/OpNMax guard + fetch_bounds on)
+    add(&fnan_v2, sizeof fnan_v2);
     if (const char* e = getenv("RX_VK_LOOP_SAFETY"); e && e[0] != '0') {
         const uint32_t ls = 0x6c736166u;   // ("lsaf")
         add(&ls, sizeof ls);
@@ -1517,7 +1535,7 @@ uint64_t translator_stamp() {
     for (char** e = _environ; e && *e; e++) {
         const char* const eq = strchr(*e, '=');
         if (eq && switches::find_gone(std::string(*e, (size_t)(eq - *e)).c_str())) continue;
-        for (const char* pre : {"RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_F16", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_MARKERS",
+        for (const char* pre : {"RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_F16", "RX_VK_MESH", "RX_VK_MFB_CULL", "RX_VK_NO_INVARIANT", "RX_VK_MARKERS",
                                 "RX_VK_ALL_GLOBAL_PROGS", "RX_VK_MISS_LOG", "RX_VK_BLOCK_PROBE", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
     }
@@ -1766,12 +1784,8 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                         logf("vk: program %016llx: scene tone map %s%s", (unsigned long long)p.key, why ? "left as the game's: " : "PsychoV35",
                              why ? why : "");
                 }
-                if (Shader::Backend::SPIRV::frag_nan_guard) {   // (RX_VK_NAN_GUARD=0: off, vk_coopmat.cpp coopmat_init)
-                    uint32_t float_targets = 0;
-                    for (int i = 0; i < 8; i++)
-                        if (frt.color_output_types[i] == Shader::AttributeType::Float) float_targets |= 1u << i;
-                    Shader::Optimization::GuardFragmentOutputs(fs->program, float_targets);
-                }
+                // (EmitSetFragColor in emit_spirv_context_get_set.cpp already applies frag_nan_guard to every Float output;
+                // running GuardFragmentOutputs here as well double-guarded 90.3% of fragment shaders back-to-back)
                 const std::vector<uint32_t> fspirv = Shader::Backend::SPIRV::EmitSPIRV(profile_graphics(VK_SHADER_STAGE_FRAGMENT_BIT), frt, fs->program, bindings);
                 dump_ir(p, "fragment", fs->program);
                 Stage f;
@@ -1923,6 +1937,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         mrt.mesh_fallback_task_threads = task_t ? task_t->program.workgroup_size[0] : 0;
         mrt.mesh_fallback_layout = fallback ? mesh_fallback_layout() : 0;
         mrt.mesh_wg_warp32 = fallback && can_workgroup_warp32(mesh_t->program, p.key, mesh.key);
+        if (fallback) (void)mesh_fallback_cull_on();
         const std::vector<uint32_t> mspirv = Shader::Backend::SPIRV::EmitSPIRV(fallback ? profile_pinned() : profile_graphics(VK_SHADER_STAGE_MESH_BIT_EXT), mrt, mesh_t->program, bindings);
         kept.push_back(mspirv);
         Stage ms;

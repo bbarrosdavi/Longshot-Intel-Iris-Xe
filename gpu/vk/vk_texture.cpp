@@ -2938,6 +2938,12 @@ void nvn_barrier(VkCommandBuffer cmd, int32_t bits) {
     d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
     record_barrier_scope(cmd, prev_scope, added_scope);
+    // Preserve pass-only / compute-only tracking across narrowed NVN barriers (vkCmdPipelineBarrier2 bumps work_epoch):
+    // without this, nvn_barrier(0x12) between end_pass and begin_pass invalidated relaxed and triggered a redundant full_barrier,
+    // while keeping from_pass_only false after compute dispatches preserves the 5cb9e4d GPU hang fix.
+    const uint64_t new_epoch = work_epoch.load(std::memory_order_relaxed);
+    if (from_pass_only) last_pass_end_epoch = new_epoch;
+    if (from_compute_only) last_compute_only_epoch = new_epoch;
 }
 
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {

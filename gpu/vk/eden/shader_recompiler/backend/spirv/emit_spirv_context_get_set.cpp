@@ -506,7 +506,7 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
             const Id bits{ctx.OpBitcast(ctx.U32[1], value)};
             const Id non_finite{ctx.OpIEqual(ctx.U1, ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.Const(0x7f800000u)), ctx.Const(0x7f800000u))};
             const Id clamped{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, ctx.Const(-65000.0f)), ctx.Const(65000.0f))};
-            value = ctx.OpSelect(ctx.F32[1], non_finite, ctx.Const(0.0f), clamped);
+            value = ctx.OpSelect(ctx.F32[1], non_finite, ctx.f32_zero_value, clamped);
         }
         ctx.OpStore(pointer, value);
     } else if (type == AttributeType::UnsignedInt) {

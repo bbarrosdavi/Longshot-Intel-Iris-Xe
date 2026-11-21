@@ -549,6 +549,8 @@ constexpr uint64_t kGuestRunPagesOffset = kGuestZeroPageOffset + kGuestZeroPageB
 constexpr uint64_t kGuestRunPagesBytes = kGuestTableSlots * sizeof(uint32_t);
 uint64_t* guest_pages = nullptr;
 uint32_t* guest_run_pages = nullptr;
+std::mutex guest_run_mu;
+std::vector<uint32_t> guest_run_shadow;   // (CPU mirror of guest_run_pages so deferred flushes clamp preceding runs accurately)
 uint64_t guest_pages_address = 0;
 VkBuffer guest_pages_buffer = VK_NULL_HANDLE;
 // (longshot, 11-07) A change to the table made while a submission is recorded goes into that submission's upload commands, after
@@ -576,13 +578,19 @@ void guest_pages_set(uint64_t lo, uint64_t hi, uint64_t address) {
             table_pending.push_back({first, count, at});
             continue;
         }
+        std::lock_guard rk(guest_run_mu);
         for (uint64_t i = 0; i < count; i++) {
+            const uint32_t rlen = at ? (uint32_t)(count - i) : 0u;
             guest_pages[first + i] = at ? at + (i << 12) : zero_page;
-            guest_run_pages[first + i] = at ? (uint32_t)(count - i) : 0u;
+            guest_run_pages[first + i] = rlen;
+            guest_run_shadow[first + i] = rlen;
         }
-        if (!at && first > 0) {
-            for (uint64_t j = first; j > 0 && guest_run_pages[j - 1] > (uint32_t)(first - (j - 1)); --j)
-                guest_run_pages[j - 1] = (uint32_t)(first - (j - 1));
+        if (first > 0) {
+            for (uint64_t j = first; j > 0 && guest_run_shadow[j - 1] > (uint32_t)(first - (j - 1)); --j) {
+                const uint32_t lim = (uint32_t)(first - (j - 1));
+                guest_run_pages[j - 1] = lim;
+                guest_run_shadow[j - 1] = lim;
+            }
         }
     }
 }
@@ -590,14 +598,20 @@ void memory_table_begin() {
     if (!table_pending.empty()) {   // (left by a recording that never ended: written now)
         table_defer = false;
         const uint64_t zero_page = guest_pages_address + kGuestZeroPageOffset;
+        std::lock_guard rk(guest_run_mu);
         for (const TableRun& r : table_pending) {
             for (uint64_t i = 0; i < r.count; i++) {
+                const uint32_t rlen = r.address ? (uint32_t)(r.count - i) : 0u;
                 guest_pages[r.first + i] = r.address ? r.address + (i << 12) : zero_page;
-                guest_run_pages[r.first + i] = r.address ? (uint32_t)(r.count - i) : 0u;
+                guest_run_pages[r.first + i] = rlen;
+                guest_run_shadow[r.first + i] = rlen;
             }
-            if (!r.address && r.first > 0) {
-                for (uint64_t j = r.first; j > 0 && guest_run_pages[j - 1] > (uint32_t)(r.first - (j - 1)); --j)
-                    guest_run_pages[j - 1] = (uint32_t)(r.first - (j - 1));
+            if (r.first > 0) {
+                for (uint64_t j = r.first; j > 0 && guest_run_shadow[j - 1] > (uint32_t)(r.first - (j - 1)); --j) {
+                    const uint32_t lim = (uint32_t)(r.first - (j - 1));
+                    guest_run_pages[j - 1] = lim;
+                    guest_run_shadow[j - 1] = lim;
+                }
             }
         }
         table_pending.clear();
@@ -610,36 +624,75 @@ bool memory_table_flush() {
     table_defer = false;
     if (table_pending.empty()) return false;
     const uint64_t zero_page = guest_pages_address + kGuestZeroPageOffset;
-    struct PageEnt { uint64_t page, addr; uint32_t run; };
-    std::vector<PageEnt> pages;   // (page, host_addr, run_pages), in the order they were set
-    for (const TableRun& r : table_pending)
-        for (uint64_t i = 0; i < r.count; i++)
-            pages.push_back({r.first + i, r.address ? r.address + (i << 12) : zero_page, r.address ? (uint32_t)(r.count - i) : 0u});
+    struct PageEnt { uint64_t page, addr; };
+    struct RunEnt { uint64_t page; uint32_t run; };
+    std::vector<PageEnt> pages;   // (page, host_addr), in the order they were set
+    std::vector<uint64_t> run_touched;
+    std::vector<RunEnt> run_ents;
+    {
+        std::lock_guard rk(guest_run_mu);
+        for (const TableRun& r : table_pending) {
+            for (uint64_t i = 0; i < r.count; i++) {
+                const uint64_t p = r.first + i;
+                const uint32_t rlen = r.address ? (uint32_t)(r.count - i) : 0u;
+                guest_run_shadow[p] = rlen;
+                pages.push_back({p, r.address ? r.address + (i << 12) : zero_page});
+                run_touched.push_back(p);
+            }
+            if (r.first > 0) {
+                // Clamp preceding contiguous runs across deferred unmaps / remapped sub-range boundaries so BDA_HOIST never overruns.
+                for (uint64_t j = r.first; j > 0 && guest_run_shadow[j - 1] > (uint32_t)(r.first - (j - 1)); --j) {
+                    const uint32_t lim = (uint32_t)(r.first - (j - 1));
+                    guest_run_shadow[j - 1] = lim;
+                    run_touched.push_back(j - 1);
+                }
+            }
+        }
+        std::sort(run_touched.begin(), run_touched.end());
+        run_touched.erase(std::unique(run_touched.begin(), run_touched.end()), run_touched.end());
+        run_ents.reserve(run_touched.size());
+        for (uint64_t p : run_touched) run_ents.push_back({p, guest_run_shadow[p]});
+    }
     table_pending.clear();
     std::stable_sort(pages.begin(), pages.end(), [](const auto& a, const auto& b) { return a.page < b.page; });
-    std::vector<uint64_t> run;
-    std::vector<uint32_t> run_len;
     VkCommandBuffer cmd = upload_command_buffer();
     GprofSpan gp(cmd, "ptable update (guest page table)");
     gp.items = 0;
-    uint64_t run_first = 0;
-    const auto emit = [&] {
-        if (!run.empty()) {
-            vkCmdUpdateBuffer(cmd, guest_pages_buffer, run_first * 8, run.size() * 8, run.data());
-            vkCmdUpdateBuffer(cmd, guest_pages_buffer, kGuestRunPagesOffset + run_first * 4, run_len.size() * 4, run_len.data());
-            gp.items += 2, gp.bytes += run.size() * 12;
+    {
+        std::vector<uint64_t> run;
+        uint64_t run_first = 0;
+        const auto emit = [&] {
+            if (!run.empty()) {
+                vkCmdUpdateBuffer(cmd, guest_pages_buffer, run_first * 8, run.size() * 8, run.data());
+                gp.items++, gp.bytes += run.size() * 8;
+            }
+            run.clear();
+        };
+        for (size_t i = 0; i < pages.size(); i++) {
+            if (i + 1 < pages.size() && pages[i + 1].page == pages[i].page) continue;   // (a later change of the same page wins)
+            if (!run.empty() && (pages[i].page != run_first + run.size() || run.size() == 8192)) emit();
+            if (run.empty()) run_first = pages[i].page;
+            run.push_back(pages[i].addr);
         }
-        run.clear();
-        run_len.clear();
-    };
-    for (size_t i = 0; i < pages.size(); i++) {
-        if (i + 1 < pages.size() && pages[i + 1].page == pages[i].page) continue;   // (a later change of the same page wins)
-        if (!run.empty() && (pages[i].page != run_first + run.size() || run.size() == 8192)) emit();
-        if (run.empty()) run_first = pages[i].page;
-        run.push_back(pages[i].addr);
-        run_len.push_back(pages[i].run);
+        emit();
     }
-    emit();
+    {
+        std::vector<uint32_t> run_len;
+        uint64_t run_first = 0;
+        const auto emit_run = [&] {
+            if (!run_len.empty()) {
+                vkCmdUpdateBuffer(cmd, guest_pages_buffer, kGuestRunPagesOffset + run_first * 4, run_len.size() * 4, run_len.data());
+                gp.items++, gp.bytes += run_len.size() * 4;
+            }
+            run_len.clear();
+        };
+        for (const RunEnt& re : run_ents) {
+            if (!run_len.empty() && (re.page != run_first + run_len.size() || run_len.size() == 16384)) emit_run();
+            if (run_len.empty()) run_first = re.page;
+            run_len.push_back(re.run);
+        }
+        emit_run();
+    }
     return true;
 }
 
@@ -665,6 +718,10 @@ uint64_t memory_guest_pages() {
     guest_pages_address = vkGetBufferDeviceAddress(dev.device, &da);
     guest_pages_buffer = b;
     std::lock_guard pk(pools_mu);
+    {
+        std::lock_guard rk(guest_run_mu);
+        guest_run_shadow.assign(kGuestTableSlots, 0u);
+    }
     guest_pages = (uint64_t*)mapped;
     guest_run_pages = (uint32_t*)((uint8_t*)mapped + kGuestRunPagesOffset);
     const uint64_t zero_page = guest_pages_address + kGuestZeroPageOffset;

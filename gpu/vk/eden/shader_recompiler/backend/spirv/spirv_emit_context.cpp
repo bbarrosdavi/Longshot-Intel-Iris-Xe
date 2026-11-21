@@ -1655,6 +1655,12 @@ void EmitContext::DefineRescalingInputPushConstant() {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
     }
+    if (wants_mesh_fallback && stage == Stage::Mesh) {
+        mesh_fallback_cull_words_type = TypeArray(U32[1], Const(MESH_FALLBACK_CULL_PUSH_WORDS));
+        Decorate(mesh_fallback_cull_words_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(mesh_fallback_cull_words_type);
+        mesh_fallback_cull_member_index = member_index++;
+    }
     if (wants_guest_pages) {
         members.push_back(U64);
         guest_pages_member_index = member_index++;
@@ -1699,6 +1705,11 @@ void EmitContext::DefineRescalingInputPushConstant() {
                        spv::Decoration::Offset,
                        static_cast<u32>(offsetof(RescalingLayout, down_factor)));
         MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
+    }
+    if (wants_mesh_fallback && stage == Stage::Mesh) {
+        MemberDecorate(push_constant_struct, mesh_fallback_cull_member_index,
+                       spv::Decoration::Offset, MESH_FALLBACK_CULL_PUSH_OFFSET);
+        MemberName(push_constant_struct, mesh_fallback_cull_member_index, "mfb_cull_info");
     }
     if (wants_guest_pages) {
         MemberDecorate(push_constant_struct, guest_pages_member_index, spv::Decoration::Offset, GUEST_PAGES_PUSH_OFFSET);
@@ -2386,6 +2397,28 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     Name(mesh_primitive_count, "isbe_primitive_count");
 
     if (mesh_fallback) {
+        if (stage == Stage::Mesh && Shader::Backend::SPIRV::mesh_fallback_cull && mesh_info.Corners() == 3 &&
+            mesh_info.max_vertices <= 256U && mesh_info.max_primitives <= 256U) {
+            bool has_all_pos = true;
+            for (u32 c = 0; c < 4; ++c) {
+                const u32 want = static_cast<u32>(IR::Attribute::PositionX) + c;
+                const auto it = std::ranges::find(mesh_info.vertex_lines, want);
+                if (it == mesh_info.vertex_lines.end()) {
+                    has_all_pos = false;
+                    break;
+                }
+                mesh_fallback_pos_lines[c] = static_cast<u32>(it - mesh_info.vertex_lines.begin());
+            }
+            if (has_all_pos) {
+                mesh_fallback_cull = true;
+                mesh_fallback_live_count =
+                    DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+                Name(mesh_fallback_live_count, "mfb_live_count");
+                mesh_fallback_tri_slots = DefineVariable(
+                    *this, TypeArray(U32[1], Const(256U)), std::nullopt, spv::StorageClass::Workgroup);
+                Name(mesh_fallback_tri_slots, "mfb_tri_slots");
+            }
+        }
         return;   // (no mesh outputs here: the epilogue writes records)
     }
 

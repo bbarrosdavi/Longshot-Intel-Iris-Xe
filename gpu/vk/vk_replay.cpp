@@ -1722,7 +1722,16 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             }
             end_pass(cmd);
             GprofSpan gp(cmd, "event signal (barrier, write, barrier)");
-            full_barrier(cmd);
+            {
+                VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+                b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+                b.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                di.memoryBarrierCount = 1, di.pMemoryBarriers = &b;
+                vkCmdPipelineBarrier2(cmd, &di);
+            }
             gpu_write(cmd, e.gpu, &v, 4);
             break;
         }
@@ -4666,7 +4675,8 @@ void blit_crop_to_rect(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t s
     b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     b.dstOffsets[0] = {(int)rect.x, (int)rect.y, 0};
     b.dstOffsets[1] = {(int)(rect.x + rect.w), (int)(rect.y + rect.h), 1};
-    vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, dst_layout, 1, &b, VK_FILTER_LINEAR);
+    const VkFilter filter = (source.w == rect.w && source.h == rect.h) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, dst_layout, 1, &b, filter);
 }
 
 /// The crop of src scaled to the whole destination (captures keep their existing dimensions).

@@ -71,6 +71,7 @@
 #include "vk_fsr3_inputs.h"   // (longshot: take_motion, this chain's motion for FSR 3.1's frame interpolation)
 #include "vk_fsr3fi.h"        // (frames_wanted: that interpolation is asked for)
 #include "vk_fsr4.h"
+#include "vk_reactive.h"      // (Batch 11A: gate R11G11B10 s.color off when reactive mask binds it as rgba16f storage)
 #include "vk_xess.h"
 #include "xess_rules.h"
 #include "vk_menu.h"
@@ -82,6 +83,7 @@
 #include "shaders/dlss_out_comp_spv.h"
 #include "shaders/dlss_out_rgba_comp_spv.h"
 #include "shaders/dlss_prep_comp_spv.h"
+#include "shaders/dlss_prep_r11_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
@@ -174,6 +176,10 @@ struct State {
     VkDescriptorSetLayout prep_set = VK_NULL_HANDLE, out_set = VK_NULL_HANDLE;
     VkPipelineLayout prep_layout = VK_NULL_HANDLE, out_layout = VK_NULL_HANDLE;
     VkPipeline prep = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
+    VkDescriptorSetLayout prep_r11_set = VK_NULL_HANDLE;
+    VkPipelineLayout prep_r11_layout = VK_NULL_HANDLE;
+    VkPipeline prep_r11 = VK_NULL_HANDLE;
+    bool prep_r11_tried = false;
     // (dlss_prep.comp and dlss_out.comp again for an engine that takes HDR colour (TemporalEngine::hdr): linear light in,
     // not clamped to 1, and its linear picture out as it is)
     VkDescriptorSetLayout prep_hdr_set = VK_NULL_HANDLE, out_hdr_set = VK_NULL_HANDLE;
@@ -412,6 +418,15 @@ bool make_pipelines() {
     const VkDescriptorType prep_types[5] = {S, S, I, I, I}, out_types[2] = {S, I};
     if (!s.prep && !make_pipeline(BUILTIN_SPV_ARGS(DLSS_PREP_COMP_SPV), prep_types, 5, 84, s.prep_set, s.prep_layout, s.prep))
         return false;
+    if (!s.prep_r11_tried) {
+        s.prep_r11_tried = true;
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &fp);
+        if ((fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) ==
+            (VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+            (void)make_pipeline(BUILTIN_SPV_ARGS(DLSS_PREP_R11_COMP_SPV), prep_types, 5, 84, s.prep_r11_set,
+                                s.prep_r11_layout, s.prep_r11);
+    }
     // (the HDR ones, for an engine that takes HDR colour. dlss_prep.comp squares the square-root encoded scene into linear
     // light (kSquare, its constant 1), what an HDR feature and its auto exposure are made for, and its ceiling (kColorMax,
     // constant 0) is 16384 in place of 1: the game's native HDR keeps its highlights, and a stray value stays well inside the
@@ -569,6 +584,16 @@ uint64_t device_address(const BufferRef& r) {
     return base ? base + r.offset : 0;
 }
 
+void temporal_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                      VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = src_stage, b.srcAccessMask = src_access;
+    b.dstStageMask = dst_stage, b.dstAccessMask = dst_access;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+
 constexpr uint64_t kPoseBytes = 4 << 20;   // (a pose buffer: 280 bones of 48 bytes are 13 KB a draw, 300 of them)
 
 /// The skinned draws into the scene (cam's depth) with a pose of the frame before (the engine's last), drawn into the motion
@@ -688,7 +713,11 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
         const float* place = &places[i * 3];
         if (placed) {
             std::memcpy((uint8_t*)stage.map + at, s.pose_bytes.data() + k.pose, bytes);
-            staged.push_back({at, at, bytes});
+            if (!staged.empty() && staged.back().srcOffset + staged.back().size == at &&
+                staged.back().dstOffset + staged.back().size == at)
+                staged.back().size += bytes;
+            else
+                staged.push_back({at, at, bytes});
             s.poses_read++;
         } else {
             // (this frame's pose, from where the game has it now: its bones, then its origin at the object's 0x40)
@@ -757,7 +786,8 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     std::memcpy(head + 16, before, 64);
     head[32] = cam.jitter[0], head[33] = cam.jitter[1], head[34] = (float)rw, head[35] = (float)rh;
     flush_mapped(u.memory, dlss_actor::kHeadWords * 4);
-    full_barrier(cmd);   // (the poses copied)
+    temporal_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);   // (the poses copied)
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     ca.imageView = s.motion.view, ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1354,13 +1384,16 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         s.last_frame = 0;
     }
     if (ready == 2) s.engines_made++, s.last_frame = 0;   // (made just now: a new history)
+    const bool hdr = engine.e->hdr && engine.e->hdr();
+    const bool use_r11 = mode == ur::FSR3 && !hdr && !rgba && !reactive::wanted() &&
+                         in->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && s.prep_r11;
     // (NVIDIA DLSS Frame Generation through NGX copies the depth and the motion each frame, vk_dlss.cpp dlss_fg_inputs: a
     // transfer's source too, always, so the Frame generation by row can turn it on at any time)
     const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih) ||
+    if (!make_image(cmd, s.color, use_r11 ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih) ||
         !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, iw, ih, copied) ||
         !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, iw, ih, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied) ||
-        !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh, VK_IMAGE_USAGE_TRANSFER_DST_BIT))   // (FSR 3.1 copies in)
+        !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh, VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return fail("its images were not made");
 
     // (longshot) the projection without this frame's jitter, for an engine that makes its depth constants from it (FSR 3.1), and
@@ -1395,14 +1428,11 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
     pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
     pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (fsr_flip ? 8 : 0);
-    // (an engine made for HDR colour, as prepare made it this frame: the game's native HDR goes past 1, and the LDR pass's
-    // clamp cut every highlight at the paper white, a flat picture. It is given linear light and gives it back: the HDR pair)
-    const bool hdr = engine.e->hdr && engine.e->hdr();
     // The network receives perceptual colour after the scene pass: decode it even when its storage is RGBA16F.
     if (rgba && !make_rgba_output()) return fail("the RGBA16F output shader was not made");
-    const VkPipeline prep_pipe = hdr ? s.prep_hdr : s.prep;
+    const VkPipeline prep_pipe = hdr ? s.prep_hdr : use_r11 ? s.prep_r11 : s.prep;
     const VkPipeline out_pipe = rgba ? s.out_rgba : hdr ? s.out_hdr : s.out;
-    const VkPipelineLayout prep_layout = hdr ? s.prep_hdr_layout : s.prep_layout;
+    const VkPipelineLayout prep_layout = hdr ? s.prep_hdr_layout : use_r11 ? s.prep_r11_layout : s.prep_layout;
     const VkPipelineLayout out_layout = rgba ? s.out_rgba_layout : hdr ? s.out_hdr_layout : s.out_layout;
 
     const auto prep = [&] {
@@ -1424,14 +1454,25 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     };
     full_barrier(cmd);   // (the scene's colour and depth, written before)
     prep();
-    full_barrier(cmd);
+    temporal_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                         VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     // (what moves by itself: the skinned draws drawn again over the camera's motion, with their own)
     const int actors = actor_motion(cmd, cam, previous, rw, rh, dview, motion, s.last_frame);
-    if (actors) full_barrier(cmd);
+    if (actors)
+        temporal_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                         VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                         VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     if (show_motion && actors) {   // (RX_VK_DLSS_DEBUG=motion: the motion as it is now, the actors' in it)
         pc.flags = 4;
         prep();
-        full_barrier(cmd);
+        temporal_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                         VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
     TemporalFrame f;
     f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
@@ -1457,7 +1498,8 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         engine.failed = true;
         return false;   // (the network writes its output over whatever the evaluation did)
     }
-    full_barrier(cmd);
+    // (Batch 11A) FSR 3.1's final P_ACCUMULATE pass already issues COMPUTE_WRITE -> COMPUTE_READ|WRITE in record_pass.
+    if (mode != ur::FSR3) full_barrier(cmd);
     {
         const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
         const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},

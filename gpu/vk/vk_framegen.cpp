@@ -34,12 +34,15 @@
 #include "vk_builtin_spv.h"   // (RX_VK_SHADER_DIR)
 #include "shaders/fg_copy_comp_spv.h"
 #include "shaders/fg_flow_comp_spv.h"
+#include "shaders/fg_flow_fp16_comp_spv.h"
 #include "shaders/fg_hud_comp_spv.h"   // (AMD FSR 3.1's interpolation source with the HUD marked: hud_source)
 #include "shaders/fg_luma_comp_spv.h"
 #include "shaders/fg_median_comp_spv.h"
+#include "shaders/fg_rcas_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
 #include "shaders/fg_scale_pq_comp_spv.h"   // (fg_scale.comp with FG_SCALE_PQ: an RGB10A2 destination)
 #include "shaders/fg_synth_comp_spv.h"
+#include "shaders/fg_synth2_comp_spv.h"
 #include "shaders/hdr_encode_comp_spv.h"
 #include "shaders/crt_downsample_comp_spv.h"
 #include "shaders/crt_lottes_comp_spv.h"
@@ -102,7 +105,7 @@ struct State {
     bool init = false;
     std::atomic<bool> failed{false};   // also read by Reflex's game-thread eligibility check
     uint32_t w = 0, h = 0;
-    Pipe copy, luma, flow, median, synth;
+    Pipe copy, luma, flow, median, synth, synth2;
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     Img frames[2], lumas[2], flows[2];
     OutSet sets[3];   // (one shown, one waiting its place on the line, one being made: the pacer never holds the game back)
@@ -128,6 +131,7 @@ struct State {
 struct ScaleState {
     bool init = false, failed = false;
     Pipe pipe;
+    Pipe rcas;              // (Batch 11A: 1:1 RCAS fast path, 10x10 FP16 SLM tile)
     Pipe pipe_pq;           // (fg_scale_pq, for the game's own HDR10 picture: framegen_scale's pq; made at its first use)
     bool pq_tried = false;
     VkSampler linear = VK_NULL_HANDLE;
@@ -327,7 +331,7 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
 
 // The optional interpolation is disabled after setup fails: retain none of its unused setup objects.
 void drop_setup() {
-    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth}) drop_pipe(*p);
+    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth, &fg.synth2}) drop_pipe(*p);
     if (fg.nearest) vkDestroySampler(dev.device, fg.nearest, nullptr);
     if (fg.linear) vkDestroySampler(dev.device, fg.linear, nullptr);
     fg.nearest = fg.linear = VK_NULL_HANDLE;
@@ -343,12 +347,16 @@ bool init() {
     const int radius = getenv("RX_VK_FRAMEGEN_RADIUS") ? std::clamp(atoi(getenv("RX_VK_FRAMEGEN_RADIUS")), 1, 16) : 12;
     const VkSpecializationMapEntry me{0, 0, 4};
     const VkSpecializationInfo spec{1, &me, 4, &radius};
+    const bool flow_ok = dev.vk12.shaderFloat16
+        ? make_pipe(fg.flow, BUILTIN_SPV_ARGS(FG_FLOW_FP16_COMP_SPV), {S, S, I}, 0, &spec)
+        : make_pipe(fg.flow, BUILTIN_SPV_ARGS(FG_FLOW_COMP_SPV), {S, S, I}, 0, &spec);
     if (!make_pipe(fg.copy, BUILTIN_SPV_ARGS(FG_COPY_COMP_SPV), {S, I, I, I}, 24) ||
         !make_pipe(fg.luma, BUILTIN_SPV_ARGS(FG_LUMA_COMP_SPV), {S, I}, 0) ||
-        !make_pipe(fg.flow, BUILTIN_SPV_ARGS(FG_FLOW_COMP_SPV), {S, S, I}, 0, &spec) ||
+        !flow_ok ||
         !make_pipe(fg.median, BUILTIN_SPV_ARGS(FG_MEDIAN_COMP_SPV), {S, I}, 0) ||
         !make_pipe(fg.synth, BUILTIN_SPV_ARGS(FG_SYNTH_COMP_SPV), {S, S, S, I}, 4))
         return undo();
+    (void)make_pipe(fg.synth2, BUILTIN_SPV_ARGS(FG_SYNTH2_COMP_SPV), {S, S, S, I, I}, 8);
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     si.maxLod = 0.25f;
@@ -381,6 +389,8 @@ bool init_scale() {
         si.maxLod = 0.25f;
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
         if (vkCreateSampler(dev.device, &si, nullptr, &scale.linear) == VK_SUCCESS) {
+            if (dev.vk12.shaderFloat16)
+                (void)make_pipe(scale.rcas, BUILTIN_SPV_ARGS(FG_RCAS_COMP_SPV), {S, I}, 4);
             scale.failed = false;
             return true;
         }
@@ -1243,8 +1253,15 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         full_barrier(cmd);
         pc.side = 1;
     }
-    pass(cmd, pipe, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}, {wide.side == 1 ? scale.small.view : src, scale.linear}},
-         dw, dh, &pc, sizeof pc);
+    if (!pq && opts.upscale == 0 && opts.sharpness > 0 && wide.side == 0 && source.x == 0 && source.y == 0 &&
+        source.w == dw && source.h == dh && scale.rcas.pipe) {
+        const float sharp = opts.sharpness / 100.0f;
+        pass(cmd, scale.rcas, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}}, dw, dh, &sharp, sizeof sharp,
+             "fg_rcas");
+    } else {
+        pass(cmd, pipe, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}, {wide.side == 1 ? scale.small.view : src, scale.linear}},
+             dw, dh, &pc, sizeof pc);
+    }
     static const bool report = env_on("RX_VK_UPSCALE_LOG");
     static bool reported = false;
     if (report && !reported) {
@@ -1662,7 +1679,15 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
                             {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch, nullptr, 0, "fg_flow", true);
         pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}},
              cw, ch, nullptr, 0, "fg_median", true);
-        for (int k = 1; k < m; k++) {
+        int k = 1;
+        for (; k + 1 < m && fg.synth2.pipe; k += 2) {
+            const float ts[2] = {(float)k / (float)m, (float)(k + 1) / (float)m};
+            pass(cmd, fg.synth2, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                  {fg.flows[1].view, fg.linear}, {set->frame[k - 1].view, VK_NULL_HANDLE},
+                                  {set->frame[k].view, VK_NULL_HANDLE}},
+                 uw, uh, ts, sizeof ts, "fg_synth2", true);
+        }
+        for (; k < m; k++) {
             const float t = (float)k / (float)m;
             pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
                                  {fg.flows[1].view, fg.linear}, {set->frame[k - 1].view, VK_NULL_HANDLE}},

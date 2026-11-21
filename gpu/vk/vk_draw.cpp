@@ -4803,9 +4803,12 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
     if (mode <= 0 || count < 5 || words[0] != 0x07230203u) return false;
     const uint32_t em = spirv_exec_model(words, count);
     const bool allow_cs_stores =
-        (em == 5u && (prog_key == 0x7650519f88e59b19ull || prog_key == 0xabccf81b45c5eb50ull || prog_key == 0xcb2e06ddfb9d7d27ull));
+        (em == 5u && (prog_key == 0x7650519f88e59b19ull || prog_key == 0xabccf81b45c5eb50ull || prog_key == 0xcb2e06ddfb9d7d27ull ||
+                      prog_key == 0x3e6fe279463b020eull || prog_key == 0x44511d69b52282adull || prog_key == 0x78ccf14779ec3efbull ||
+                      prog_key == 0x4247f1b4c3ce6cf3ull || prog_key == 0xf0fed2bbccae7bdcull || prog_key == 0x3de6d86ec7e6720eull ||
+                      prog_key == 0x6344c53d07706e30ull || prog_key == 0x102f5b0abb0f1e63ull || prog_key == 0x7984161db3e053b5ull));
     const bool allow_cs_safe = allow_cs_stores || (em == 5u && prog_key == 0x27ee9883e2a20323ull);
-    if (em != 4u && !allow_cs_safe && (em != 5u || mode < 2)) return false;   // 4 = Fragment, 5 = GLCompute
+    if (em != 4u && em != 5u) return false;   // 4 = Fragment, 5 = GLCompute
 
     const bool selective_no_nc = false;
 
@@ -4829,12 +4832,15 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
     };
 
     std::unordered_map<uint32_t, std::string_view> names;
-    uint32_t void_t = 0, u32_t = 0, u32x2_t = 0, u32x4_t = 0;
+    uint32_t void_t = 0, u32_t = 0, u64_t = 0, u32x2_t = 0, u32x4_t = 0;
+    uint32_t local_size_x = 0;
+    bool has_utbuf = false, is_mfb_mesh = false;
     std::unordered_map<uint32_t, uint32_t> rtarr_elem;      // rtarr_type_id -> elem_type_id
     std::unordered_map<uint32_t, uint32_t> struct_m0;       // struct_type_id -> member0_type_id
     std::unordered_map<uint64_t, uint32_t> ptr_types;       // (sc << 32) | elem_t -> ptr_type_id
     std::unordered_map<uint32_t, uint32_t> u32_consts;      // literal_val -> const_id
     std::unordered_map<uint32_t, uint32_t> const_vals;      // const_id -> literal_val
+    std::unordered_map<uint32_t, uint64_t> u64_const_vals;  // const_id -> u64 literal_val
 
     struct VarInfo { uint32_t id; uint32_t ptype; uint32_t sc; };
     std::vector<VarInfo> vars;
@@ -4866,13 +4872,20 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
             const size_t max_len = (wc - 2) * 4;
             size_t len = 0;
             while (len < max_len && s[len]) len++;
-            names[words[i + 1]] = std::string_view(s, len);
+            const std::string_view sv(s, len);
+            names[words[i + 1]] = sv;
+            if (sv == "mfb_out_pos" || sv == "mfb_out_idx") is_mfb_mesh = true;
         } else if (op == 15 && wc >= 3) {
             entry_ids.insert(words[i + 2]);
+        } else if (op == 16 && wc >= 6 && words[i + 2] == 17u) {
+            local_size_x = words[i + 3];
+        } else if (op == 17 && wc == 2 && words[i + 1] == 44u) {
+            has_utbuf = true;
         } else if (op == 19 && wc == 2) {
             void_t = words[i + 1];
-        } else if (op == 21 && wc == 4) {
-            if (words[i + 2] == 32 && words[i + 3] == 0) u32_t = words[i + 1];
+        } else if (op == 21 && wc == 4 && words[i + 3] == 0) {
+            if (words[i + 2] == 32) u32_t = words[i + 1];
+            else if (words[i + 2] == 64) u64_t = words[i + 1];
         } else if (op == 23 && wc == 4 && words[i + 2] == u32_t) {
             if (words[i + 3] == 2) u32x2_t = words[i + 1];
             else if (words[i + 3] == 4) u32x4_t = words[i + 1];
@@ -4885,6 +4898,8 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
         } else if (op == 43 && wc == 4) {
             if (words[i + 1] == u32_t) u32_consts[words[i + 3]] = words[i + 2];
             const_vals[words[i + 2]] = words[i + 3];
+        } else if (op == 43 && wc == 5 && u64_t && words[i + 1] == u64_t) {
+            u64_const_vals[words[i + 2]] = uint64_t(words[i + 3]) | (uint64_t(words[i + 4]) << 32);
         } else if (op == 54 && wc == 5) {
             cur_fn = FuncInfo{uint32_t(i), 0, words[i + 2], false, false, {}};
             in_fn = true;
@@ -4902,7 +4917,8 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
             vars.push_back(VarInfo{words[i + 2], words[i + 1], words[i + 3]});
         }
         if (wc >= 3 && (op == 43 || op == 59 || op == 61 || op == 65 || op == 80 || op == 81 || op == 124 ||
-                        op == 128 || op == 130 || op == 149 || op == 169 || op == 194 || op == 199)) {
+                        op == 128 || op == 130 || op == 149 || op == 169 || op == 171 || op == 176 || op == 194 ||
+                        op == 195 || op == 199 || op == 245)) {
             const uint32_t id = words[i + 2];
             if (id < defs.size()) defs[id] = Def{uint16_t(op), uint16_t(wc), words[i + 1], uint32_t(i)};
         }
@@ -5043,7 +5059,51 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
                 bound_slots[SlotKey{it_cn->second, it_cv->second * 4u}] = vname;
         }
 
-        if (!bound_slots.empty()) {
+        auto get_cbuf_slot = [&](uint32_t cand, std::string_view& out_cn, uint32_t& out_off) -> bool {
+            const Def* d0 = get_def(cand);
+            if (!d0) return false;
+            const Def* ld = nullptr;
+            uint32_t elem_bytes = 0, extra_bytes = 0;
+            if (d0->op == 81 && d0->wc == 5) {
+                const uint32_t comp = words[d0->off + 4];
+                if (comp > 1u) return false;
+                ld = get_def(words[d0->off + 3]);
+                elem_bytes = 8u;
+                extra_bytes = comp * 4u;
+            } else if (d0->op == 61 && d0->wc >= 4) {
+                ld = d0;
+                elem_bytes = 4u;
+            }
+            if (!ld || ld->op != 61 || ld->wc < 4) return false;
+            const Def* ac = get_def(words[ld->off + 3]);
+            if (!ac || ac->op != 65 || ac->wc < 6) return false;
+            auto it_cn = names.find(words[ac->off + 3]);
+            auto it_cv = const_vals.find(words[ac->off + 5]);
+            if (it_cn == names.end() || it_cv == const_vals.end()) return false;
+            out_cn = it_cn->second;
+            out_off = it_cv->second * elem_bytes + extra_bytes;
+            return true;
+        };
+
+        if (em == 5u && bound_slots.empty() && local_size_x == 32u && has_utbuf && !is_mfb_mesh && ssbo_vars.count("ssbo0")) {
+            bound_slots[SlotKey{"c0", 1648u}] = "ssbo0";
+        }
+        const bool is_mfb_task = (em == 5u && bound_slots.size() == 1 && bound_slots.count(SlotKey{"c0", 1648u}));
+        bool is_cull_loads = (em == 5u && !bound_slots.empty() && bound_slots.size() <= 4);
+        if (is_cull_loads) {
+            for (const auto& [sk, sv] : bound_slots) {
+                (void)sv;
+                if (sk.c_name != "c0" ||
+                    (sk.byte_off != 312u && sk.byte_off != 320u && sk.byte_off != 328u && sk.byte_off != 336u &&
+                     sk.byte_off != 1248u && sk.byte_off != 1280u && sk.byte_off != 1312u && sk.byte_off != 1344u)) {
+                    is_cull_loads = false;
+                    break;
+                }
+            }
+        }
+        const bool allow_cs_loads = allow_cs_safe || is_mfb_task || is_cull_loads || (em == 5u && mode >= 2);
+
+        if (!bound_slots.empty() && (em == 4u || allow_cs_loads)) {
             std::unordered_map<uint32_t, const FuncInfo*> fn_map;
             for (const auto& f : funcs) fn_map[f.id] = &f;
 
@@ -5051,16 +5111,24 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
                 if (ci.nargs != 1 && ci.nargs != 2) continue;
                 const Def* arg_def = get_def(ci.arg0);
                 if (!arg_def) continue;
-                const Def* bc_def = (arg_def->op == 128 && arg_def->wc == 5) ? get_def(words[arg_def->off + 3]) : arg_def;
+                const Def* bc_def = arg_def;
+                if (arg_def->op == 128 && arg_def->wc == 5) {
+                    const uint32_t rhs = words[arg_def->off + 4];
+                    auto it64 = u64_const_vals.find(rhs);
+                    if (it64 == u64_const_vals.end() || it64->second >= 65536ull) continue;
+                    bc_def = get_def(words[arg_def->off + 3]);
+                }
                 if (!bc_def || bc_def->op != 124 || bc_def->wc != 4) continue;
                 const Def* cc_def = get_def(words[bc_def->off + 3]);
                 if (!cc_def || cc_def->op != 80 || cc_def->wc != 5) continue;
                 const uint32_t lo_id = words[cc_def->off + 3];
+                const uint32_t hi_id = words[cc_def->off + 4];
                 const Def* lo_def = get_def(lo_id);
                 if (!lo_def) continue;
-                uint32_t a0 = 0, a1 = 0;
-                if (lo_def->op == 81 && lo_def->wc == 5) {
-                    const Def* carry_def = get_def(words[lo_def->off + 3]);
+                uint32_t a0 = 0, a1 = 0, carry_struct_id = 0;
+                if (lo_def->op == 81 && lo_def->wc == 5 && words[lo_def->off + 4] == 0u) {
+                    carry_struct_id = words[lo_def->off + 3];
+                    const Def* carry_def = get_def(carry_struct_id);
                     if (!carry_def || carry_def->op != 149 || carry_def->wc != 5) continue;
                     a0 = words[carry_def->off + 3];
                     a1 = words[carry_def->off + 4];
@@ -5072,34 +5140,74 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
                 }
 
                 uint32_t base_a = 0;
+                std::string_view base_cn;
+                uint32_t base_off = 0;
                 std::string_view ssbo_name;
                 for (uint32_t cand : {a0, a1}) {
                     const Def* d0 = get_def(cand);
-                    if (!d0) continue;
-                    const Def* ld = nullptr;
-                    uint32_t elem_bytes = 0;
-                    if (d0->op == 81 && d0->wc == 5 && words[d0->off + 4] == 0u) {
-                        ld = get_def(words[d0->off + 3]);
-                        elem_bytes = 8u;
-                    } else if (d0->op == 61 && d0->wc >= 4) {
-                        ld = d0;
-                        elem_bytes = 4u;
-                    }
-                    if (!ld || ld->op != 61 || ld->wc < 4) continue;
-                    const Def* ac = get_def(words[ld->off + 3]);
-                    if (!ac || ac->op != 65 || ac->wc < 6) continue;
-                    auto it_cn = names.find(words[ac->off + 3]);
-                    auto it_cv = const_vals.find(words[ac->off + 5]);
-                    if (it_cn != names.end() && it_cv != const_vals.end()) {
-                        auto it_bs = bound_slots.find(SlotKey{it_cn->second, it_cv->second * elem_bytes});
+                    if (d0 && d0->op == 81 && d0->wc == 5 && words[d0->off + 4] != 0u) continue;
+                    std::string_view cn;
+                    uint32_t boff = 0;
+                    if (get_cbuf_slot(cand, cn, boff)) {
+                        auto it_bs = bound_slots.find(SlotKey{cn, boff});
                         if (it_bs != bound_slots.end()) {
                             base_a = cand;
+                            base_cn = cn;
+                            base_off = boff;
                             ssbo_name = it_bs->second;
                             break;
                         }
                     }
                 }
                 if (!base_a || ssbo_name.empty()) continue;
+
+                // Validate high-word pairing: hi_id must derive from cbuf(base_cn, base_off + 4) + carry
+                const Def* dhi = get_def(hi_id);
+                if (!dhi || dhi->op != 128 || dhi->wc != 5) continue;
+                auto is_carry_val = [&](uint32_t cid) -> bool {
+                    const Def* dc = get_def(cid);
+                    if (!dc) return false;
+                    if (carry_struct_id) {
+                        if (dc->op == 81 && dc->wc == 5 && words[dc->off + 3] == carry_struct_id && words[dc->off + 4] == 1u)
+                            return true;
+                        if (dc->op == 169 && dc->wc == 6) {
+                            const Def* cond = get_def(words[dc->off + 3]);
+                            if (cond && cond->op == 171 && cond->wc == 5) {
+                                const Def* ext = get_def(words[cond->off + 3]);
+                                if (ext && ext->op == 81 && ext->wc == 5 && words[ext->off + 3] == carry_struct_id && words[ext->off + 4] == 1u)
+                                    return true;
+                            }
+                        }
+                    } else if (dc->op == 169 && dc->wc == 6) {
+                        const Def* cond = get_def(words[dc->off + 3]);
+                        if (cond && cond->op == 176 && cond->wc == 5 && words[cond->off + 3] == lo_id &&
+                            (words[cond->off + 4] == a0 || words[cond->off + 4] == a1))
+                            return true;
+                    }
+                    return false;
+                };
+                const uint32_t hx = words[dhi->off + 3], hy = words[dhi->off + 4];
+                const uint32_t other_hi = is_carry_val(hy) ? hx : (is_carry_val(hx) ? hy : 0u);
+                if (!other_hi) continue;
+                bool hi_ok = false;
+                std::string_view hi_cn;
+                uint32_t hi_off = 0;
+                if (get_cbuf_slot(other_hi, hi_cn, hi_off) && hi_cn == base_cn && hi_off == base_off + 4u) {
+                    hi_ok = true;
+                } else if (const Def* d2 = get_def(other_hi); d2 && d2->op == 128 && d2->wc == 5) {
+                    const uint32_t ox = words[d2->off + 3], oy = words[d2->off + 4];
+                    const std::pair<uint32_t, uint32_t> hcands[2] = {{ox, oy}, {oy, ox}};
+                    for (auto [b_cand, o_cand] : hcands) {
+                        if (get_cbuf_slot(b_cand, hi_cn, hi_off) && hi_cn == base_cn && hi_off == base_off + 4u) {
+                            auto it_z = const_vals.find(o_cand);
+                            if (it_z != const_vals.end() && it_z->second == 0u) {
+                                hi_ok = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!hi_ok) continue;
 
                 const FuncInfo* fip = fn_map.count(ci.fn_id) ? fn_map[ci.fn_id] : nullptr;
                 uint32_t elem_t = 0;
@@ -5192,9 +5300,13 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
             i += wc;
         }
         std::unordered_map<uint32_t, uint32_t> dead_ranges;
-        for (const auto& f : funcs2)
-            if (!entry_ids.count(f.id) && !remaining_called.count(f.id))
+        std::unordered_set<uint32_t> dead_fn_ids;
+        for (const auto& f : funcs2) {
+            if (!entry_ids.count(f.id) && !remaining_called.count(f.id)) {
                 dead_ranges[f.start] = f.end;
+                dead_fn_ids.insert(f.id);
+            }
+        }
 
         if (!dead_ranges.empty()) {
             out.clear();
@@ -5206,7 +5318,13 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
                     i = it_d->second;
                     continue;
                 }
-                const uint32_t wc = out1[i] >> 16;
+                const uint32_t w0 = out1[i];
+                const uint32_t wc = w0 >> 16;
+                const uint32_t op = w0 & 0xFFFFu;
+                if ((op == 5 || op == 71) && wc >= 3 && dead_fn_ids.count(out1[i + 1])) {
+                    i += wc;
+                    continue;
+                }
                 out.insert(out.end(), out1.begin() + i, out1.begin() + i + wc);
                 i += wc;
             }
@@ -5304,7 +5422,8 @@ std::atomic<uint64_t> st_bda_hoist_shaders{0}, st_bda_hoist_bases{0}, st_bda_hoi
 // PhysicalStorageBuffer load (off64 < safe_lim ? host_base + off64 : zero_page).
 bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t prog_key, std::vector<uint32_t>& out) {
     if (count < 5 || words[0] != 0x07230203u) return false;
-    if (spirv_exec_model(words, count) != 5u) return false;   // GLCompute only
+    const uint32_t em = spirv_exec_model(words, count);
+    if (em != 0u && em != 4u && em != 5u && em != 5364u && em != 5365u) return false;   // VS, FS, CS, Task, Mesh
 
     bool has_calls = false;
     size_t first_func_off = 0;
@@ -5339,6 +5458,7 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
     struct FnInfo {
         uint32_t id = 0, rtype = 0, start = 0, end = 0;
         uint32_t nparams = 0, p0_t = 0;
+        uint32_t fn_pc_ptr_t = 0, fn_pc_var_id = 0, fn_pc_idx_id = 0;
         bool has_store = false, has_atomic = false, has_pc = false, has_utoptr = false;
     };
     std::unordered_map<uint32_t, FnInfo> bda_load_fns;
@@ -5347,7 +5467,7 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
     uint32_t cur_blk = 0;
 
     struct CallRec {
-        uint32_t off, wc, rtype, res_id, fn_id, arg0, olo, ohi, add64_c;
+        uint32_t off, wc, rtype, res_id, fn_id, arg0, olo, ohi, add64_c, add64_val;
         uint32_t s_id, blo, bhi;
     };
     std::vector<CallRec> raw_calls;
@@ -5388,6 +5508,11 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
                 !cur_fn.has_store && !cur_fn.has_atomic && cur_fn.has_pc && cur_fn.has_utoptr &&
                 (cur_fn.rtype == u32_t || (u32x2_t && cur_fn.rtype == u32x2_t) || (u32x4_t && cur_fn.rtype == u32x4_t))) {
                 bda_load_fns[cur_fn.id] = cur_fn;
+                if (!pc_var_id) {
+                    pc_ptr_t = cur_fn.fn_pc_ptr_t;
+                    pc_var_id = cur_fn.fn_pc_var_id;
+                    pc_idx_id = cur_fn.fn_pc_idx_id;
+                }
             }
             in_fn = false;
             cur_blk = 0;
@@ -5401,7 +5526,11 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
                 auto itn = names.find(words[i + 3]);
                 if (itn != names.end() && itn->second == "rescaling_push_constants") {
                     cur_fn.has_pc = true;
-                    if (!pc_var_id) { pc_ptr_t = words[i + 1]; pc_var_id = words[i + 3]; pc_idx_id = words[i + 4]; }
+                    if (!cur_fn.fn_pc_var_id) {
+                        cur_fn.fn_pc_ptr_t = words[i + 1];
+                        cur_fn.fn_pc_var_id = words[i + 3];
+                        cur_fn.fn_pc_idx_id = words[i + 4];
+                    }
                 }
             }
             // Record defs inside functions
@@ -5429,7 +5558,7 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
                 }
             }
             if (op == 57 && wc == 5) {
-                raw_calls.push_back(CallRec{uint32_t(i), wc, words[i + 1], words[i + 2], words[i + 3], words[i + 4], 0, 0, 0, 0, 0, 0});
+                raw_calls.push_back(CallRec{uint32_t(i), wc, words[i + 1], words[i + 2], words[i + 3], words[i + 4], 0, 0, 0, 0, 0, 0, 0});
             }
         }
         i += wc;
@@ -5458,6 +5587,7 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
         }
     };
     std::unordered_map<BaseKey, std::vector<CallRec>, BaseKeyHash> groups;
+    std::unordered_map<BaseKey, std::vector<CallRec>, BaseKeyHash> direct_groups;
 
     for (CallRec c : raw_calls) {
         if (!bda_load_fns.count(c.fn_id)) continue;
@@ -5466,12 +5596,14 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
 
         uint32_t cur = c.arg0;
         uint32_t add64_c = 0;
+        uint32_t add64_val = 0;
         const Def* d = get_def(cur);
         if (d && d->op == 128 && d->wc == 5 && d->rtype == u64_t) {
             const uint32_t rhs = words[d->off + 4];
             auto itc = u64_const_vals.find(rhs);
-            if (itc == u64_const_vals.end() || itc->second > 32ull) continue;   // skip negative or large/dynamic u64 add
+            if (itc == u64_const_vals.end() || itc->second >= 4096ull) continue;   // skip negative or >= 4096 or dynamic u64 add
             add64_c = rhs;
+            add64_val = uint32_t(itc->second);
             cur = words[d->off + 3];
             d = get_def(cur);
         }
@@ -5481,58 +5613,81 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
         const uint32_t lo = words[cc->off + 3], hi = words[cc->off + 4];
 
         const Def* dlo = get_def(lo);
-        if (!dlo || dlo->op != 81 || dlo->wc != 5 || words[dlo->off + 4] != 0u) continue;
-        const Def* dc = get_def(words[dlo->off + 3]);
-        if (!dc || dc->op != 149 || dc->wc != 5) continue;   // OpIAddCarry
-        const uint32_t la = words[dc->off + 3], lb = words[dc->off + 4];
-
         const Def* dhi = get_def(hi);
-        if (!dhi || dhi->op != 128 || dhi->wc != 5) continue;   // OpIAdd hsum carry_sel
-        const uint32_t hsum = words[dhi->off + 3];
-        const Def* dhsum = get_def(hsum);
+        bool dyn_candidate = false;
+        if (dlo && dlo->op == 81 && dlo->wc == 5 && words[dlo->off + 4] == 0u) {
+            const Def* dc = get_def(words[dlo->off + 3]);
+            if (dc && dc->op == 149 && dc->wc == 5 && dhi && dhi->op == 128 && dhi->wc == 5) {
+                dyn_candidate = true;
+                const uint32_t la = words[dc->off + 3], lb = words[dc->off + 4];
+                const uint32_t hsum = words[dhi->off + 3];
+                const Def* dhsum = get_def(hsum);
 
-        bool matched = false;
-        uint32_t ms_id = 0, mblo = 0, mbhi = 0, molo = 0, mohi = 0;
-        const std::pair<uint32_t, uint32_t> lo_cands[2] = {{lb, la}, {la, lb}};
-        for (auto [cand_lo, off_lo] : lo_cands) {
-            uint32_t s_lo = 0, idx_lo = 99;
-            if (!ext_pair(cand_lo, s_lo, idx_lo) || idx_lo != 0u) continue;
-            if (dhsum && dhsum->op == 128 && dhsum->wc == 5) {
-                const uint32_t ha = words[dhsum->off + 3], hb = words[dhsum->off + 4];
-                const std::pair<uint32_t, uint32_t> hi_cands[2] = {{hb, ha}, {ha, hb}};
-                for (auto [cand_hi, off_hi] : hi_cands) {
-                    uint32_t s_hi = 0, idx_hi = 99;
-                    if (ext_pair(cand_hi, s_hi, idx_hi) && s_hi == s_lo && idx_hi == 1u) {
-                        const Def* doh = get_def(off_hi);
-                        if (doh && doh->op == 195) continue;   // skip signed ASR negative offset
-                        ms_id = s_lo; mblo = cand_lo; mbhi = cand_hi; molo = off_lo; mohi = off_hi;
-                        matched = true;
-                        break;
+                bool matched = false;
+                uint32_t ms_id = 0, mblo = 0, mbhi = 0, molo = 0, mohi = 0;
+                const std::pair<uint32_t, uint32_t> lo_cands[2] = {{lb, la}, {la, lb}};
+                for (auto [cand_lo, off_lo] : lo_cands) {
+                    uint32_t s_lo = 0, idx_lo = 99;
+                    if (!ext_pair(cand_lo, s_lo, idx_lo) || idx_lo != 0u) continue;
+                    if (dhsum && dhsum->op == 128 && dhsum->wc == 5) {
+                        const uint32_t ha = words[dhsum->off + 3], hb = words[dhsum->off + 4];
+                        const std::pair<uint32_t, uint32_t> hi_cands[2] = {{hb, ha}, {ha, hb}};
+                        for (auto [cand_hi, off_hi] : hi_cands) {
+                            uint32_t s_hi = 0, idx_hi = 99;
+                            if (ext_pair(cand_hi, s_hi, idx_hi) && s_hi == s_lo && idx_hi == 1u) {
+                                const Def* doh = get_def(off_hi);
+                                if (doh && doh->op == 195) continue;   // skip signed ASR negative offset
+                                ms_id = s_lo; mblo = cand_lo; mbhi = cand_hi; molo = off_lo; mohi = off_hi;
+                                matched = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        uint32_t s_hi = 0, idx_hi = 99;
+                        if (ext_pair(hsum, s_hi, idx_hi) && s_hi == s_lo && idx_hi == 1u) {
+                            ms_id = s_lo; mblo = cand_lo; mbhi = hsum; molo = off_lo; mohi = 0;   // 0 -> u32_0
+                            matched = true;
+                        }
+                    }
+                    if (matched) break;
+                }
+                if (matched) {
+                    const Def* dblo = get_def(mblo);
+                    const Def* dbhi = get_def(mbhi);
+                    if (dblo && dbhi && dblo->blk && dblo->blk == dbhi->blk) {
+                        c.s_id = ms_id; c.blo = mblo; c.bhi = mbhi; c.olo = molo; c.ohi = mohi;
+                        c.add64_c = add64_c; c.add64_val = add64_val;
+                        groups[BaseKey{ms_id, mblo, mbhi}].push_back(c);
+                        continue;
                     }
                 }
-            } else {
-                uint32_t s_hi = 0, idx_hi = 99;
-                if (ext_pair(hsum, s_hi, idx_hi) && s_hi == s_lo && idx_hi == 1u) {
-                    ms_id = s_lo; mblo = cand_lo; mbhi = hsum; molo = off_lo; mohi = 0;   // 0 -> u32_0
-                    matched = true;
-                }
             }
-            if (matched) break;
         }
-        if (!matched) continue;
-        const Def* dblo = get_def(mblo);
-        const Def* dbhi = get_def(mbhi);
-        if (!dblo || !dbhi || !dblo->blk || dblo->blk != dbhi->blk) continue;
-
-        c.s_id = ms_id; c.blo = mblo; c.bhi = mbhi; c.olo = molo; c.ohi = mohi; c.add64_c = add64_c;
-        groups[BaseKey{ms_id, mblo, mbhi}].push_back(c);
+        // Direct / constant-offset BDA call (no OpIAddCarry, sharing (lo, hi) in the same block)
+        if (!dyn_candidate && dlo && dhi && dlo->blk && dlo->blk == dhi->blk) {
+            c.s_id = 0; c.blo = lo; c.bhi = hi; c.olo = 0; c.ohi = 0;
+            c.add64_c = add64_c; c.add64_val = add64_val;
+            direct_groups[BaseKey{0, lo, hi}].push_back(c);
+        }
     }
 
-    // Keep only groups with >= 4 calls
+    auto advance_past_phis = [&](uint32_t ins_off) -> uint32_t {
+        while (ins_off < count) {
+            const uint32_t wc = words[ins_off] >> 16;
+            if (!wc || ins_off + wc >= count) break;
+            if ((words[ins_off + wc] & 0xFFFFu) != 245u) break;
+            ins_off += wc;
+        }
+        return ins_off;
+    };
+
+    // Keep dynamic groups with >= 4 calls and direct constant-offset groups with >= 2 calls (span <= 64)
     struct HoistGroup {
         BaseKey key;
         uint32_t insert_after_off;
         uint32_t host_base_id, safe_lim_id, zero_page_id;
+        bool is_direct;
+        uint32_t max_end;
         std::vector<CallRec> calls;
     };
     std::vector<HoistGroup> active;
@@ -5540,8 +5695,22 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
         if (vec.size() < 4) continue;
         const Def* dblo = get_def(k.blo);
         const Def* dbhi = get_def(k.bhi);
-        const uint32_t ins_off = std::max(dblo->off, dbhi->off);
-        active.push_back(HoistGroup{k, ins_off, 0, 0, 0, std::move(vec)});
+        const uint32_t ins_off = advance_past_phis(std::max(dblo->off, dbhi->off));
+        active.push_back(HoistGroup{k, ins_off, 0, 0, 0, false, 0, std::move(vec)});
+    }
+    for (auto& [k, vec] : direct_groups) {
+        if (vec.size() < 2) continue;
+        uint32_t min_off = UINT32_MAX, max_end = 0;
+        for (const CallRec& c : vec) {
+            const uint32_t eb = (c.rtype == u32x4_t) ? 16u : (c.rtype == u32x2_t) ? 8u : 4u;
+            min_off = std::min(min_off, c.add64_val);
+            max_end = std::max(max_end, c.add64_val + eb);
+        }
+        if (max_end > 64u || (max_end - min_off) > 64u) continue;
+        const Def* dblo = get_def(k.blo);
+        const Def* dbhi = get_def(k.bhi);
+        const uint32_t ins_off = advance_past_phis(std::max(dblo->off, dbhi->off));
+        active.push_back(HoistGroup{k, ins_off, 0, 0, 0, true, max_end, std::move(vec)});
     }
     if (active.empty()) return false;
 
@@ -5566,7 +5735,7 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
     const uint32_t c_4095 = need_u32(4095u), c_2m = need_u32(2097152u), c_3m = need_u32(3145728u), c_fe = need_u32(4294967294u);
     const uint32_t c64_zoff = make_u64_c(25165888ull);     // kGuestZeroPageOffset
     const uint32_t c64_roff = make_u64_c(25174080ull);     // kGuestRunPagesOffset
-    const uint32_t c64_48   = make_u64_c(48ull);           // max add64_c(32) + max elem(16)
+    const uint32_t c64_16   = make_u64_c(16ull);           // max elem(16) (add64_c added before safe_lim check)
     const uint32_t c64_0    = make_u64_c(0ull);
     const uint32_t c64_12   = make_u64_c(12ull);
 
@@ -5578,6 +5747,71 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
     for (auto& g : active) {
         const uint32_t blo = g.key.blo, bhi = g.key.bhi;
         auto& h = insert_after[g.insert_after_off];
+        if (g.is_direct) {
+            // Same-page fast path for direct/constant-offset struct loads (span <= 64):
+            // 1 guest_pages lookup + (blo & 4095) < (4097 - max_end), no guest_run_pages load needed.
+            const uint32_t c_poff_lim = need_u32(4097u - g.max_end);
+            const uint32_t pc_ac = bound++, gp_addr = bound++;
+            const uint32_t t1 = bound++, t2 = bound++, t3 = bound++, t4 = bound++;
+            const uint32_t t5 = bound++, t6 = bound++, t7 = bound++, t8 = bound++;
+            const uint32_t t9 = bound++, t10 = bound++, slot = bound++;
+            const uint32_t s8 = bound++, s8_64 = bound++, hp_a = bound++, hp_ps = bound++, hp_pe = bound++, host_page = bound++;
+            const uint32_t poff = bound++, poff_64 = bound++, host_base = bound++;
+            const uint32_t ok_page = bound++, nz_page = bound++, ok_both = bound++, zero_page = bound++, safe_base = bound++;
+            g.host_base_id = safe_base;
+
+            const uint32_t code[] = {
+                (5u << 16) | 65u,  pc_ptr_t, pc_ac, pc_var_id, pc_idx_id,
+                (4u << 16) | 61u,  u64_t, gp_addr, pc_ac,
+                (5u << 16) | 199u, u32_t, t1, bhi, c_fe,
+                (5u << 16) | 170u, u1_t,  t2, t1, c_16,
+                (5u << 16) | 170u, u1_t,  t3, bhi, c_127,
+                (5u << 16) | 166u, u1_t,  t4, t2, t3,
+                (5u << 16) | 194u, u32_t, t5, blo, c_12,
+                (5u << 16) | 199u, u32_t, t6, bhi, c_1,
+                (5u << 16) | 196u, u32_t, t7, t6, c_20,
+                (5u << 16) | 197u, u32_t, t8, t7, t5,
+                (5u << 16) | 197u, u32_t, t9, c_2m, t5,
+                (6u << 16) | 169u, u32_t, t10, t2, t8, t9,
+                (6u << 16) | 169u, u32_t, slot, t4, t10, c_3m,
+                (5u << 16) | 196u, u32_t, s8, slot, c_3,
+                (4u << 16) | 113u, u64_t, s8_64, s8,
+                (5u << 16) | 128u, u64_t, hp_a, gp_addr, s8_64,
+                (4u << 16) | 120u, psb_u64.ptr_struct, hp_ps, hp_a,
+                (5u << 16) | 65u,  psb_u64.ptr_elem, hp_pe, hp_ps, c_0,
+                (6u << 16) | 61u,  u64_t, host_page, hp_pe, 2u, 8u,
+                (5u << 16) | 199u, u32_t, poff, blo, c_4095,
+                (4u << 16) | 113u, u64_t, poff_64, poff,
+                (5u << 16) | 128u, u64_t, host_base, host_page, poff_64,
+                (5u << 16) | 176u, u1_t,  ok_page, poff, c_poff_lim,
+                (5u << 16) | 171u, u1_t,  nz_page, host_page, c64_0,
+                (5u << 16) | 167u, u1_t,  ok_both, ok_page, nz_page,
+                (5u << 16) | 128u, u64_t, zero_page, gp_addr, c64_zoff,
+                (6u << 16) | 169u, u64_t, safe_base, ok_both, host_base, zero_page,
+            };
+            h.insert(h.end(), std::begin(code), std::end(code));
+
+            for (const CallRec& c : g.calls) {
+                const PsbPair& pp = (c.rtype == u32x4_t) ? psb_u32x4 : (c.rtype == u32x2_t) ? psb_u32x2 : psb_u32;
+                const uint32_t align = (c.rtype == u32x4_t) ? 16u : (c.rtype == u32x2_t) ? 8u : 4u;
+                std::vector<uint32_t> nw;
+                uint32_t sel_a = safe_base;
+                if (c.add64_c) {
+                    sel_a = bound++;
+                    nw.insert(nw.end(), {(5u << 16) | 128u, u64_t, sel_a, safe_base, c.add64_c});
+                }
+                const uint32_t ptr_s = bound++, ptr_e = bound++;
+                nw.insert(nw.end(), {
+                    (4u << 16) | 120u, pp.ptr_struct, ptr_s, sel_a,
+                    (5u << 16) | 65u,  pp.ptr_elem, ptr_e, ptr_s, c_0,
+                    (6u << 16) | 61u,  c.rtype, c.res_id, ptr_e, 2u, align,
+                });
+                replacements[c.off] = RepSpan{c.off + c.wc, std::move(nw)};
+                hoisted_calls++;
+            }
+            continue;
+        }
+
         const uint32_t pc_ac = bound++, gp_addr = bound++;
         const uint32_t t1 = bound++, t2 = bound++, t3 = bound++, t4 = bound++;
         const uint32_t t5 = bound++, t6 = bound++, t7 = bound++, t8 = bound++;
@@ -5623,7 +5857,7 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
             (5u << 16) | 199u, u32_t, poff, blo, c_4095,
             (4u << 16) | 113u, u64_t, poff_64, poff,
             (5u << 16) | 128u, u64_t, host_base, host_page, poff_64,
-            (5u << 16) | 128u, u64_t, need_b, poff_64, c64_48,
+            (5u << 16) | 128u, u64_t, need_b, poff_64, c64_16,
             (5u << 16) | 172u, u1_t,  gt_ok, run_b, need_b,
             (5u << 16) | 130u, u64_t, sub_b, run_b, need_b,
             (6u << 16) | 169u, u64_t, safe_lim, gt_ok, sub_b, c64_0,
@@ -5634,12 +5868,11 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
         for (const CallRec& c : g.calls) {
             const PsbPair& pp = (c.rtype == u32x4_t) ? psb_u32x4 : (c.rtype == u32x2_t) ? psb_u32x2 : psb_u32;
             const uint32_t align = (c.rtype == u32x4_t) ? 16u : (c.rtype == u32x2_t) ? 8u : 4u;
-            const uint32_t p1 = bound++, off64 = bound++, ok = bound++;
+            const uint32_t p1 = bound++, off64 = bound++;
             const uint32_t ohi_id = c.ohi ? c.ohi : c_0;
             std::vector<uint32_t> nw = {
                 (5u << 16) | 80u,  u32x2_t, p1, c.olo, ohi_id,
                 (4u << 16) | 124u, u64_t, off64, p1,
-                (5u << 16) | 176u, u1_t, ok, off64, safe_lim,
             };
             uint32_t final_off = off64;
             if (c.add64_c) {
@@ -5647,8 +5880,9 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
                 nw.insert(nw.end(), {(5u << 16) | 128u, u64_t, off2, off64, c.add64_c});
                 final_off = off2;
             }
-            const uint32_t fast_a = bound++, sel_a = bound++, ptr_s = bound++, ptr_e = bound++;
+            const uint32_t ok = bound++, fast_a = bound++, sel_a = bound++, ptr_s = bound++, ptr_e = bound++;
             nw.insert(nw.end(), {
+                (5u << 16) | 176u, u1_t, ok, final_off, safe_lim,
                 (5u << 16) | 128u, u64_t, fast_a, host_base, final_off,
                 (6u << 16) | 169u, u64_t, sel_a, ok, fast_a, zero_page,
                 (4u << 16) | 120u, pp.ptr_struct, ptr_s, sel_a,
@@ -5662,26 +5896,74 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
 
     if (replacements.empty()) return false;
 
-    out.clear();
-    out.reserve(count + new_consts.size() + active.size() * 190 + hoisted_calls * 40);
-    for (size_t k = 0; k < 5; k++) out.push_back(words[k]);
-    out[3] = bound;
+    std::vector<uint32_t> out1;
+    out1.reserve(count + new_consts.size() + active.size() * 190 + hoisted_calls * 40);
+    for (size_t k = 0; k < 5; k++) out1.push_back(words[k]);
+    out1[3] = bound;
 
     for (size_t i = 5; i < count;) {
         if (i == first_func_off && !new_consts.empty())
-            out.insert(out.end(), new_consts.begin(), new_consts.end());
+            out1.insert(out1.end(), new_consts.begin(), new_consts.end());
         auto it_r = replacements.find(uint32_t(i));
         if (it_r != replacements.end()) {
-            out.insert(out.end(), it_r->second.nw.begin(), it_r->second.nw.end());
+            out1.insert(out1.end(), it_r->second.nw.begin(), it_r->second.nw.end());
             i = it_r->second.end_off;
             continue;
         }
         const uint32_t wc = words[i] >> 16;
-        out.insert(out.end(), words + i, words + i + wc);
+        out1.insert(out.size() ? out1.end() : out1.end(), words + i, words + i + wc);
         auto it_ins = insert_after.find(uint32_t(i));
         if (it_ins != insert_after.end())
-            out.insert(out.end(), it_ins->second.begin(), it_ins->second.end());
+            out1.insert(out1.end(), it_ins->second.begin(), it_ins->second.end());
         i += wc;
+    }
+
+    // Strip dead BDA helper functions with 0 remaining OpFunctionCalls
+    std::unordered_set<uint32_t> remaining_called;
+    struct Span { uint32_t start, end, id; };
+    std::vector<Span> funcs2;
+    uint32_t cur_start = 0, cur_id = 0;
+    for (size_t i = 5; i < out1.size();) {
+        const uint32_t w0 = out1[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > out1.size()) break;
+        if (op == 54 && wc == 5) { cur_start = uint32_t(i); cur_id = out1[i + 2]; }
+        else if (op == 56 && cur_id) { funcs2.push_back(Span{cur_start, uint32_t(i + wc), cur_id}); cur_id = 0; }
+        else if (op == 57 && wc >= 5) { remaining_called.insert(out1[i + 3]); }
+        i += wc;
+    }
+    std::unordered_map<uint32_t, uint32_t> dead_ranges;
+    std::unordered_set<uint32_t> dead_fn_ids;
+    for (const auto& f : funcs2) {
+        if (!entry_ids.count(f.id) && bda_load_fns.count(f.id) && !remaining_called.count(f.id)) {
+            dead_ranges[f.start] = f.end;
+            dead_fn_ids.insert(f.id);
+        }
+    }
+
+    if (!dead_ranges.empty()) {
+        out.clear();
+        out.reserve(out1.size());
+        for (size_t k = 0; k < 5; k++) out.push_back(out1[k]);
+        for (size_t i = 5; i < out1.size();) {
+            auto it_d = dead_ranges.find(uint32_t(i));
+            if (it_d != dead_ranges.end()) {
+                i = it_d->second;
+                continue;
+            }
+            const uint32_t w0 = out1[i];
+            const uint32_t wc = w0 >> 16;
+            const uint32_t op = w0 & 0xFFFFu;
+            if ((op == 5 || op == 71) && wc >= 3 && dead_fn_ids.count(out1[i + 1])) {
+                i += wc;
+                continue;
+            }
+            out.insert(out.end(), out1.begin() + i, out1.begin() + i + wc);
+            i += wc;
+        }
+    } else {
+        out = std::move(out1);
     }
 
     const uint64_t ns = st_bda_hoist_shaders.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -5967,6 +6249,44 @@ const char* checkpoint_kind(char c) {
 
 thread_local uint64_t fallback_payload_address = 0, fallback_records_address = 0;   // (the draw's fallback buffers)
 thread_local uint64_t fallback_indirect_input = 0;
+thread_local uint32_t fallback_cull_words[5] = {};
+
+void pack_fallback_cull_words(const NvnState& s, const Targets& at, uint32_t out[5]) {
+    std::memset(out, 0, 20);
+    if (!Shader::Backend::SPIRV::mesh_fallback_cull || s.poly.mode != 2) return;
+    uint32_t cull_mode = 0;
+    if (!sw().no_cull) {
+        const bool front_ccw = (s.poly.front == NVN_FRONT_FACE_CCW);
+        if (s.poly.cull == NVN_FACE_BACK) cull_mode = front_ccw ? 2u : 1u;
+        else if (s.poly.cull == NVN_FACE_FRONT) cull_mode = front_ccw ? 1u : 2u;
+        else if (s.poly.cull == NVN_FACE_FRONT_AND_BACK) cull_mode = 3u;
+    }
+    out[0] = cull_mode;
+    if (at.samples != VK_SAMPLE_COUNT_1_BIT || !at.width || !at.height) return;
+    float vx = s.viewport[0][0], vy = s.viewport[0][1], vw = s.viewport[0][2], vh = s.viewport[0][3];
+    if (vw == 0.0f && vh == 0.0f) vx = 0.0f, vy = 0.0f, vw = (float)at.width, vh = (float)at.height;
+    if (!(vw > 0.0f && vh > 0.0f && vw <= 32767.0f && vh <= 32767.0f)) return;
+    const int32_t ivx = (int32_t)std::lround(vx), ivy = (int32_t)std::lround(vy);
+    const int32_t ivw = (int32_t)std::lround(vw), ivh = (int32_t)std::lround(vh);
+    if (std::abs(vx - (float)ivx) > 1e-3f || std::abs(vy - (float)ivy) > 1e-3f ||
+        std::abs(vw - (float)ivw) > 1e-3f || std::abs(vh - (float)ivh) > 1e-3f)
+        return;
+    int32_t sx0 = 0, sy0 = 0, sx1 = (int32_t)at.width, sy1 = (int32_t)at.height;
+    if (s.scissor[2] > 0 && s.scissor[3] > 0) {
+        sx0 = std::max(0, s.scissor[0]);
+        sy0 = std::max(0, s.scissor[1]);
+        sx1 = std::min<int32_t>(s.scissor[0] + s.scissor[2], (int32_t)at.width);
+        sy1 = std::min<int32_t>(s.scissor[1] + s.scissor[3], (int32_t)at.height);
+    }
+    if (sx1 <= sx0 || sy1 <= sy0) {
+        out[0] = 3u;
+        return;
+    }
+    out[1] = ((uint32_t)sx0 & 0xFFFFu) | (((uint32_t)sy0 & 0xFFFFu) << 16);
+    out[2] = ((uint32_t)sx1 & 0xFFFFu) | (((uint32_t)sy1 & 0xFFFFu) << 16);
+    out[3] = ((uint32_t)ivw & 0xFFFFu) | (((uint32_t)ivh & 0x7FFFu) << 16) | 0x80000000u;
+    out[4] = ((uint32_t)(uint16_t)(int16_t)ivx) | (((uint32_t)(uint16_t)(int16_t)ivy) << 16);
+}
 
 void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at, uint32_t fallback_first = 0, uint64_t gm_ranges = 0) {
     checkpoint(cmd, p, at ? 'd' : 'c');
@@ -5997,6 +6317,7 @@ void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at, ui
         std::memcpy(data + Shader::Backend::SPIRV::MESH_FIRST_PUSH_OFFSET, &firsts, 8);
     }
     if (p.fallback) {   // (the fallback's records and payloads, pushed as addresses)
+        std::memcpy(data + Shader::Backend::SPIRV::MESH_FALLBACK_CULL_PUSH_OFFSET, fallback_cull_words, 20);
         std::memcpy(data + Shader::Backend::SPIRV::MESH_FALLBACK_PAYLOAD_PUSH_OFFSET, &fallback_payload_address, 8);
         std::memcpy(data + Shader::Backend::SPIRV::MESH_FALLBACK_RECORDS_PUSH_OFFSET, &fallback_records_address, 8);
         std::memcpy(data + Shader::Backend::SPIRV::MESH_FALLBACK_INDIRECT_INPUT_PUSH_OFFSET, &fallback_indirect_input, 8);
@@ -9302,6 +9623,7 @@ struct MfbBatchItem {
     uint64_t mesh_conv_off = 0;
     uint64_t indirect_input = 0;
     uint64_t gm_ranges = 0;
+    uint32_t cull_words[5]{};
     DescWriter dw{};
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
     std::vector<const Texture*> sampled;
@@ -9554,6 +9876,7 @@ int mfb_batch_add(NvnState& s, const DrawArgs& d) {
     it.mesh_conv_off = 0;
     it.indirect_input = indirect_input;
     it.gm_ranges = dw().gm_ranges_address;
+    pack_fallback_cull_words(s, at, it.cull_words);
     it.desc_set = VK_NULL_HANDLE;
     std::swap(it.dw, dw());
     dw().prog = nullptr;
@@ -9764,6 +10087,7 @@ bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
         fallback_payload_address = it.fb->payload_address;
         fallback_records_address = it.fb->records_address;
         fallback_indirect_input = it.indirect_input;
+        std::memcpy(fallback_cull_words, it.cull_words, sizeof fallback_cull_words);
         push_constants(cmd, p, nullptr, it.d.first_task, it.gm_ranges);
         const VkPipeline pipe = p.fallback_compute[it.stage_mesh];
         char label[64] = "mfb";
@@ -10256,9 +10580,11 @@ static void draw_impl(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, const
         fallback_records_address = pre->fb->records_address;
         fallback_payload_address = pre->fb->payload_address;
         fallback_indirect_input = pre->indirect_input;
+        std::memcpy(fallback_cull_words, pre->cull_words, sizeof fallback_cull_words);
         if (fallback_role == FallbackRole::Colour) fallback_list_hold(d.indirect, false);
     } else {
         if (fallback_role == FallbackRole::DepthOnly && fallback_list_held(d.indirect)) SKIP_HERE();
+        if (p.fallback && d.mesh) pack_fallback_cull_words(s, at, fallback_cull_words);
         if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) {
             if (fallback_role == FallbackRole::Colour && p.compute_state.load(std::memory_order_acquire) == 1)
                 fallback_list_hold(d.indirect, true);

@@ -42,6 +42,11 @@ struct Inputs {
     fsr3_math::Camera camera;     ///< device_to_view_depth (fsr3_math.h)
     float frame_time_ms = 16.667f;
     bool reset = false;
+    /// (Batch 11A) Optional external RGBA16F upscale-size output view: when set, accumulate writes directly here,
+    /// skipping g.output allocation and the post-upscale vkCmdCopyImage.
+    VkImageView output = VK_NULL_HANDLE;
+    /// (Batch 11A) Caller already synchronized all input image writes to COMPUTE_SHADER_BIT | TRANSFER_BIT.
+    bool inputs_synced = false;
 };
 
 /// Whether this device can run the passes: push descriptors enough for the widest pass, storage images in every format the
@@ -53,7 +58,8 @@ struct Inputs {
 /// (longshot) The pipelines and the internal images for these sizes, made again when they change (upscale does the same
 /// first): 1 ready as they were, 2 made just now (a new history), 0 an image could not be made (try again later), -1 the
 /// passes cannot run here (for good). vk_fsr3.cpp's engine of the temporal chain calls it from its prepare
-[[nodiscard]] int prepare_sizes(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height);
+[[nodiscard]] int prepare_sizes(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height,
+                                bool need_output = true);
 
 /// Records one evaluation into output_image(), making the pipelines and the internal images at these sizes first (again
 /// when they change). False when something could not be made or the inputs are not usable

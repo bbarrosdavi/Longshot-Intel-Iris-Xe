@@ -1,0 +1,44 @@
+#version 450
+// (Batch 11A) Fused dual-output frame synthesis (e.g. 3x FG: t0=1/3 and t1=2/3 in a single 1080p pass).
+// Reads a0, b0, and flow ONCE instead of twice (-16.6 MB/frame bandwidth, exact same math as fg_synth.comp).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D fa;
+layout(binding = 1) uniform sampler2D fb;
+layout(binding = 2) uniform sampler2D flow;
+layout(binding = 3, rgba8) uniform writeonly image2D dst0;
+layout(binding = 4, rgba8) uniform writeonly image2D dst1;
+layout(push_constant) uniform P { float t0; float t1; } pc;
+float gap(vec3 x, vec3 y) { const vec3 d = abs(x - y); return max(d.r, max(d.g, d.b)); }
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 d = imageSize(dst0);
+    if (any(greaterThanEqual(g, d))) return;
+    const vec3 a0 = texelFetch(fa, g, 0).rgb, b0 = texelFetch(fb, g, 0).rgb;
+    const vec3 still0 = mix(a0, b0, pc.t0);
+    const vec3 still1 = mix(a0, b0, pc.t1);
+    const float moved = smoothstep(0.03, 0.09, gap(a0, b0));
+    if (moved <= 0.0) {
+        imageStore(dst0, g, vec4(still0, 1.0));
+        imageStore(dst1, g, vec4(still1, 1.0));
+        return;
+    }
+    const vec2 p = vec2(g) + 0.5;
+    const vec2 v = textureLod(flow, p / (vec2(textureSize(flow, 0)) * 16.0), 0.0).xy;
+    const vec2 inv_size = 1.0 / vec2(d);
+    {
+        const float t = pc.t0;
+        const vec3 a = textureLod(fa, (p - t * v) * inv_size, 0.0).rgb;
+        const vec3 b = textureLod(fb, (p + (1.0 - t) * v) * inv_size, 0.0).rgb;
+        const float agree = 1.0 - smoothstep(0.05, 0.16, gap(a, b));
+        const vec3 near = t <= 0.5 ? a0 : b0;
+        imageStore(dst0, g, vec4(mix(mix(still0, near, moved), mix(a, b, t), moved * agree), 1.0));
+    }
+    {
+        const float t = pc.t1;
+        const vec3 a = textureLod(fa, (p - t * v) * inv_size, 0.0).rgb;
+        const vec3 b = textureLod(fb, (p + (1.0 - t) * v) * inv_size, 0.0).rgb;
+        const float agree = 1.0 - smoothstep(0.05, 0.16, gap(a, b));
+        const vec3 near = t <= 0.5 ? a0 : b0;
+        imageStore(dst1, g, vec4(mix(mix(still1, near, moved), mix(a, b, t), moved * agree), 1.0));
+    }
+}
