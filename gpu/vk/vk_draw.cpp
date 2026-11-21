@@ -40,6 +40,7 @@
 #include "vk_paths.h"
 #include "pipeline_cache_file.h"
 #include "vk_draw.h"
+#include "vk_custom_spv.h"
 #include "draw_key.h"     // (the draw path's questions answered from their arguments alone: pipe_same, dyn_same, ...)
 #include "flat_map.h"
 #include "vk_menu.h"          // (opts.anisotropy: the Anisotropic filtering row; resolution_scale)
@@ -4746,7 +4747,8 @@ uint32_t spirv_exec_model(const uint32_t* words, size_t count) {
 bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uint64_t prog_key, std::vector<uint32_t>& out) {
     if (mode <= 0 || count < 5 || words[0] != 0x07230203u) return false;
     const uint32_t em = spirv_exec_model(words, count);
-    if (em != 4u && (em != 5u || mode < 2)) return false;   // 4 = Fragment, 5 = GLCompute
+    const bool allow_27ee = (em == 5u && prog_key == 0x27ee9883e2a20323ull);
+    if (em != 4u && !allow_27ee && (em != 5u || mode < 2)) return false;   // 4 = Fragment, 5 = GLCompute
 
     const bool selective_no_nc = false;
 
@@ -4998,24 +5000,41 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
                 if (!cc_def || cc_def->op != 80 || cc_def->wc != 5) continue;
                 const uint32_t lo_id = words[cc_def->off + 3];
                 const Def* lo_def = get_def(lo_id);
-                if (!lo_def || lo_def->op != 81 || lo_def->wc != 5) continue;
-                const Def* carry_def = get_def(words[lo_def->off + 3]);
-                if (!carry_def || carry_def->op != 149 || carry_def->wc != 5) continue;
+                if (!lo_def) continue;
+                uint32_t a0 = 0, a1 = 0;
+                if (lo_def->op == 81 && lo_def->wc == 5) {
+                    const Def* carry_def = get_def(words[lo_def->off + 3]);
+                    if (!carry_def || carry_def->op != 149 || carry_def->wc != 5) continue;
+                    a0 = words[carry_def->off + 3];
+                    a1 = words[carry_def->off + 4];
+                } else if (lo_def->op == 128 && lo_def->wc == 5) {
+                    a0 = words[lo_def->off + 3];
+                    a1 = words[lo_def->off + 4];
+                } else {
+                    continue;
+                }
 
-                const uint32_t a0 = words[carry_def->off + 3], a1 = words[carry_def->off + 4];
                 uint32_t base_a = 0;
                 std::string_view ssbo_name;
                 for (uint32_t cand : {a0, a1}) {
-                    const Def* ce = get_def(cand);
-                    if (!ce || ce->op != 81 || ce->wc != 5 || words[ce->off + 4] != 0u) continue;
-                    const Def* ld = get_def(words[ce->off + 3]);
+                    const Def* d0 = get_def(cand);
+                    if (!d0) continue;
+                    const Def* ld = nullptr;
+                    uint32_t elem_bytes = 0;
+                    if (d0->op == 81 && d0->wc == 5 && words[d0->off + 4] == 0u) {
+                        ld = get_def(words[d0->off + 3]);
+                        elem_bytes = 8u;
+                    } else if (d0->op == 61 && d0->wc >= 4) {
+                        ld = d0;
+                        elem_bytes = 4u;
+                    }
                     if (!ld || ld->op != 61 || ld->wc < 4) continue;
                     const Def* ac = get_def(words[ld->off + 3]);
                     if (!ac || ac->op != 65 || ac->wc < 6) continue;
                     auto it_cn = names.find(words[ac->off + 3]);
                     auto it_cv = const_vals.find(words[ac->off + 5]);
                     if (it_cn != names.end() && it_cv != const_vals.end()) {
-                        auto it_bs = bound_slots.find(SlotKey{it_cn->second, it_cv->second * 8u});
+                        auto it_bs = bound_slots.find(SlotKey{it_cn->second, it_cv->second * elem_bytes});
                         if (it_bs != bound_slots.end()) {
                             base_a = cand;
                             ssbo_name = it_bs->second;
@@ -5199,6 +5218,16 @@ bool transform_spirv_fast_math(const uint32_t* words, size_t count, int mode, st
     }
     return changed;
 }
+int custom_spv_mode() {
+    static const int m = []() {
+        const char* e = getenv("RX_VK_CUSTOM_SPV");
+        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const int v = e && *e ? atoi(e) : (intel_mesa ? 1 : 0);
+        if (v) logf("vk: RX_VK_CUSTOM_SPV=%d (48590e0b SLM + e40dc98f SIMD16)", v);
+        return v;
+    }();
+    return m;
+}
 } // namespace
 
 VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShaderModule* m) {
@@ -5206,15 +5235,33 @@ VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShad
     if (ci && ci->pCode && ci->codeSize >= 20) {
         const uint32_t* words = ci->pCode;
         size_t count = ci->codeSize / 4;
+        const uint32_t em = spirv_exec_model(words, count);
         static const char* dump_dir = getenv("RX_VK_DUMP_ALL_SPV");
         if (dump_dir && *dump_dir) {
             static std::atomic<uint32_t> seq{0};
-            const uint32_t em = spirv_exec_model(words, count);
             const char* st = em == 0 ? "vs" : em == 4 ? "fs" : em == 5 ? "cs" : "st";
             char path[512];
             snprintf(path, sizeof path, "%s/%016llx_%s_%u.spv", dump_dir, (unsigned long long)prog_key, st,
                      seq.fetch_add(1, std::memory_order_relaxed));
             if (FILE* f = fopen(path, "wb")) fwrite(words, 4, count, f), fclose(f);
+        }
+        const int cust = custom_spv_mode();
+        if (cust > 0) {
+            const uint32_t* rep = nullptr;
+            size_t rep_n = 0;
+            if (prog_key == 0x48590e0b8589d6caull && em == 5u) {
+                rep = kCustomSpv_48590e0b; rep_n = std::size(kCustomSpv_48590e0b);
+            } else if (prog_key == 0xe40dc98fca54ad01ull && em == 4u) {
+                rep = kCustomSpv_e40dc98f; rep_n = std::size(kCustomSpv_e40dc98f);
+            }
+            if (rep) {
+                logf("vk: custom SPIR-V override applied to %016llx (em=%u, %zu -> %zu words)",
+                     (unsigned long long)prog_key, em, count, rep_n);
+                VkShaderModuleCreateInfo ci2 = *ci;
+                ci2.pCode = rep;
+                ci2.codeSize = rep_n * 4;
+                return guarded_shader_module(&ci2, m);
+            }
         }
         const int bda_mode = bda_ssbo_mode();
         const int fm = fast_math_mode();

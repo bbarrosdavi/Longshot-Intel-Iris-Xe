@@ -284,6 +284,7 @@ SW(RX_VK_COMPUTE_SERIAL, hw, bool, "on with Intel's Windows driver, off elsewher
 SW(RX_VK_COMPUTE_WARM_APART, hw, bool, "on with Mesa's Intel driver, off elsewhere", "1 or 0 says on any GPU whether the preparation compiles a compute program's variants as items of their own, after the translation.")
 SW(RX_VK_COND_ALWAYS, diag, bool, "off: render conditions are evaluated", "=1 (test) makes every conditional-render condition hold, so everything conditional is drawn.")
 SW(RX_VK_CPU_OVER_GPU, attempt, bool, "off: CPU writes are taken over GPU contents only for textures the GPU merely cleared", "Takes whole pages the CPU wrote after a GPU write over any GPU-written texture, not only cleared ones.")
+SW(RX_VK_CUSTOM_SPV, hw, bool, "on on Mesa's Intel driver, off elsewhere", "Replaces hot shaders (48590e0b fluid CS with 10x10 SLM tile, e40dc98f 3D noise FS with SIMD16) with hand-optimized SPIR-V overrides.")
 SW(RX_VK_DEAD_EVERY, tune, int, "1 present", "Sets how often, in presents, dead transient render targets are looked for.")
 SW(RX_VK_DEAD_MIN_UNUSED, tune, int, "1 present (3 before)", "Sets how many presents a dead transient render target must go unused before it is let go.")
 SW(RX_VK_DESC_POOL_DIV, tune, int, "1 (8192 sets, full-size pools)", "Makes each recording's descriptor pool an n-th (1 to 32) of its size, for the memory the driver keeps.")
