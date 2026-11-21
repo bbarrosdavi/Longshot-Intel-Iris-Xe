@@ -340,7 +340,7 @@ bool init() {
     const auto undo = [] { drop_setup(); return false; };
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return false;
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    const int radius = getenv("RX_VK_FRAMEGEN_RADIUS") ? std::clamp(atoi(getenv("RX_VK_FRAMEGEN_RADIUS")), 1, 16) : 8;
+    const int radius = getenv("RX_VK_FRAMEGEN_RADIUS") ? std::clamp(atoi(getenv("RX_VK_FRAMEGEN_RADIUS")), 1, 16) : 12;
     const VkSpecializationMapEntry me{0, 0, 4};
     const VkSpecializationInfo spec{1, &me, 4, &radius};
     if (!make_pipe(fg.copy, BUILTIN_SPV_ARGS(FG_COPY_COMP_SPV), {S, I, I, I}, 24) ||
@@ -796,9 +796,9 @@ void display_main() {
         // frame slot, a swapchain image or a new swapchain: the review, 2026-11-17. A wait there grows with the delay; the
         // copy's own time to submit (the game's held submits, the queue's lock) is the pipeline's and counts in the delay:
         // timed from after it, a CPU that takes 3 ms to submit left every set out, and the delay stayed at 0)
-        // (Batch 10J) Allow up to 15 ms for swapchain acquire/submit on iGPUs (3 ms rejected 100% of sets on Iris Xe,
+        // (Batch 10J) Allow up to 25 ms for swapchain acquire/submit on iGPUs (3 ms rejected 100% of sets on Iris Xe,
         // leaving fg.late_ns permanently stuck at 0.0 ms and dumping 2x frames <2 ms apart).
-        if (k == 0) s.as_came = t0 - j.queued <= 15000000 && now_ns() - t0 <= 15000000;
+        if (k == 0) s.as_came = t0 - j.queued <= 25000000 && now_ns() - t0 <= 25000000;
     };
     // The copies of a set presented ahead still to go to the GPU, in order, for as many of its frames as `room` (the spare
     // swapchain images not held by the set before)
@@ -887,6 +887,9 @@ void display_main() {
     // (its copies take that long to submit)
     const auto take_early = [&](int left, int64_t until) {
         if (held != 1 || !taken[0].line || until - now_ns() < 3000000) return;
+        // (Batch 10J) Below ~33 FPS, never let take_early() call present_image() mid-set: on iGPUs its fence/acquire
+        // wait stalls display_main by 30-50 ms right before taken[0]'s game frame, breaking even 2x cadence.
+        if (taken[0].j.set->frame_ns > 30000000) return;
         const int spare = (int)dev.swap_spare.load(std::memory_order_relaxed);
         Job j;
         {
@@ -965,11 +968,14 @@ void display_main() {
             if (!timed && due > j.at + interval + s.step) due = j.at + interval + s.step;
             // (Batch 10J) 250 ms sanity guard (matches gap threshold; 100 ms snapped <20 FPS frames to now)
             if (timed && due > now + 250000000) due = now;
-            // (Batch 10J) Anti-bunching: never dump ANY frame (including a taken-early set's k==0 right after the
-            // previous set's game frame) < min_gap after shown_at unless a backlog is building in fg.jobs.
-            if (shown_at > 0 && fg.queued_jobs.load(std::memory_order_relaxed) < (k > 0 ? 2 : 1)) {
+            // (Batch 10J) Anti-bunching: enforce even spacing (94% of game frame / shown) normally, and a smooth
+            // 60% catch-up floor even if >= 2 sets are queued so MAILBOX never drops frames dumped 0.1 ms apart.
+            if (shown_at > 0) {
                 const int64_t base_frame = (s.line && j.set->frame_ns > 0) ? j.set->frame_ns : interval;
-                const int64_t min_gap = std::clamp<int64_t>(base_frame * 4 / (5 * std::max(s.shown, 1)), 4000000, 50000000);
+                const int q = fg.queued_jobs.load(std::memory_order_relaxed);
+                const int64_t min_gap = q < 2
+                    ? std::clamp<int64_t>(base_frame * 47 / (50 * std::max(s.shown, 1)), 4000000, 55000000)
+                    : std::clamp<int64_t>(base_frame * 30 / (50 * std::max(s.shown, 1)), 4000000, 30000000);
                 if (due < shown_at + min_gap) due = shown_at + min_gap;
             }
             const int64_t slot_was = slot;

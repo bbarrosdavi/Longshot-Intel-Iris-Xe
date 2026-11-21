@@ -1,16 +1,16 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : enable
 // Block matching: one vector per 4x4 quarter-size texels (16x16 pixels), +-RADIUS quarter texels searched.
-// (Batch 10J) Cooperative SLM tile caching (36x36 la + 52x52 lb = 15.6 KB SLM, 250x fewer texture fetches)
-// + 2-stage coarse-to-fine search (stride-2 16-sample coarse + exact 64-sample 3x3 fine refinement in SLM).
+// (Batch 10J) Cooperative SLM tile caching (36x36 la + 60x60 lb = 19.2 KB SLM, supports RADIUS <= 12 = +-48 px)
+// + 2-stage coarse-to-fine search + parabolic subpixel refinement in SLM (~1 px flow accuracy instead of 4 px steps).
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(constant_id = 0) const int RADIUS = 8;
+layout(constant_id = 0) const int RADIUS = 12;
 layout(binding = 0) uniform sampler2D la;
 layout(binding = 1) uniform sampler2D lb;
 layout(binding = 2, rgba16f) uniform writeonly image2D flow;
 
 shared float s_la[36][36];
-shared float s_lb[52][52];
+shared float s_lb[60][60];
 
 float sad64_slm(int ax, int ay, int bx, int by) {
     float s = 0.0;
@@ -32,7 +32,7 @@ void main() {
     const ivec2 fsize = imageSize(flow);
     const ivec2 lm = textureSize(la, 0) - 1;
 
-    if (RADIUS <= 8) {
+    if (RADIUS <= 12) {
         const int lidx = int(gl_LocalInvocationIndex);
         const ivec2 la_orig = wg * 32 - 2;
         for (int idx = lidx; idx < 36 * 36; idx += 64) {
@@ -40,10 +40,10 @@ void main() {
             const int x = idx - y * 36;
             s_la[y][x] = texelFetch(la, clamp(la_orig + ivec2(x, y), ivec2(0), lm), 0).r;
         }
-        const ivec2 lb_orig = wg * 32 - 10;
-        for (int idx = lidx; idx < 52 * 52; idx += 64) {
-            const int y = idx / 52;
-            const int x = idx - y * 52;
+        const ivec2 lb_orig = wg * 32 - 14;
+        for (int idx = lidx; idx < 60 * 60; idx += 64) {
+            const int y = idx / 60;
+            const int x = idx - y * 60;
             s_lb[y][x] = texelFetch(lb, clamp(lb_orig + ivec2(x, y), ivec2(0), lm), 0).r;
         }
         barrier();
@@ -51,8 +51,8 @@ void main() {
 
         const int ax = lid.x * 4;
         const int ay = lid.y * 4;
-        const int bx = ax + 8;
-        const int by = ay + 8;
+        const int bx = ax + 12;
+        const int by = ay + 12;
 
         // 4x4 symmetric sub-patch (offsets 0, 2, 5, 7) held in registers for Stage 1 coarse search
         const vec4 p0 = vec4(s_la[ay + 0][ax + 0], s_la[ay + 0][ax + 2], s_la[ay + 0][ax + 5], s_la[ay + 0][ax + 7]);
@@ -60,8 +60,8 @@ void main() {
         const vec4 p2 = vec4(s_la[ay + 5][ax + 0], s_la[ay + 5][ax + 2], s_la[ay + 5][ax + 5], s_la[ay + 5][ax + 7]);
         const vec4 p3 = vec4(s_la[ay + 7][ax + 0], s_la[ay + 7][ax + 2], s_la[ay + 7][ax + 5], s_la[ay + 7][ax + 7]);
 
-        float cbest = 1e9;
-        ivec2 cv = ivec2(0);
+        float cbest = 1e9, cbest2 = 1e9;
+        ivec2 cv = ivec2(0), cv2 = ivec2(0);
         for (int dy = -RADIUS; dy <= RADIUS; dy += 2) {
             const int r0 = by + dy;
             const int r1 = r0 + 2;
@@ -78,27 +78,58 @@ void main() {
                     abs(p2.x - s_lb[r2][c0]) + abs(p2.y - s_lb[r2][c1]) + abs(p2.z - s_lb[r2][c2]) + abs(p2.w - s_lb[r2][c3]) +
                     abs(p3.x - s_lb[r3][c0]) + abs(p3.y - s_lb[r3][c1]) + abs(p3.z - s_lb[r3][c2]) + abs(p3.w - s_lb[r3][c3]);
                 const float cost = s * 4.0 + 0.12 * float(abs(dx) + abs(dy)) + (dx != 0 || dy != 0 ? 0.6 : 0.0);
-                if (cost < cbest) cbest = cost, cv = ivec2(dx, dy);
+                if (cost < cbest) {
+                    cbest2 = cbest; cv2 = cv;
+                    cbest = cost; cv = ivec2(dx, dy);
+                } else if (cost < cbest2) {
+                    cbest2 = cost; cv2 = ivec2(dx, dy);
+                }
             }
         }
 
-        // Stage 2: exact 64-sample SAD at (0,0) and 3x3 neighborhood around best coarse candidate
-        float best = sad64_slm(ax, ay, bx, by);
+        // Stage 2: exact 64-sample SAD at (0,0), 3x3 around best coarse candidate, and secondary coarse candidate
+        float best_sad = sad64_slm(ax, ay, bx, by);
+        float best = best_sad;
         ivec2 bv = ivec2(0);
         const int y0 = max(-RADIUS, cv.y - 1), y1 = min(RADIUS, cv.y + 1);
         const int x0 = max(-RADIUS, cv.x - 1), x1 = min(RADIUS, cv.x + 1);
         for (int dy = y0; dy <= y1; dy++) {
             for (int dx = x0; dx <= x1; dx++) {
                 if (dx == 0 && dy == 0) continue;
-                const float cost = sad64_slm(ax, ay, bx + dx, by + dy) + 0.12 * float(abs(dx) + abs(dy)) + 0.6;
-                if (cost < best) best = cost, bv = ivec2(dx, dy);
+                const float sad = sad64_slm(ax, ay, bx + dx, by + dy);
+                const float cost = sad + 0.12 * float(abs(dx) + abs(dy)) + 0.6;
+                if (cost < best) { best = cost; best_sad = sad; bv = ivec2(dx, dy); }
             }
         }
-        imageStore(flow, g, vec4(vec2(bv) * 4.0, best / 64.0, 1.0));
+        if (abs(cv2.x - cv.x) > 1 || abs(cv2.y - cv.y) > 1) {
+            if (cv2.x != 0 || cv2.y != 0) {
+                const float sad = sad64_slm(ax, ay, bx + cv2.x, by + cv2.y);
+                const float cost = sad + 0.12 * float(abs(cv2.x) + abs(cv2.y)) + 0.6;
+                if (cost < best) { best = cost; best_sad = sad; bv = cv2; }
+            }
+        }
+
+        // Parabolic subpixel refinement in quarter-texel units for moving blocks (keeps static (0,0) locked at 0)
+        vec2 sub = vec2(0.0);
+        if (bv.x != 0 || bv.y != 0) {
+            if (bv.x > -RADIUS && bv.x < RADIUS) {
+                const float sL = sad64_slm(ax, ay, bx + bv.x - 1, by + bv.y);
+                const float sR = sad64_slm(ax, ay, bx + bv.x + 1, by + bv.y);
+                const float den = 2.0 * (sL - 2.0 * best_sad + sR);
+                if (best_sad <= sL && best_sad <= sR && den > 1e-4) sub.x = clamp((sL - sR) / den, -0.5, 0.5);
+            }
+            if (bv.y > -RADIUS && bv.y < RADIUS) {
+                const float sU = sad64_slm(ax, ay, bx + bv.x, by + bv.y - 1);
+                const float sD = sad64_slm(ax, ay, bx + bv.x, by + bv.y + 1);
+                const float den = 2.0 * (sU - 2.0 * best_sad + sD);
+                if (best_sad <= sU && best_sad <= sD && den > 1e-4) sub.y = clamp((sU - sD) / den, -0.5, 0.5);
+            }
+        }
+        imageStore(flow, g, vec4((vec2(bv) + sub) * 4.0, best / 64.0, 1.0));
         return;
     }
 
-    // Fallback for custom RX_VK_FRAMEGEN_RADIUS > 8: coarse stride-2 + 3x3 fine via texelFetch
+    // Fallback for custom RX_VK_FRAMEGEN_RADIUS > 12: coarse stride-2 + 3x3 fine via texelFetch
     if (any(greaterThanEqual(g, fsize))) return;
     const ivec2 c = g * 4 + 2;
     const int offs[4] = int[4](-4, -2, 1, 3);
