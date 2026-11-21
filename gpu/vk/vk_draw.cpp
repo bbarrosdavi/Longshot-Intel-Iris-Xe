@@ -4697,12 +4697,560 @@ VkResult extern_guarded_graphics(VkPipelineCache cache, const VkGraphicsPipeline
 VkResult extern_guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     return guarded_compute(cache, ci, pl);
 }
+namespace {
+thread_local uint64_t tl_module_prog_key = 0;
+
+// (Batch 10F) Strip NoContraction (bit 0) and/or SignedZeroInfNanPreserve (bit 1) from SPIR-V modules at vkCreateShaderModule
+// time (without touching LONGSHOT_SHADER_STAMP or invalidating longshot_programs.bin).
+// RX_VK_FAST_MATH: 0=off, 1=FS NoContraction, 2=FS SignedZeroInfNanPreserve, 3=FS both, 5=all stages NoContraction, 7=all stages both.
+int fast_math_mode() {
+    static const int m = [] {
+        const char* e = getenv("RX_VK_FAST_MATH");
+        const int v = e ? atoi(e) : 0;
+        if (v) logf("vk: RX_VK_FAST_MATH=%d (bit0=NoContraction, bit1=SignedZeroInfNanPreserve, bit2=all stages)", v);
+        return v;
+    }();
+    return m;
+}
+
+int bda_ssbo_mode() {
+    static const int m = [] {
+        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const char* e = getenv("RX_VK_BDA_SSBO");
+        const int v = e && *e ? atoi(e) : (intel_mesa ? 1 : 0);
+        if (v) logf("vk: RX_VK_BDA_SSBO=%d (1=FS BDA->SSBO, 2=+CS loads, 3=+CS stores/atomics)", v);
+        return v;
+    }();
+    return m;
+}
+
+std::atomic<uint64_t> st_bda_ssbo_shaders{0}, st_bda_ssbo_calls{0};
+
+uint32_t spirv_exec_model(const uint32_t* words, size_t count) {
+    if (count < 5 || words[0] != 0x07230203u) return ~0u;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) break;
+        if (op == 15 && wc >= 2) return words[i + 1];   // OpEntryPoint
+        if (op == 54) break;                            // OpFunction
+        i += wc;
+    }
+    return ~0u;
+}
+
+// (Batch 10F) Lower BDA page-table helper OpFunctionCalls (guest_load_*, guest_store_*, guest_atomic_iadd_u32) whose 64-bit
+// guest base address comes from a constant-buffer slot already bound as a Vulkan StorageBuffer (%ssboK) in the same module
+// into direct %ssboK OpAccessChain + OpLoad/OpStore/OpAtomicIAdd instructions, and remove dead DontInline BDA helper functions.
+bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uint64_t prog_key, std::vector<uint32_t>& out) {
+    if (mode <= 0 || count < 5 || words[0] != 0x07230203u) return false;
+    const uint32_t em = spirv_exec_model(words, count);
+    if (em != 4u && (em != 5u || mode < 2)) return false;   // 4 = Fragment, 5 = GLCompute
+
+    const bool selective_no_nc = false;
+
+    // Quick scan: check if the module contains any OpFunctionCall (op == 57) before allocating tables.
+    bool has_calls = false;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+        if (op == 57) { has_calls = true; break; }
+        i += wc;
+    }
+    if (!has_calls && !selective_no_nc) return false;
+
+    uint32_t bound = words[3];
+    struct Def { uint16_t op = 0; uint16_t wc = 0; uint32_t rtype = 0; uint32_t off = 0; };
+    std::vector<Def> defs(bound);
+    auto get_def = [&](uint32_t id) -> const Def* {
+        return (id < defs.size() && defs[id].op != 0) ? &defs[id] : nullptr;
+    };
+
+    std::unordered_map<uint32_t, std::string_view> names;
+    uint32_t void_t = 0, u32_t = 0, u32x2_t = 0, u32x4_t = 0;
+    std::unordered_map<uint32_t, uint32_t> rtarr_elem;      // rtarr_type_id -> elem_type_id
+    std::unordered_map<uint32_t, uint32_t> struct_m0;       // struct_type_id -> member0_type_id
+    std::unordered_map<uint64_t, uint32_t> ptr_types;       // (sc << 32) | elem_t -> ptr_type_id
+    std::unordered_map<uint32_t, uint32_t> u32_consts;      // literal_val -> const_id
+    std::unordered_map<uint32_t, uint32_t> const_vals;      // const_id -> literal_val
+
+    struct VarInfo { uint32_t id; uint32_t ptype; uint32_t sc; };
+    std::vector<VarInfo> vars;
+    struct FuncInfo {
+        uint32_t start_off = 0, end_off = 0, id = 0;
+        bool has_store = false, has_atomic_add = false;
+        std::vector<uint32_t> param_types;
+    };
+    std::vector<FuncInfo> funcs;
+    struct CallInfo {
+        uint32_t off, wc, rtype, call_id, fn_id, arg0, arg1, nargs;
+    };
+    std::vector<CallInfo> calls;
+    std::unordered_set<uint32_t> entry_ids;
+
+    FuncInfo cur_fn;
+    bool in_fn = false;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+        if (in_fn) {
+            if (op == 62) cur_fn.has_store = true;
+            else if (op == 234) cur_fn.has_atomic_add = true;
+        }
+        if (op == 5 && wc >= 3) {
+            const char* s = reinterpret_cast<const char*>(words + i + 2);
+            const size_t max_len = (wc - 2) * 4;
+            size_t len = 0;
+            while (len < max_len && s[len]) len++;
+            names[words[i + 1]] = std::string_view(s, len);
+        } else if (op == 15 && wc >= 3) {
+            entry_ids.insert(words[i + 2]);
+        } else if (op == 19 && wc == 2) {
+            void_t = words[i + 1];
+        } else if (op == 21 && wc == 4) {
+            if (words[i + 2] == 32 && words[i + 3] == 0) u32_t = words[i + 1];
+        } else if (op == 23 && wc == 4 && words[i + 2] == u32_t) {
+            if (words[i + 3] == 2) u32x2_t = words[i + 1];
+            else if (words[i + 3] == 4) u32x4_t = words[i + 1];
+        } else if (op == 29 && wc == 3) {
+            rtarr_elem[words[i + 1]] = words[i + 2];
+        } else if (op == 30 && wc >= 3) {
+            struct_m0[words[i + 1]] = words[i + 2];
+        } else if (op == 32 && wc == 4) {
+            ptr_types[(uint64_t(words[i + 2]) << 32) | words[i + 3]] = words[i + 1];
+        } else if (op == 43 && wc == 4) {
+            if (words[i + 1] == u32_t) u32_consts[words[i + 3]] = words[i + 2];
+            const_vals[words[i + 2]] = words[i + 3];
+        } else if (op == 54 && wc == 5) {
+            cur_fn = FuncInfo{uint32_t(i), 0, words[i + 2], false, false, {}};
+            in_fn = true;
+        } else if (op == 55 && wc == 3 && in_fn) {
+            cur_fn.param_types.push_back(words[i + 1]);
+        } else if (op == 56 && in_fn) {
+            cur_fn.end_off = uint32_t(i + wc);
+            funcs.push_back(std::move(cur_fn));
+            in_fn = false;
+        } else if (op == 57 && wc >= 5) {
+            const uint32_t nargs = wc - 4;
+            calls.push_back(CallInfo{uint32_t(i), uint32_t(wc), words[i + 1], words[i + 2], words[i + 3],
+                                     words[i + 4], nargs >= 2 ? words[i + 5] : 0u, nargs});
+        } else if (op == 59 && wc >= 4) {
+            vars.push_back(VarInfo{words[i + 2], words[i + 1], words[i + 3]});
+        }
+        if (wc >= 3 && (op == 43 || op == 59 || op == 61 || op == 65 || op == 80 || op == 81 || op == 124 ||
+                        op == 128 || op == 130 || op == 149 || op == 169 || op == 194 || op == 199)) {
+            const uint32_t id = words[i + 2];
+            if (id < defs.size()) defs[id] = Def{uint16_t(op), uint16_t(wc), words[i + 1], uint32_t(i)};
+        }
+        i += wc;
+    }
+
+    // Build ssbo_vars: (ssbo_name, elem_type) -> var_id
+    std::unordered_map<std::string_view, std::unordered_map<uint32_t, uint32_t>> ssbo_vars;
+    for (const auto& v : vars) {
+        if (v.sc != 12u) continue;
+        auto it_n = names.find(v.id);
+        if (it_n == names.end()) continue;
+        const std::string_view vname = it_n->second;
+        if (vname.size() < 5 || vname.substr(0, 4) != "ssbo" || vname.substr(0, 10) == "ssbo_table") continue;
+        for (const auto& [st_id, arr_id] : struct_m0) {
+            auto it_p = ptr_types.find((uint64_t(12u) << 32) | st_id);
+            if (it_p != ptr_types.end() && it_p->second == v.ptype) {
+                auto it_a = rtarr_elem.find(arr_id);
+                if (it_a != rtarr_elem.end()) ssbo_vars[vname][it_a->second] = v.id;
+                break;
+            }
+        }
+    }
+
+    struct ReplaceSpan { uint32_t end_off; std::vector<uint32_t> new_words; };
+    std::unordered_map<uint32_t, ReplaceSpan> replacements;
+    uint32_t removed_calls = 0;
+
+    const uint32_t c_0 = u32_consts.count(0u) ? u32_consts[0u] : 0u;
+    const uint32_t c_1 = u32_consts.count(1u) ? u32_consts[1u] : 0u;
+    const uint32_t c_2 = u32_consts.count(2u) ? u32_consts[2u] : 0u;
+    const uint32_t c_3 = u32_consts.count(3u) ? u32_consts[3u] : 0u;
+    const uint32_t c_4 = u32_consts.count(4u) ? u32_consts[4u] : 0u;
+    const uint32_t c_16 = u32_consts.count(16u) ? u32_consts[16u] : 0u;
+    const uint32_t c_mask = u32_consts.count(4294967280u) ? u32_consts[4294967280u] : 0u;
+    const uint32_t ptr_sb_u32 = ptr_types.count((uint64_t(12u) << 32) | u32_t) ? ptr_types[(uint64_t(12u) << 32) | u32_t] : 0u;
+    const uint32_t ptr_sb_u32x2 = ptr_types.count((uint64_t(12u) << 32) | u32x2_t) ? ptr_types[(uint64_t(12u) << 32) | u32x2_t] : 0u;
+    const uint32_t ptr_sb_u32x4 = ptr_types.count((uint64_t(12u) << 32) | u32x4_t) ? ptr_types[(uint64_t(12u) << 32) | u32x4_t] : 0u;
+
+    // Fast path for the 230 5-BDA-call PBR Fragment Shaders: reuse the dominating %290 relative offset into %ssbo1 so
+    // NIR DCE eliminates the duplicate light_idx*96+32 multiply, c0_1[164] load, and all 5 64-bit OpIAddCarry chains.
+    bool handled_fs_reuse290 = false;
+    if (em == 4u && calls.size() == 5 && u32_t && u32x4_t && ptr_sb_u32 && ptr_sb_u32x4 && c_0 && c_1 && c_2 && c_4 && c_16) {
+        auto it_ssbo1 = ssbo_vars.find("ssbo1");
+        if (it_ssbo1 != ssbo_vars.end()) {
+            const uint32_t ssbo1_u32 = it_ssbo1->second.count(u32_t) ? it_ssbo1->second[u32_t] : 0u;
+            const uint32_t ssbo1_u32x4 = it_ssbo1->second.count(u32x4_t) ? it_ssbo1->second[u32x4_t] : 0u;
+            if (ssbo1_u32 && ssbo1_u32x4 && calls[0].rtype == u32_t && calls[1].rtype == u32x4_t &&
+                calls[2].rtype == u32x4_t && calls[3].rtype == u32x4_t && calls[4].rtype == u32x4_t) {
+                const uint32_t call0_off = calls[0].off;
+                uint32_t rel_16_id = 0, idx_16_u32_id = 0, best_off = 0;
+                for (uint32_t id = 1; id < defs.size(); id++) {
+                    const Def& d = defs[id];
+                    if (d.op == 65 && d.wc == 6 && d.off < call0_off && d.off >= best_off && words[d.off + 3] == ssbo1_u32) {
+                        const uint32_t idx_id = words[d.off + 5];
+                        if (const Def* shr = get_def(idx_id); shr && shr->op == 194 && shr->wc == 5) {
+                            idx_16_u32_id = idx_id;
+                            rel_16_id = words[shr->off + 3];
+                            best_off = d.off;
+                        }
+                    }
+                }
+                if (rel_16_id && idx_16_u32_id) {
+                    uint32_t vec4_base_id = 0;
+                    for (size_t idx = 0; idx < 5; idx++) {
+                        const CallInfo& ci = calls[idx];
+                        std::vector<uint32_t> nw;
+                        if (idx == 0) {
+                            const uint32_t id0 = bound++, id1 = bound++, id2 = bound++, id_ac = bound++;
+                            vec4_base_id = bound++;
+                            nw = {
+                                (5u << 16) | 128u, u32_t, id0, idx_16_u32_id, c_16,
+                                (5u << 16) | 128u, u32_t, id1, id0, c_4,
+                                (5u << 16) | 128u, u32_t, id2, id1, c_1,
+                                (6u << 16) | 65u,  ptr_sb_u32, id_ac, ssbo1_u32, c_0, id2,
+                                (4u << 16) | 61u,  u32_t, ci.call_id, id_ac,
+                                (5u << 16) | 194u, u32_t, vec4_base_id, rel_16_id, c_4,
+                            };
+                        } else if (idx == 1 || idx == 2 || idx == 4) {
+                            const uint32_t c_k = (idx == 1) ? c_1 : (idx == 2) ? c_2 : c_4;
+                            const uint32_t id0 = bound++, id_ac = bound++;
+                            nw = {
+                                (5u << 16) | 128u, u32_t, id0, vec4_base_id, c_k,
+                                (6u << 16) | 65u,  ptr_sb_u32x4, id_ac, ssbo1_u32x4, c_0, id0,
+                                (4u << 16) | 61u,  u32x4_t, ci.call_id, id_ac,
+                            };
+                        } else {
+                            const uint32_t id0 = bound++, id1 = bound++, id_ac = bound++;
+                            nw = {
+                                (5u << 16) | 128u, u32_t, id0, vec4_base_id, c_2,
+                                (5u << 16) | 128u, u32_t, id1, id0, c_1,
+                                (6u << 16) | 65u,  ptr_sb_u32x4, id_ac, ssbo1_u32x4, c_0, id1,
+                                (4u << 16) | 61u,  u32x4_t, ci.call_id, id_ac,
+                            };
+                        }
+                        replacements[ci.off] = ReplaceSpan{ci.off + ci.wc, std::move(nw)};
+                        removed_calls++;
+                    }
+                    handled_fs_reuse290 = true;
+                }
+            }
+        }
+    }
+
+    // General path for any remaining BDA calls (including all 44 Compute Shaders with already-bound SSBO BDA calls):
+    if (!handled_fs_reuse290 && !calls.empty() && u32_t && c_0 && c_2 && c_mask) {
+        struct SlotKey {
+            std::string_view c_name;
+            uint32_t byte_off;
+            bool operator==(const SlotKey& o) const { return c_name == o.c_name && byte_off == o.byte_off; }
+        };
+        struct SlotKeyHash {
+            size_t operator()(const SlotKey& k) const {
+                return std::hash<std::string_view>{}(k.c_name) ^ (size_t(k.byte_off) * 0x9e3779b9u);
+            }
+        };
+        std::unordered_map<SlotKey, std::string_view, SlotKeyHash> bound_slots;
+        for (uint32_t id = 1; id < defs.size(); id++) {
+            const Def& d = defs[id];
+            if (d.op != 65 || d.wc < 6) continue;
+            auto it_vn = names.find(words[d.off + 3]);
+            if (it_vn == names.end()) continue;
+            const std::string_view vname = it_vn->second;
+            if (vname.size() < 5 || vname.substr(0, 4) != "ssbo" || vname.substr(0, 10) == "ssbo_table") continue;
+            const uint32_t idx_id = words[d.off + 5];
+            const Def* shr = get_def(idx_id);
+            const Def* sub = (shr && shr->op == 194 && shr->wc == 5) ? get_def(words[shr->off + 3]) : shr;
+            if (!sub || sub->op != 130 || sub->wc != 5) continue;
+            const Def* band = get_def(words[sub->off + 4]);
+            if (!band || band->op != 199 || band->wc != 5) continue;
+            const Def* ld = get_def(words[band->off + 3]);
+            if (!ld || ld->op != 61 || ld->wc < 4) continue;
+            const Def* ac = get_def(words[ld->off + 3]);
+            if (!ac || ac->op != 65 || ac->wc < 6) continue;
+            auto it_cn = names.find(words[ac->off + 3]);
+            auto it_cv = const_vals.find(words[ac->off + 5]);
+            if (it_cn != names.end() && it_cv != const_vals.end())
+                bound_slots[SlotKey{it_cn->second, it_cv->second * 4u}] = vname;
+        }
+
+        if (!bound_slots.empty()) {
+            std::unordered_map<uint32_t, const FuncInfo*> fn_map;
+            for (const auto& f : funcs) fn_map[f.id] = &f;
+
+            for (const CallInfo& ci : calls) {
+                if (ci.nargs != 1 && ci.nargs != 2) continue;
+                const Def* arg_def = get_def(ci.arg0);
+                if (!arg_def) continue;
+                const Def* bc_def = (arg_def->op == 128 && arg_def->wc == 5) ? get_def(words[arg_def->off + 3]) : arg_def;
+                if (!bc_def || bc_def->op != 124 || bc_def->wc != 4) continue;
+                const Def* cc_def = get_def(words[bc_def->off + 3]);
+                if (!cc_def || cc_def->op != 80 || cc_def->wc != 5) continue;
+                const uint32_t lo_id = words[cc_def->off + 3];
+                const Def* lo_def = get_def(lo_id);
+                if (!lo_def || lo_def->op != 81 || lo_def->wc != 5) continue;
+                const Def* carry_def = get_def(words[lo_def->off + 3]);
+                if (!carry_def || carry_def->op != 149 || carry_def->wc != 5) continue;
+
+                const uint32_t a0 = words[carry_def->off + 3], a1 = words[carry_def->off + 4];
+                uint32_t base_a = 0;
+                std::string_view ssbo_name;
+                for (uint32_t cand : {a0, a1}) {
+                    const Def* ce = get_def(cand);
+                    if (!ce || ce->op != 81 || ce->wc != 5 || words[ce->off + 4] != 0u) continue;
+                    const Def* ld = get_def(words[ce->off + 3]);
+                    if (!ld || ld->op != 61 || ld->wc < 4) continue;
+                    const Def* ac = get_def(words[ld->off + 3]);
+                    if (!ac || ac->op != 65 || ac->wc < 6) continue;
+                    auto it_cn = names.find(words[ac->off + 3]);
+                    auto it_cv = const_vals.find(words[ac->off + 5]);
+                    if (it_cn != names.end() && it_cv != const_vals.end()) {
+                        auto it_bs = bound_slots.find(SlotKey{it_cn->second, it_cv->second * 8u});
+                        if (it_bs != bound_slots.end()) {
+                            base_a = cand;
+                            ssbo_name = it_bs->second;
+                            break;
+                        }
+                    }
+                }
+                if (!base_a || ssbo_name.empty()) continue;
+
+                const FuncInfo* fip = fn_map.count(ci.fn_id) ? fn_map[ci.fn_id] : nullptr;
+                uint32_t elem_t = 0;
+                int op_kind = 0;   // 1=load, 2=store, 3=atomic_add
+                if (ci.nargs == 1) {
+                    elem_t = ci.rtype;
+                    op_kind = 1;
+                } else if (mode >= 3 && ci.nargs == 2 && ci.rtype == void_t && fip && fip->has_store && fip->param_types.size() == 2) {
+                    elem_t = fip->param_types[1];
+                    op_kind = 2;
+                } else if (mode >= 3 && ci.nargs == 2 && ci.rtype == u32_t && fip && fip->has_atomic_add && fip->param_types.size() == 2 && c_1) {
+                    elem_t = u32_t;
+                    op_kind = 3;
+                }
+                if (!op_kind || !elem_t) continue;
+
+                auto it_sv = ssbo_vars.find(ssbo_name);
+                if (it_sv == ssbo_vars.end() || !it_sv->second.count(elem_t)) continue;
+                const uint32_t ssbo_vid = it_sv->second[elem_t];
+                const uint32_t ptr_sb_t = (elem_t == u32_t) ? ptr_sb_u32 : (elem_t == u32x2_t) ? ptr_sb_u32x2 : (elem_t == u32x4_t) ? ptr_sb_u32x4 : 0u;
+                const uint32_t c_shr = (elem_t == u32_t) ? c_2 : (elem_t == u32x2_t) ? c_3 : (elem_t == u32x4_t) ? c_4 : 0u;
+                if (!ssbo_vid || !ptr_sb_t || !c_shr) continue;
+
+                const uint32_t addr_id = bound++, id_band = bound++, id_sub = bound++, id_shr = bound++, id_ac = bound++;
+                std::vector<uint32_t> nw = {
+                    (4u << 16) | 113u, u32_t, addr_id, ci.arg0,
+                    (5u << 16) | 199u, u32_t, id_band, base_a, c_mask,
+                    (5u << 16) | 130u, u32_t, id_sub, addr_id, id_band,
+                    (5u << 16) | 194u, u32_t, id_shr, id_sub, c_shr,
+                    (6u << 16) | 65u,  ptr_sb_t, id_ac, ssbo_vid, c_0, id_shr,
+                };
+                if (op_kind == 1) {
+                    nw.insert(nw.end(), {(4u << 16) | 61u, ci.rtype, ci.call_id, id_ac});
+                } else if (op_kind == 2) {
+                    nw.insert(nw.end(), {(3u << 16) | 62u, id_ac, ci.arg1});
+                } else {
+                    nw.insert(nw.end(), {(7u << 16) | 234u, u32_t, ci.call_id, id_ac, c_1, c_0, ci.arg1});
+                }
+                replacements[ci.off] = ReplaceSpan{ci.off + ci.wc, std::move(nw)};
+                removed_calls++;
+            }
+        }
+    }
+
+    if (replacements.empty() && !selective_no_nc) return false;
+
+    std::vector<uint32_t> out1;
+    out1.reserve(count + removed_calls * 20);
+    for (size_t k = 0; k < 5; k++) out1.push_back(words[k]);
+    out1[3] = bound;
+
+    bool body = false;
+    bool changed = !replacements.empty();
+    for (size_t i = 5; i < count;) {
+        auto it_r = replacements.find(uint32_t(i));
+        if (it_r != replacements.end()) {
+            out1.insert(out1.end(), it_r->second.new_words.begin(), it_r->second.new_words.end());
+            i = it_r->second.end_off;
+            continue;
+        }
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (op == 54) body = true;
+        if (!body && selective_no_nc) {
+            if ((op == 71 && wc == 3 && words[i + 2] == 42u) || (op == 72 && wc == 4 && words[i + 3] == 42u)) {
+                changed = true;
+                i += wc;
+                continue;
+            }
+        }
+        out1.insert(out1.end(), words + i, words + i + wc);
+        i += wc;
+    }
+
+    if (removed_calls > 0) {
+        // Strip dead helper functions with 0 remaining OpFunctionCalls
+        std::unordered_set<uint32_t> remaining_called;
+        struct Span { uint32_t start, end, id; };
+        std::vector<Span> funcs2;
+        uint32_t cur_start = 0, cur_id = 0;
+        for (size_t i = 5; i < out1.size();) {
+            const uint32_t w0 = out1[i];
+            const uint32_t wc = w0 >> 16;
+            const uint32_t op = w0 & 0xFFFFu;
+            if (!wc || i + wc > out1.size()) break;
+            if (op == 54 && wc == 5) { cur_start = uint32_t(i); cur_id = out1[i + 2]; }
+            else if (op == 56 && cur_id) { funcs2.push_back(Span{cur_start, uint32_t(i + wc), cur_id}); cur_id = 0; }
+            else if (op == 57 && wc >= 5) { remaining_called.insert(out1[i + 3]); }
+            i += wc;
+        }
+        std::unordered_map<uint32_t, uint32_t> dead_ranges;
+        for (const auto& f : funcs2)
+            if (!entry_ids.count(f.id) && !remaining_called.count(f.id))
+                dead_ranges[f.start] = f.end;
+
+        if (!dead_ranges.empty()) {
+            out.clear();
+            out.reserve(out1.size());
+            for (size_t k = 0; k < 5; k++) out.push_back(out1[k]);
+            for (size_t i = 5; i < out1.size();) {
+                auto it_d = dead_ranges.find(uint32_t(i));
+                if (it_d != dead_ranges.end()) {
+                    i = it_d->second;
+                    continue;
+                }
+                const uint32_t wc = out1[i] >> 16;
+                out.insert(out.end(), out1.begin() + i, out1.begin() + i + wc);
+                i += wc;
+            }
+        } else {
+            out = std::move(out1);
+        }
+        st_bda_ssbo_shaders.fetch_add(1, std::memory_order_relaxed);
+        st_bda_ssbo_calls.fetch_add(removed_calls, std::memory_order_relaxed);
+    } else {
+        out = std::move(out1);
+    }
+    return changed;
+}
+
+bool transform_spirv_fast_math(const uint32_t* words, size_t count, int mode, std::vector<uint32_t>& out) {
+    const uint32_t em = spirv_exec_model(words, count);
+    if (em == ~0u) return false;
+    const bool all_stages = (mode & 4) != 0;
+    if (!all_stages && em != 4u) return false;   // 4 = Fragment
+    const bool strip_nocontract = (mode & 1) != 0;
+    const bool strip_nan_preserve = (mode & 2) != 0;
+    if (!strip_nocontract && !strip_nan_preserve) return false;
+
+    out.clear();
+    out.reserve(count);
+    for (size_t k = 0; k < 5; k++) out.push_back(words[k]);
+    bool changed = false;
+    bool body = false;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) {
+            out.insert(out.end(), words + i, words + count);
+            break;
+        }
+        if (op == 54) body = true;   // OpFunction: annotations/header are before this
+        if (!body) {
+            // OpDecorate <target> NoContraction (71, wc==3, decoration==42)
+            if (strip_nocontract && op == 71 && wc == 3 && words[i + 2] == 42u) {
+                changed = true;
+                i += wc;
+                continue;
+            }
+            // OpMemberDecorate <struct> <member> NoContraction (72, wc==4, decoration==42)
+            if (strip_nocontract && op == 72 && wc == 4 && words[i + 3] == 42u) {
+                changed = true;
+                i += wc;
+                continue;
+            }
+            // OpExecutionMode <entry> SignedZeroInfNanPreserve <bits> (16, wc==4, mode==4461)
+            if (strip_nan_preserve && op == 16 && wc == 4 && words[i + 2] == 4461u) {
+                changed = true;
+                i += wc;
+                continue;
+            }
+            // OpCapability SignedZeroInfNanPreserve (17, wc==2, cap==4467)
+            if (strip_nan_preserve && op == 17 && wc == 2 && words[i + 1] == 4467u) {
+                changed = true;
+                i += wc;
+                continue;
+            }
+        }
+        out.insert(out.end(), words + i, words + i + wc);
+        i += wc;
+    }
+    return changed;
+}
+} // namespace
+
 VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShaderModule* m) {
+    const uint64_t prog_key = tl_module_prog_key;
+    if (ci && ci->pCode && ci->codeSize >= 20) {
+        const uint32_t* words = ci->pCode;
+        size_t count = ci->codeSize / 4;
+        static const char* dump_dir = getenv("RX_VK_DUMP_ALL_SPV");
+        if (dump_dir && *dump_dir) {
+            static std::atomic<uint32_t> seq{0};
+            const uint32_t em = spirv_exec_model(words, count);
+            const char* st = em == 0 ? "vs" : em == 4 ? "fs" : em == 5 ? "cs" : "st";
+            char path[512];
+            snprintf(path, sizeof path, "%s/%016llx_%s_%u.spv", dump_dir, (unsigned long long)prog_key, st,
+                     seq.fetch_add(1, std::memory_order_relaxed));
+            if (FILE* f = fopen(path, "wb")) fwrite(words, 4, count, f), fclose(f);
+        }
+        const int bda_mode = bda_ssbo_mode();
+        const int fm = fast_math_mode();
+        if (bda_mode > 0 || fm > 0) {
+            std::vector<uint32_t> patched;
+            bool did_patch = false;
+            if (bda_mode > 0 && transform_spirv_bda_ssbo(words, count, bda_mode, prog_key, patched)) {
+                words = patched.data();
+                count = patched.size();
+                did_patch = true;
+            }
+            if (fm > 0) {
+                std::vector<uint32_t> patched2;
+                if (transform_spirv_fast_math(words, count, fm, patched2)) {
+                    patched = std::move(patched2);
+                    words = patched.data();
+                    count = patched.size();
+                    did_patch = true;
+                }
+            }
+            if (did_patch) {
+                VkShaderModuleCreateInfo ci2 = *ci;
+                ci2.pCode = words;
+                ci2.codeSize = count * 4;
+                return guarded_shader_module(&ci2, m);
+            }
+        }
+    }
     return guarded_shader_module(ci, m);
 }
 /// (longshot) A program whose shader module the driver faulted on (vk_shader.cpp make_module) is kept out as one whose pipeline
 /// it faulted on: not asked of it again in this run, nor in later runs on the same driver (driver_faults.h)
-bool driver_faulted_program(uint64_t key) { return key && driver_faults_on() && fault_quarantine().contains(key); }
+bool driver_faulted_program(uint64_t key) {
+    tl_module_prog_key = key;
+    return key && driver_faults_on() && fault_quarantine().contains(key);
+}
 void driver_faulted_module(uint64_t key) {
     if (!key || !driver_faults_on() || fault_quarantine().contains(key)) return;
     fault_quarantine().load({key});
@@ -8211,6 +8759,7 @@ struct MfbBatchState {
     Targets at{};
     uint64_t dgen_start = 0;
     uint16_t written_mask = 0;
+    uint16_t sampled_targets_mask = 0;
     bool flushed = false;
 };
 TLS_OBJECT(mfb_batch, MfbBatchState)
@@ -8304,6 +8853,7 @@ void mfb_batch_begin() {
     b.count = 0;
     b.dgen_start = texture_destroy_generation();
     b.written_mask = 0;
+    b.sampled_targets_mask = 0;
     b.flushed = false;
 }
 
@@ -8408,22 +8958,29 @@ int mfb_batch_add(NvnState& s, const DrawArgs& d) {
         }
     }
 
-    // Never reorder a draw whose task/mesh/fragment stages sample a target written by an earlier draw in the same batch.
-    if (slot_idx > 0 && b.written_mask) {
-        for (const Texture* t : draw_sampled()) {
-            int k = at.depth == t ? 8 : -1;
-            for (int i = 0; i < at.n && k < 0; i++)
-                if (at.color[i] == t) k = i;
-            if (k >= 0 && (b.written_mask >> k & 1)) {
+    uint16_t item_writes = 0;
+    for (int i = 0; i < at.n; i++)
+        if (at.color[i] && target_write_mask(p, s, i)) item_writes |= (uint16_t)(1u << i);
+    if (at.depth && s.ds.dw) item_writes |= 1u << 8;
+
+    uint16_t item_sampled_targets = 0;
+    for (const Texture* t : draw_sampled()) {
+        int k = at.depth == t ? 8 : -1;
+        for (int i = 0; i < at.n && k < 0; i++)
+            if (at.color[i] == t) k = i;
+        if (k >= 0) {
+            item_sampled_targets |= (uint16_t)(1u << k);
+            // Match draw_hazards (rule 5): a draw that samples a target it writes itself is not a pass-splitting hazard.
+            if (slot_idx > 0 && (b.written_mask >> k & 1) && !(item_writes >> k & 1)) {
                 dw().prog = nullptr;
                 return -1;
             }
         }
     }
-    uint16_t item_writes = 0;
-    for (int i = 0; i < at.n; i++)
-        if (at.color[i] && target_write_mask(p, s, i)) item_writes |= (uint16_t)(1u << i);
-    if (at.depth && s.ds.dw) item_writes |= 1u << 8;
+    if (slot_idx > 0 && writes_sampled_target(item_writes, b.sampled_targets_mask)) {
+        dw().prog = nullptr;
+        return -1;
+    }
 
     if ((size_t)slot_idx >= b.items.size()) b.items.resize((size_t)slot_idx + 1);
     MfbBatchItem& it = b.items[slot_idx];
@@ -8457,6 +9014,7 @@ int mfb_batch_add(NvnState& s, const DrawArgs& d) {
 
     if (slot_idx == 0) b.at = at;
     b.written_mask |= item_writes;
+    b.sampled_targets_mask |= item_sampled_targets;
     b.count++;
     return slot_idx;
 }
@@ -8684,9 +9242,11 @@ bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
     const int64_t nb = st_mfb_batches.fetch_add(1, std::memory_order_relaxed) + 1;
     const int64_t nd = st_mfb_batched_draws.fetch_add(b.count, std::memory_order_relaxed) + b.count;
     if (nb == 1 || nb % 600 == 0)
-        logf("vk: mfb batch: %lld batches, %lld batched draws (avg %.2f/batch), %lld pending clears kept",
+        logf("vk: mfb batch: %lld batches, %lld batched draws (avg %.2f/batch), %lld pending clears kept, bda_ssbo: %llu shaders / %llu calls",
              (long long)nb, (long long)nd, (double)nd / (double)nb,
-             (long long)st_mfb_clears_kept.load(std::memory_order_relaxed));
+             (long long)st_mfb_clears_kept.load(std::memory_order_relaxed),
+             (unsigned long long)st_bda_ssbo_shaders.load(std::memory_order_relaxed),
+             (unsigned long long)st_bda_ssbo_calls.load(std::memory_order_relaxed));
     return true;
 }
 

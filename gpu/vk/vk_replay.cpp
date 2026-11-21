@@ -2022,7 +2022,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                         if (qh.op == NOP_DRAW_MESH) {
                             seen_mesh++;
                             q += qh.size;
-                        } else if (is_pure_state_op(qh.op)) {
+                        } else if (is_pure_state_op(qh.op) || qh.op == NOP_UPDATE_UB) {
                             q += qh.size;
                         } else {
                             break;
@@ -2031,6 +2031,14 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                     if (seen_mesh >= 2) {
                         static thread_local NvnState ws;
                         ws = s;
+                        const size_t saved_ub_size = ub_updates.size();
+                        const uint64_t saved_ub_gen = ub_gen;
+                        const size_t saved_ub_limit = ub_limit;
+                        const int64_t saved_st_ub = st_ub_updates;
+                        size_t committed_ub_size = saved_ub_size;
+                        uint64_t committed_ub_gen = saved_ub_gen;
+                        size_t committed_ub_limit = saved_ub_limit;
+                        int64_t committed_st_ub = saved_st_ub;
                         mfb_batch_begin();
                         int draw_slots[32];
                         int total_draws = 0;
@@ -2046,7 +2054,13 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                                 if (!ws.render_enabled || ws.raster_discard) {
                                     draw_slots[total_draws++] = -1;
                                     q += qh.size;
-                                    if (batched_active >= 2) batch_end = q;
+                                    if (batched_active >= 2) {
+                                        batch_end = q;
+                                        committed_ub_size = ub_updates.size();
+                                        committed_ub_gen = ub_gen;
+                                        committed_ub_limit = ub_limit;
+                                        committed_st_ub = st_ub_updates;
+                                    }
                                     continue;
                                 }
                                 const auto qd = payload<nvn_p_draw_mesh>(qa, qavail);
@@ -2062,6 +2076,25 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                                 batched_active++;
                                 q += qh.size;
                                 batch_end = q;
+                                committed_ub_size = ub_updates.size();
+                                committed_ub_gen = ub_gen;
+                                committed_ub_limit = ub_limit;
+                                committed_st_ub = st_ub_updates;
+                            } else if (qh.op == NOP_UPDATE_UB) {
+                                const auto u = payload<nvn_p_update_ub>(qa, qavail);
+                                if (u.size && u.size <= qavail - sizeof u) {
+                                    if (early && !worker && memory_rb_waited_range(host->gpu_guest(u.dst), u.size)) break;
+                                    if (worker) {
+                                        ub_limit++, ub_gen++;
+                                    } else {
+                                        UbUpdate up{rec_value_now, u.dst, std::vector<uint8_t>(qa + sizeof u, qa + sizeof u + u.size)};
+                                        ub_updates.push_back(std::move(up));
+                                        ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
+                                        ub_gen++;
+                                        st_ub_updates++;
+                                    }
+                                }
+                                q += qh.size;
                             } else if (apply_state_op(ws, qh.op, qa, qavail, true)) {
                                 q += qh.size;
                             } else {
@@ -2069,6 +2102,13 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                             }
                         }
                         if (batched_active >= 2 && mfb_batch_flush_compute(cmd)) {
+                            if (!worker && ub_updates.size() > committed_ub_size) {
+                                ub_updates.resize(committed_ub_size);
+                                ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            ub_gen = committed_ub_gen;
+                            ub_limit = committed_ub_limit;
+                            st_ub_updates = committed_st_ub;
                             int di = 0;
                             int work_done = 0;
                             for (const uint8_t* r = p; r < batch_end;) {
@@ -2098,7 +2138,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                                     s.samples_passed += 16;
                                     work_done++;
                                     if (!worker && rb_writers) memory_count_work();
-                                } else {
+                                } else if (rh.op != NOP_UPDATE_UB) {
                                     apply_state_op(s, rh.op, ra, ravail, false);
                                 }
                                 r += rh.size;
@@ -2116,6 +2156,13 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                             p = batch_end;
                             continue;
                         }
+                        if (!worker && ub_updates.size() > saved_ub_size) {
+                            ub_updates.resize(saved_ub_size);
+                            ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        ub_gen = saved_ub_gen;
+                        ub_limit = saved_ub_limit;
+                        st_ub_updates = saved_st_ub;
                         mfb_batch_end();
                     }
                 }
