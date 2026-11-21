@@ -751,6 +751,7 @@ void display_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk display");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     int64_t interval = 16666667, last_at = 0;
+    int64_t done_interval = 0, last_done_at = 0;   // (Batch 10J3: real GPU-completion cadence for sawtooth-free 2x/3x pacing)
     // (by_time: sets on the game's timeline; early: those of them taken while the set before was shown; waited: those whose
     // copies did not go to the GPU as they came; ready: the others, ready_ns their first copies' ends past their game frames,
     // summed; slotted: their frames held back under FIFO to a refresh after the one before, fifo_slot; caught: made frames
@@ -925,7 +926,19 @@ void display_main() {
         copy_up_to(s, (int)dev.swap_spare.load(std::memory_order_relaxed));
         const bool first = s.ahead && s.pending[0].used;   // (its first copy made ahead)
         // (Batch 10J) 500 ms fence wait (100 ms timed out on <20 FPS iGPUs with 2 frames in flight).
+        const int64_t wait_t0 = now_ns();
         if (first) vkWaitForFences(dev.device, 1, &s.pending[0].done, VK_TRUE, 500000000ull);
+        const int64_t done_at = now_ns();
+        const int64_t fence_wait_ns = done_at - wait_t0;
+        if (last_done_at) {
+            const int64_t dd = done_at - last_done_at;
+            if (dd > 0 && dd < 200000000) {
+                const int64_t cdd = std::clamp<int64_t>(dd, 4000000, 120000000);
+                // Asymmetric EWMA: track speed-ups quickly (3/4), smooth over slowdowns (7/8)
+                done_interval = !done_interval ? cdd : cdd < done_interval ? (done_interval * 3 + cdd) / 4 : (done_interval * 7 + cdd) / 8;
+            }
+        }
+        last_done_at = done_at;
         // (longshot) A fixed multiplier's set on the game's timeline, presented ahead (its first copy's end waited for): its own
         // delay and how late its first frame can be shown against its time, a millisecond to spare, set the delay of the sets
         // after it (pace_delay). The copy's end as seen while the set before was shown (ready_at, taken early), else now: a set
@@ -968,14 +981,16 @@ void display_main() {
             if (!timed && due > j.at + interval + s.step) due = j.at + interval + s.step;
             // (Batch 10J) 250 ms sanity guard (matches gap threshold; 100 ms snapped <20 FPS frames to now)
             if (timed && due > now + 250000000) due = now;
-            // (Batch 10J) Anti-bunching: enforce even spacing (94% of game frame / shown) normally, and a smooth
-            // 60% catch-up floor even if >= 2 sets are queued so MAILBOX never drops frames dumped 0.1 ms apart.
+            // (Batch 10J3) Sawtooth-free 2x/3x spacing from measured GPU-completion cadence (done_interval):
+            // With 2 frames in flight, fg.queued_jobs is normally 1-2 while GPU work is still running, so only
+            // gently accelerate (82%) when >= 2 sets are queued AND the fence already finished (< 2 ms wait, real backlog).
+            // Otherwise hold steady 96% spacing (e.g., 24/24/27 ms at 13.3 FPS 3x instead of 14/14/45 ms sawtooth).
             if (shown_at > 0) {
-                const int64_t base_frame = (s.line && j.set->frame_ns > 0) ? j.set->frame_ns : interval;
-                const int q = fg.queued_jobs.load(std::memory_order_relaxed);
-                const int64_t min_gap = q < 2
-                    ? std::clamp<int64_t>(base_frame * 47 / (50 * std::max(s.shown, 1)), 4000000, 55000000)
-                    : std::clamp<int64_t>(base_frame * 30 / (50 * std::max(s.shown, 1)), 4000000, 30000000);
+                const int64_t base_frame = done_interval > 0 ? done_interval
+                                         : (s.line && j.set->frame_ns > 0) ? j.set->frame_ns : interval;
+                const bool real_backlog = fg.queued_jobs.load(std::memory_order_relaxed) >= 2 && fence_wait_ns < 2000000;
+                const int64_t num = real_backlog ? 41 : 48;   // 82% catch-up vs 96% steady spacing
+                const int64_t min_gap = std::clamp<int64_t>(base_frame * num / (50 * std::max(s.shown, 1)), 4000000, 55000000);
                 if (due < shown_at + min_gap) due = shown_at + min_gap;
             }
             const int64_t slot_was = slot;

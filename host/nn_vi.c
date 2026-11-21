@@ -158,7 +158,8 @@ enum { FPS_UNCAPPED = 1000, FPS_MOVIE = 240 };   /* (FPS_MOVIE: the pacing while
 static volatile uint64_t movie_seen_at;
 static const int64_t MOVIE_STALE_NS = 250000000LL;   /* (a quarter second: three 60 fps frames of grace) */
 static volatile int fps_now;   /* (the cap this present runs at, 0 before the first: fps_refresh) */
-static int fps_of(int want) { return want == 30 ? 30 : want > 60 ? (want > FPS_UNCAPPED ? FPS_UNCAPPED : want) : 60; }
+/* (Batch 10J3) Allow sub-60 HOS_FPS_MAX (15..59, e.g. 20 base -> 60 at 3x FG / 40 at 2x FG) in real-time mode. */
+static int fps_of(int want) { return (want >= 15 && want < 60) ? want : want > 60 ? (want > FPS_UNCAPPED ? FPS_UNCAPPED : want) : 60; }
 static void fps_refresh(void) {
     /* (the Insert menu's Frame rate cap, frame_rate_cap=: 0 the console's 60, then 90, 120, 144, 165, 240, 6 Uncapped, -1 the 30 FPS cap; a value
        this build does not know is 60. The options file's until the renderer answers, HOS_FPS_MAX over both) */
@@ -183,15 +184,15 @@ static void fps_refresh(void) {
        left alone - the player asked for its own pacing. Measured on a Deck OLED at cap 240: intro skips 1,055 -> 567
        of 5,947, the title's looped movies 4-86 of 1,800, game clock 0.998-1.005; middle caps measured worse than both
        ends (cap 73 skipped 1,216, later movies 465/275), so jump straight to 240 rather than nudge past 60) */
-    if (movie_pace && row == 60) {
+    if (movie_pace && row <= 60) {
         const uint64_t seen = __atomic_load_n(&movie_seen_at, __ATOMIC_RELAXED);
         if (seen && hos_now_ns() - (int64_t)seen < MOVIE_STALE_NS) v = FPS_MOVIE;
     }
     const int was = fps_now;
     if (v == was) return;
     fps_now = v;
-    if (v == FPS_MOVIE && row == 60) hos_log("vi: a movie is playing: the frame rate goes to %d for it (HOS_MOVIE_PACE=0 leaves it)", FPS_MOVIE);
-    else if (was == FPS_MOVIE && row == 60) hos_log("vi: the movie is over: back to the game's frame rate cap 60");
+    if (v == FPS_MOVIE && row <= 60) hos_log("vi: a movie is playing: the frame rate goes to %d for it (HOS_MOVIE_PACE=0 leaves it)", FPS_MOVIE);
+    else if (was == FPS_MOVIE && row <= 60) hos_log("vi: the movie is over: back to the game's frame rate cap %d", row);
     else if (v == FPS_UNCAPPED) hos_log("vi: frame rate uncapped: pacing, the game's limiter and its time step follow the frames");
     else if (v != 60) hos_log("vi: frame rate cap %d: pacing, the game's limiter and its time step follow it", v);
     else if (was) hos_log("vi: frame rate cap 60: the game's own limiter and step");
@@ -216,7 +217,7 @@ int hos_vi_native_interval(Ctx *c, int requested) {
     /* (longshot) 30 has its own display period; interval 2 would pace it to 15.
        It also keeps real time even when the saved Game speed is Per frame. */
     fps_refresh();
-    present_interval = fps_max() == 30 ? 1 : game_interval || !rx_option(0, 1) ? clamped : 1;
+    present_interval = fps_max() < 60 ? 1 : game_interval || !rx_option(0, 1) ? clamped : 1;
     return requested;
 }
 /* (longshot) The window's textures as the console's display queue has them: each present is shown at its display
@@ -467,7 +468,7 @@ static void realtime_step(int64_t now) {
         /* (longshot) 30 lowers the limiter; higher caps raise it. On return to 60, restore the game's value
            from before the override, unless the game has written a new one since. */
         static int raised, game_limit;
-        if (fps_max() != 60 && *limit > 0 && (fps_max() == 30 || *limit < fps_max())) {
+        if (fps_max() != 60 && *limit > 0 && (fps_max() < 60 || *limit < fps_max())) {
             if (*limit != raised) game_limit = *limit;
             *limit = raised = fps_max();
         } else if (raised && *limit == raised && fps_max() != raised) {
