@@ -4747,8 +4747,10 @@ uint32_t spirv_exec_model(const uint32_t* words, size_t count) {
 bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uint64_t prog_key, std::vector<uint32_t>& out) {
     if (mode <= 0 || count < 5 || words[0] != 0x07230203u) return false;
     const uint32_t em = spirv_exec_model(words, count);
-    const bool allow_27ee = (em == 5u && prog_key == 0x27ee9883e2a20323ull);
-    if (em != 4u && !allow_27ee && (em != 5u || mode < 2)) return false;   // 4 = Fragment, 5 = GLCompute
+    const bool allow_cs_stores =
+        (em == 5u && (prog_key == 0x7650519f88e59b19ull || prog_key == 0xabccf81b45c5eb50ull || prog_key == 0xcb2e06ddfb9d7d27ull));
+    const bool allow_cs_safe = allow_cs_stores || (em == 5u && prog_key == 0x27ee9883e2a20323ull);
+    if (em != 4u && !allow_cs_safe && (em != 5u || mode < 2)) return false;   // 4 = Fragment, 5 = GLCompute
 
     const bool selective_no_nc = false;
 
@@ -5050,10 +5052,10 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
                 if (ci.nargs == 1) {
                     elem_t = ci.rtype;
                     op_kind = 1;
-                } else if (mode >= 3 && ci.nargs == 2 && ci.rtype == void_t && fip && fip->has_store && fip->param_types.size() == 2) {
+                } else if ((mode >= 3 || allow_cs_stores) && ci.nargs == 2 && ci.rtype == void_t && fip && fip->has_store && fip->param_types.size() == 2) {
                     elem_t = fip->param_types[1];
                     op_kind = 2;
-                } else if (mode >= 3 && ci.nargs == 2 && ci.rtype == u32_t && fip && fip->has_atomic_add && fip->param_types.size() == 2 && c_1) {
+                } else if ((mode >= 3 || allow_cs_stores) && ci.nargs == 2 && ci.rtype == u32_t && fip && fip->has_atomic_add && fip->param_types.size() == 2 && c_1) {
                     elem_t = u32_t;
                     op_kind = 3;
                 }
@@ -5228,6 +5230,414 @@ int custom_spv_mode() {
     }();
     return m;
 }
+
+bool bda_hoist_on() {
+    static const bool on = []() {
+        const char* e = getenv("RX_VK_BDA_HOIST");
+        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const bool v = e && *e ? (atoi(e) != 0) : intel_mesa;
+        if (v) logf("vk: RX_VK_BDA_HOIST=1 (hoisted guest_pages + run_pages base-pointer translation)");
+        return v;
+    }();
+    return on;
+}
+
+std::atomic<uint64_t> st_bda_hoist_shaders{0}, st_bda_hoist_bases{0}, st_bda_hoist_calls{0};
+
+// (Batch 10H) Hoist repeated guest_pages BDA load calls (>=4 calls sharing the same 64-bit base pointer s_id=(blo,bhi))
+// into ONE page-table + run_pages lookup per base pointer, replacing each call with a branchless bounds-checked
+// PhysicalStorageBuffer load (off64 < safe_lim ? host_base + off64 : zero_page).
+bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t prog_key, std::vector<uint32_t>& out) {
+    if (count < 5 || words[0] != 0x07230203u) return false;
+    if (spirv_exec_model(words, count) != 5u) return false;   // GLCompute only
+
+    bool has_calls = false;
+    size_t first_func_off = 0;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+        if (op == 54 && !first_func_off) first_func_off = i;
+        if (op == 57) has_calls = true;
+        i += wc;
+    }
+    if (!has_calls || !first_func_off) return false;
+
+    uint32_t bound = words[3];
+    struct Def { uint16_t op = 0; uint16_t wc = 0; uint32_t rtype = 0; uint32_t off = 0; uint32_t blk = 0; };
+    std::vector<Def> defs(bound);
+    auto get_def = [&](uint32_t id) -> const Def* {
+        return (id < defs.size() && defs[id].op != 0) ? &defs[id] : nullptr;
+    };
+
+    uint32_t u1_t = 0, u32_t = 0, u64_t = 0, u32x2_t = 0, u32x4_t = 0;
+    std::unordered_map<uint32_t, uint32_t> u32_consts;
+    std::unordered_map<uint32_t, uint64_t> u64_const_vals;
+    std::unordered_set<uint32_t> entry_ids;
+    std::unordered_map<uint32_t, std::string_view> names;
+
+    struct PsbPair { uint32_t ptr_elem = 0, ptr_struct = 0; };
+    PsbPair psb_u64{}, psb_u32{}, psb_u32x2{}, psb_u32x4{};
+    uint32_t pc_ptr_t = 0, pc_var_id = 0, pc_idx_id = 0;
+
+    struct FnInfo {
+        uint32_t id = 0, rtype = 0, start = 0, end = 0;
+        uint32_t nparams = 0, p0_t = 0;
+        bool has_store = false, has_atomic = false, has_pc = false, has_utoptr = false;
+    };
+    std::unordered_map<uint32_t, FnInfo> bda_load_fns;
+    FnInfo cur_fn{};
+    bool in_fn = false;
+    uint32_t cur_blk = 0;
+
+    struct CallRec {
+        uint32_t off, wc, rtype, res_id, fn_id, arg0, olo, ohi, add64_c;
+        uint32_t s_id, blo, bhi;
+    };
+    std::vector<CallRec> raw_calls;
+
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+
+        if (op == 5 && wc >= 3) {
+            const char* s = reinterpret_cast<const char*>(&words[i + 2]);
+            names[words[i + 1]] = std::string_view(s, strnlen(s, (wc - 2) * 4));
+        } else if (op == 15 && wc >= 3) {
+            entry_ids.insert(words[i + 2]);
+        } else if (op == 20 && wc == 2) {
+            u1_t = words[i + 1];
+        } else if (op == 21 && wc == 4 && words[i + 3] == 0u) {
+            if (words[i + 2] == 32u) u32_t = words[i + 1];
+            else if (words[i + 2] == 64u) u64_t = words[i + 1];
+        } else if (op == 23 && wc == 4 && u32_t && words[i + 2] == u32_t) {
+            if (words[i + 3] == 2u) u32x2_t = words[i + 1];
+            else if (words[i + 3] == 4u) u32x4_t = words[i + 1];
+        } else if (op == 43 && wc == 4 && u32_t && words[i + 1] == u32_t) {
+            u32_consts[words[i + 3]] = words[i + 2];
+        } else if (op == 43 && wc == 5 && u64_t && words[i + 1] == u64_t) {
+            u64_const_vals[words[i + 2]] = uint64_t(words[i + 3]) | (uint64_t(words[i + 4]) << 32);
+        } else if (op == 54 && wc == 5) {
+            in_fn = true;
+            cur_blk = 0;
+            cur_fn = FnInfo{words[i + 2], words[i + 1], uint32_t(i), 0};
+        } else if (op == 55 && wc == 3 && in_fn) {
+            if (cur_fn.nparams == 0) cur_fn.p0_t = words[i + 1];
+            cur_fn.nparams++;
+        } else if (op == 56 && in_fn) {
+            cur_fn.end = uint32_t(i + wc);
+            if (!entry_ids.count(cur_fn.id) && cur_fn.nparams == 1 && cur_fn.p0_t == u64_t &&
+                !cur_fn.has_store && !cur_fn.has_atomic && cur_fn.has_pc && cur_fn.has_utoptr &&
+                (cur_fn.rtype == u32_t || (u32x2_t && cur_fn.rtype == u32x2_t) || (u32x4_t && cur_fn.rtype == u32x4_t))) {
+                bda_load_fns[cur_fn.id] = cur_fn;
+            }
+            in_fn = false;
+            cur_blk = 0;
+        } else if (op == 248 && wc == 2 && in_fn) {
+            cur_blk = words[i + 1];
+        } else if (in_fn) {
+            if (op == 62) cur_fn.has_store = true;
+            if (op >= 227 && op <= 243) cur_fn.has_atomic = true;
+            if (op == 120) cur_fn.has_utoptr = true;
+            if (op == 65 && wc == 5) {
+                auto itn = names.find(words[i + 3]);
+                if (itn != names.end() && itn->second == "rescaling_push_constants") {
+                    cur_fn.has_pc = true;
+                    if (!pc_var_id) { pc_ptr_t = words[i + 1]; pc_var_id = words[i + 3]; pc_idx_id = words[i + 4]; }
+                }
+            }
+            // Record defs inside functions
+            if (wc >= 3 && (op == 61 || op == 65 || op == 80 || op == 81 || op == 113 || op == 120 || op == 124 ||
+                            op == 128 || op == 130 || op == 149 || op == 169 || op == 194 || op == 195 || op == 196 ||
+                            op == 197 || op == 199 || op == 245)) {
+                const uint32_t rid = words[i + 2];
+                if (rid < defs.size()) defs[rid] = Def{uint16_t(op), uint16_t(wc), words[i + 1], uint32_t(i), cur_blk};
+            }
+            if (op == 65 && wc == 5) {
+                // Capture PhysicalStorageBuffer struct+element pointer pairs from OpAccessChain(OpConvertUToPtr, 0)
+                const Def* bd = get_def(words[i + 3]);
+                if (bd && bd->op == 120 && bd->wc == 4) {
+                    const uint32_t p_elem = words[i + 1];
+                    const uint32_t p_struct = bd->rtype;
+                    // Look up element type of p_elem via OpTypePointer? Match via next OpLoad's rtype!
+                    if (i + wc < count && (words[i + wc] & 0xFFFFu) == 61u && (words[i + wc] >> 16) >= 4 &&
+                        words[i + wc + 3] == words[i + 2]) {
+                        const uint32_t lt = words[i + wc + 1];
+                        if (lt == u64_t && !psb_u64.ptr_elem) psb_u64 = {p_elem, p_struct};
+                        else if (lt == u32_t && !psb_u32.ptr_elem) psb_u32 = {p_elem, p_struct};
+                        else if (u32x2_t && lt == u32x2_t && !psb_u32x2.ptr_elem) psb_u32x2 = {p_elem, p_struct};
+                        else if (u32x4_t && lt == u32x4_t && !psb_u32x4.ptr_elem) psb_u32x4 = {p_elem, p_struct};
+                    }
+                }
+            }
+            if (op == 57 && wc == 5) {
+                raw_calls.push_back(CallRec{uint32_t(i), wc, words[i + 1], words[i + 2], words[i + 3], words[i + 4], 0, 0, 0, 0, 0, 0});
+            }
+        }
+        i += wc;
+    }
+
+    if (bda_load_fns.empty() || raw_calls.empty() || !u1_t || !u32_t || !u64_t || !u32x2_t ||
+        !pc_var_id || !psb_u64.ptr_elem || !psb_u32.ptr_elem) {
+        return false;
+    }
+
+    auto ext_pair = [&](uint32_t vid, uint32_t& out_src, uint32_t& out_idx) -> bool {
+        const Def* d = get_def(vid);
+        if (!d || d->op != 81 || d->wc != 5) return false;
+        out_src = words[d->off + 3];
+        out_idx = words[d->off + 4];
+        return true;
+    };
+
+    struct BaseKey {
+        uint32_t s_id, blo, bhi;
+        bool operator==(const BaseKey& o) const { return s_id == o.s_id && blo == o.blo && bhi == o.bhi; }
+    };
+    struct BaseKeyHash {
+        size_t operator()(const BaseKey& k) const {
+            return size_t(k.s_id) * 2654435761u ^ (size_t(k.blo) << 7) ^ (size_t(k.bhi) << 15);
+        }
+    };
+    std::unordered_map<BaseKey, std::vector<CallRec>, BaseKeyHash> groups;
+
+    for (CallRec c : raw_calls) {
+        if (!bda_load_fns.count(c.fn_id)) continue;
+        if (c.rtype == u32x2_t && !psb_u32x2.ptr_elem) continue;
+        if (c.rtype == u32x4_t && !psb_u32x4.ptr_elem) continue;
+
+        uint32_t cur = c.arg0;
+        uint32_t add64_c = 0;
+        const Def* d = get_def(cur);
+        if (d && d->op == 128 && d->wc == 5 && d->rtype == u64_t) {
+            const uint32_t rhs = words[d->off + 4];
+            auto itc = u64_const_vals.find(rhs);
+            if (itc == u64_const_vals.end() || itc->second > 32ull) continue;   // skip negative or large/dynamic u64 add
+            add64_c = rhs;
+            cur = words[d->off + 3];
+            d = get_def(cur);
+        }
+        if (!d || d->op != 124 || d->wc != 4) continue;   // OpBitcast %u64
+        const Def* cc = get_def(words[d->off + 3]);
+        if (!cc || cc->op != 80 || cc->wc != 5) continue;   // OpCompositeConstruct %u32x2 lo hi
+        const uint32_t lo = words[cc->off + 3], hi = words[cc->off + 4];
+
+        const Def* dlo = get_def(lo);
+        if (!dlo || dlo->op != 81 || dlo->wc != 5 || words[dlo->off + 4] != 0u) continue;
+        const Def* dc = get_def(words[dlo->off + 3]);
+        if (!dc || dc->op != 149 || dc->wc != 5) continue;   // OpIAddCarry
+        const uint32_t la = words[dc->off + 3], lb = words[dc->off + 4];
+
+        const Def* dhi = get_def(hi);
+        if (!dhi || dhi->op != 128 || dhi->wc != 5) continue;   // OpIAdd hsum carry_sel
+        const uint32_t hsum = words[dhi->off + 3];
+        const Def* dhsum = get_def(hsum);
+
+        bool matched = false;
+        uint32_t ms_id = 0, mblo = 0, mbhi = 0, molo = 0, mohi = 0;
+        const std::pair<uint32_t, uint32_t> lo_cands[2] = {{lb, la}, {la, lb}};
+        for (auto [cand_lo, off_lo] : lo_cands) {
+            uint32_t s_lo = 0, idx_lo = 99;
+            if (!ext_pair(cand_lo, s_lo, idx_lo) || idx_lo != 0u) continue;
+            if (dhsum && dhsum->op == 128 && dhsum->wc == 5) {
+                const uint32_t ha = words[dhsum->off + 3], hb = words[dhsum->off + 4];
+                const std::pair<uint32_t, uint32_t> hi_cands[2] = {{hb, ha}, {ha, hb}};
+                for (auto [cand_hi, off_hi] : hi_cands) {
+                    uint32_t s_hi = 0, idx_hi = 99;
+                    if (ext_pair(cand_hi, s_hi, idx_hi) && s_hi == s_lo && idx_hi == 1u) {
+                        const Def* doh = get_def(off_hi);
+                        if (doh && doh->op == 195) continue;   // skip signed ASR negative offset
+                        ms_id = s_lo; mblo = cand_lo; mbhi = cand_hi; molo = off_lo; mohi = off_hi;
+                        matched = true;
+                        break;
+                    }
+                }
+            } else {
+                uint32_t s_hi = 0, idx_hi = 99;
+                if (ext_pair(hsum, s_hi, idx_hi) && s_hi == s_lo && idx_hi == 1u) {
+                    ms_id = s_lo; mblo = cand_lo; mbhi = hsum; molo = off_lo; mohi = 0;   // 0 -> u32_0
+                    matched = true;
+                }
+            }
+            if (matched) break;
+        }
+        if (!matched) continue;
+        const Def* dblo = get_def(mblo);
+        const Def* dbhi = get_def(mbhi);
+        if (!dblo || !dbhi || !dblo->blk || dblo->blk != dbhi->blk) continue;
+
+        c.s_id = ms_id; c.blo = mblo; c.bhi = mbhi; c.olo = molo; c.ohi = mohi; c.add64_c = add64_c;
+        groups[BaseKey{ms_id, mblo, mbhi}].push_back(c);
+    }
+
+    // Keep only groups with >= 4 calls
+    struct HoistGroup {
+        BaseKey key;
+        uint32_t insert_after_off;
+        uint32_t host_base_id, safe_lim_id, zero_page_id;
+        std::vector<CallRec> calls;
+    };
+    std::vector<HoistGroup> active;
+    for (auto& [k, vec] : groups) {
+        if (vec.size() < 4) continue;
+        const Def* dblo = get_def(k.blo);
+        const Def* dbhi = get_def(k.bhi);
+        const uint32_t ins_off = std::max(dblo->off, dbhi->off);
+        active.push_back(HoistGroup{k, ins_off, 0, 0, 0, std::move(vec)});
+    }
+    if (active.empty()) return false;
+
+    // Ensure all needed u32 & u64 constants exist
+    std::vector<uint32_t> new_consts;
+    auto need_u32 = [&](uint32_t v) -> uint32_t {
+        auto it = u32_consts.find(v);
+        if (it != u32_consts.end()) return it->second;
+        const uint32_t id = bound++;
+        u32_consts[v] = id;
+        new_consts.insert(new_consts.end(), {(4u << 16) | 43u, u32_t, id, v});
+        return id;
+    };
+    auto make_u64_c = [&](uint64_t v) -> uint32_t {
+        const uint32_t id = bound++;
+        new_consts.insert(new_consts.end(), {(5u << 16) | 43u, u64_t, id, uint32_t(v & 0xFFFFFFFFu), uint32_t(v >> 32)});
+        return id;
+    };
+
+    const uint32_t c_0 = need_u32(0u), c_1 = need_u32(1u), c_2 = need_u32(2u), c_3 = need_u32(3u);
+    const uint32_t c_12 = need_u32(12u), c_16 = need_u32(16u), c_20 = need_u32(20u), c_127 = need_u32(127u);
+    const uint32_t c_4095 = need_u32(4095u), c_2m = need_u32(2097152u), c_3m = need_u32(3145728u), c_fe = need_u32(4294967294u);
+    const uint32_t c64_zoff = make_u64_c(25165888ull);     // kGuestZeroPageOffset
+    const uint32_t c64_roff = make_u64_c(25174080ull);     // kGuestRunPagesOffset
+    const uint32_t c64_48   = make_u64_c(48ull);           // max add64_c(32) + max elem(16)
+    const uint32_t c64_0    = make_u64_c(0ull);
+    const uint32_t c64_12   = make_u64_c(12ull);
+
+    std::unordered_map<uint32_t, std::vector<uint32_t>> insert_after;
+    struct RepSpan { uint32_t end_off; std::vector<uint32_t> nw; };
+    std::unordered_map<uint32_t, RepSpan> replacements;
+    size_t hoisted_calls = 0;
+
+    for (auto& g : active) {
+        const uint32_t blo = g.key.blo, bhi = g.key.bhi;
+        auto& h = insert_after[g.insert_after_off];
+        const uint32_t pc_ac = bound++, gp_addr = bound++;
+        const uint32_t t1 = bound++, t2 = bound++, t3 = bound++, t4 = bound++;
+        const uint32_t t5 = bound++, t6 = bound++, t7 = bound++, t8 = bound++;
+        const uint32_t t9 = bound++, t10 = bound++, slot = bound++;
+        const uint32_t s8 = bound++, s8_64 = bound++, hp_a = bound++, hp_ps = bound++, hp_pe = bound++, host_page = bound++;
+        const uint32_t s4 = bound++, s4_64 = bound++, rp_b = bound++, rp_a = bound++, rp_ps = bound++, rp_pe = bound++;
+        const uint32_t run_p = bound++, run_64 = bound++, run_b = bound++;
+        const uint32_t poff = bound++, poff_64 = bound++, host_base = bound++;
+        const uint32_t need_b = bound++, gt_ok = bound++, sub_b = bound++, safe_lim = bound++, zero_page = bound++;
+        g.host_base_id = host_base;
+        g.safe_lim_id = safe_lim;
+        g.zero_page_id = zero_page;
+
+        const uint32_t code[] = {
+            (5u << 16) | 65u,  pc_ptr_t, pc_ac, pc_var_id, pc_idx_id,
+            (4u << 16) | 61u,  u64_t, gp_addr, pc_ac,
+            (5u << 16) | 199u, u32_t, t1, bhi, c_fe,
+            (5u << 16) | 170u, u1_t,  t2, t1, c_16,
+            (5u << 16) | 170u, u1_t,  t3, bhi, c_127,
+            (5u << 16) | 166u, u1_t,  t4, t2, t3,
+            (5u << 16) | 194u, u32_t, t5, blo, c_12,
+            (5u << 16) | 199u, u32_t, t6, bhi, c_1,
+            (5u << 16) | 196u, u32_t, t7, t6, c_20,
+            (5u << 16) | 197u, u32_t, t8, t7, t5,
+            (5u << 16) | 197u, u32_t, t9, c_2m, t5,
+            (6u << 16) | 169u, u32_t, t10, t2, t8, t9,
+            (6u << 16) | 169u, u32_t, slot, t4, t10, c_3m,
+            (5u << 16) | 196u, u32_t, s8, slot, c_3,
+            (4u << 16) | 113u, u64_t, s8_64, s8,
+            (5u << 16) | 128u, u64_t, hp_a, gp_addr, s8_64,
+            (4u << 16) | 120u, psb_u64.ptr_struct, hp_ps, hp_a,
+            (5u << 16) | 65u,  psb_u64.ptr_elem, hp_pe, hp_ps, c_0,
+            (6u << 16) | 61u,  u64_t, host_page, hp_pe, 2u, 8u,
+            (5u << 16) | 196u, u32_t, s4, slot, c_2,
+            (4u << 16) | 113u, u64_t, s4_64, s4,
+            (5u << 16) | 128u, u64_t, rp_b, gp_addr, c64_roff,
+            (5u << 16) | 128u, u64_t, rp_a, rp_b, s4_64,
+            (4u << 16) | 120u, psb_u32.ptr_struct, rp_ps, rp_a,
+            (5u << 16) | 65u,  psb_u32.ptr_elem, rp_pe, rp_ps, c_0,
+            (6u << 16) | 61u,  u32_t, run_p, rp_pe, 2u, 4u,
+            (4u << 16) | 113u, u64_t, run_64, run_p,
+            (5u << 16) | 196u, u64_t, run_b, run_64, c64_12,
+            (5u << 16) | 199u, u32_t, poff, blo, c_4095,
+            (4u << 16) | 113u, u64_t, poff_64, poff,
+            (5u << 16) | 128u, u64_t, host_base, host_page, poff_64,
+            (5u << 16) | 128u, u64_t, need_b, poff_64, c64_48,
+            (5u << 16) | 172u, u1_t,  gt_ok, run_b, need_b,
+            (5u << 16) | 130u, u64_t, sub_b, run_b, need_b,
+            (6u << 16) | 169u, u64_t, safe_lim, gt_ok, sub_b, c64_0,
+            (5u << 16) | 128u, u64_t, zero_page, gp_addr, c64_zoff,
+        };
+        h.insert(h.end(), std::begin(code), std::end(code));
+
+        for (const CallRec& c : g.calls) {
+            const PsbPair& pp = (c.rtype == u32x4_t) ? psb_u32x4 : (c.rtype == u32x2_t) ? psb_u32x2 : psb_u32;
+            const uint32_t align = (c.rtype == u32x4_t) ? 16u : (c.rtype == u32x2_t) ? 8u : 4u;
+            const uint32_t p1 = bound++, off64 = bound++, ok = bound++;
+            const uint32_t ohi_id = c.ohi ? c.ohi : c_0;
+            std::vector<uint32_t> nw = {
+                (5u << 16) | 80u,  u32x2_t, p1, c.olo, ohi_id,
+                (4u << 16) | 124u, u64_t, off64, p1,
+                (5u << 16) | 176u, u1_t, ok, off64, safe_lim,
+            };
+            uint32_t final_off = off64;
+            if (c.add64_c) {
+                const uint32_t off2 = bound++;
+                nw.insert(nw.end(), {(5u << 16) | 128u, u64_t, off2, off64, c.add64_c});
+                final_off = off2;
+            }
+            const uint32_t fast_a = bound++, sel_a = bound++, ptr_s = bound++, ptr_e = bound++;
+            nw.insert(nw.end(), {
+                (5u << 16) | 128u, u64_t, fast_a, host_base, final_off,
+                (6u << 16) | 169u, u64_t, sel_a, ok, fast_a, zero_page,
+                (4u << 16) | 120u, pp.ptr_struct, ptr_s, sel_a,
+                (5u << 16) | 65u,  pp.ptr_elem, ptr_e, ptr_s, c_0,
+                (6u << 16) | 61u,  c.rtype, c.res_id, ptr_e, 2u, align,
+            });
+            replacements[c.off] = RepSpan{c.off + c.wc, std::move(nw)};
+            hoisted_calls++;
+        }
+    }
+
+    if (replacements.empty()) return false;
+
+    out.clear();
+    out.reserve(count + new_consts.size() + active.size() * 190 + hoisted_calls * 40);
+    for (size_t k = 0; k < 5; k++) out.push_back(words[k]);
+    out[3] = bound;
+
+    for (size_t i = 5; i < count;) {
+        if (i == first_func_off && !new_consts.empty())
+            out.insert(out.end(), new_consts.begin(), new_consts.end());
+        auto it_r = replacements.find(uint32_t(i));
+        if (it_r != replacements.end()) {
+            out.insert(out.end(), it_r->second.nw.begin(), it_r->second.nw.end());
+            i = it_r->second.end_off;
+            continue;
+        }
+        const uint32_t wc = words[i] >> 16;
+        out.insert(out.end(), words + i, words + i + wc);
+        auto it_ins = insert_after.find(uint32_t(i));
+        if (it_ins != insert_after.end())
+            out.insert(out.end(), it_ins->second.begin(), it_ins->second.end());
+        i += wc;
+    }
+
+    const uint64_t ns = st_bda_hoist_shaders.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t nb = st_bda_hoist_bases.fetch_add(active.size(), std::memory_order_relaxed) + active.size();
+    const uint64_t nc = st_bda_hoist_calls.fetch_add(hoisted_calls, std::memory_order_relaxed) + hoisted_calls;
+    if (ns <= 8 || ns % 20 == 0)
+        logf("vk: BDA_HOIST %016llx: %zu bases, %zu calls hoisted (total %llu shaders / %llu bases / %llu calls)",
+             (unsigned long long)prog_key, active.size(), hoisted_calls,
+             (unsigned long long)ns, (unsigned long long)nb, (unsigned long long)nc);
+    return true;
+}
 } // namespace
 
 VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShaderModule* m) {
@@ -5264,14 +5674,24 @@ VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShad
             }
         }
         const int bda_mode = bda_ssbo_mode();
+        const bool hoist_on = bda_hoist_on();
         const int fm = fast_math_mode();
-        if (bda_mode > 0 || fm > 0) {
+        if (bda_mode > 0 || hoist_on || fm > 0) {
             std::vector<uint32_t> patched;
             bool did_patch = false;
             if (bda_mode > 0 && transform_spirv_bda_ssbo(words, count, bda_mode, prog_key, patched)) {
                 words = patched.data();
                 count = patched.size();
                 did_patch = true;
+            }
+            if (hoist_on) {
+                std::vector<uint32_t> patched_h;
+                if (transform_spirv_bda_hoist(words, count, prog_key, patched_h)) {
+                    patched = std::move(patched_h);
+                    words = patched.data();
+                    count = patched.size();
+                    did_patch = true;
+                }
             }
             if (fm > 0) {
                 std::vector<uint32_t> patched2;
