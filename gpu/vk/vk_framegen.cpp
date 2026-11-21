@@ -761,7 +761,6 @@ void display_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk display");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     int64_t interval = 16666667, last_at = 0;
-    int64_t done_interval = 0, last_done_at = 0;   // (Batch 10J3: real GPU-completion cadence for sawtooth-free 2x/3x pacing)
     // (by_time: sets on the game's timeline; early: those of them taken while the set before was shown; waited: those whose
     // copies did not go to the GPU as they came; ready: the others, ready_ns their first copies' ends past their game frames,
     // summed; slotted: their frames held back under FIFO to a refresh after the one before, fifo_slot; caught: made frames
@@ -936,19 +935,7 @@ void display_main() {
         copy_up_to(s, (int)dev.swap_spare.load(std::memory_order_relaxed));
         const bool first = s.ahead && s.pending[0].used;   // (its first copy made ahead)
         // (Batch 10J) 500 ms fence wait (100 ms timed out on <20 FPS iGPUs with 2 frames in flight).
-        const int64_t wait_t0 = now_ns();
         if (first) vkWaitForFences(dev.device, 1, &s.pending[0].done, VK_TRUE, 500000000ull);
-        const int64_t done_at = now_ns();
-        const int64_t fence_wait_ns = done_at - wait_t0;
-        if (last_done_at) {
-            const int64_t dd = done_at - last_done_at;
-            if (dd > 0 && dd < 200000000) {
-                const int64_t cdd = std::clamp<int64_t>(dd, 4000000, 120000000);
-                // Asymmetric EWMA: track speed-ups quickly (3/4), smooth over slowdowns (7/8)
-                done_interval = !done_interval ? cdd : cdd < done_interval ? (done_interval * 3 + cdd) / 4 : (done_interval * 7 + cdd) / 8;
-            }
-        }
-        last_done_at = done_at;
         // (longshot) A fixed multiplier's set on the game's timeline, presented ahead (its first copy's end waited for): its own
         // delay and how late its first frame can be shown against its time, a millisecond to spare, set the delay of the sets
         // after it (pace_delay). The copy's end as seen while the set before was shown (ready_at, taken early), else now: a set
@@ -975,33 +962,23 @@ void display_main() {
         const bool timed = s.timed;
         for (int k = 0; k < s.shown; k++) {
             const int f = s.first ? fifo_pick(j.set->made + 1, s.shown, k) : k;   // (the set's frame: the catch-up's picks)
-            int64_t due = timed ? j.set->due[f] : pace ? next_show : 0;
-            // (a frame on the game's timeline is late against its own time, below; under FIFO against its refresh slot, a
-            // refresh after the slot before, also where fifo_slot starts again from now: so a set late from the GPU or a
-            // held thread is counted, the review, 2026-11-17)
-            int64_t own = due;
             int64_t now = now_ns();
+            // Once vkWaitForFences(s.pending[0].done) completed above, all frames of this set are already rendered and copied
+            // on the GPU. Never hold finished frames behind future pace_delay/fixed_dues predictions (which added 150-265 ms
+            // of presentation lag and starved sets[3]); instead pace directly from shown_at at 88% of the game's frame span
+            // (or 56% fast drain whenever a newer set is already waiting in fg.jobs).
+            const int64_t base_frame = std::clamp<int64_t>(
+                (s.line && j.set->frame_ns > 0) ? j.set->frame_ns : interval, 12000000, 90000000);
+            const int q = fg.queued_jobs.load(std::memory_order_relaxed);
+            const int64_t num = q >= 1 ? 28 : 44;   // 56% fast catch-up when a newer set is queued, 88% smooth cadence otherwise
+            const int64_t step_gap = std::clamp<int64_t>(base_frame * num / (50 * std::max(s.shown, 1)), 4000000, 32000000);
+            int64_t due = (pace && shown_at > 0) ? std::max(now, shown_at + step_gap) : now;
+            int64_t own = due;
             if (s.refresh && dev.swap_mode == VK_PRESENT_MODE_FIFO_KHR) {   // (one a refresh at most)
                 if (slot > 0) own = std::max(due, slot + s.refresh);
                 const int64_t at = fifo_slot(due, slot, s.refresh, now);
                 stat.slotted += at > due && at > now;
                 due = at;
-            }
-            if (due < now) due = now;
-            if (!timed && due > j.at + interval + s.step) due = j.at + interval + s.step;
-            // (Batch 10J) 250 ms sanity guard (matches gap threshold; 100 ms snapped <20 FPS frames to now)
-            if (timed && due > now + 250000000) due = now;
-            // (Batch 10J3) Sawtooth-free 2x/3x spacing from measured GPU-completion cadence (done_interval):
-            // With 2 frames in flight, fg.queued_jobs is normally 1-2 while GPU work is still running, so only
-            // gently accelerate (82%) when >= 2 sets are queued AND the fence already finished (< 2 ms wait, real backlog).
-            // Otherwise hold steady 96% spacing (e.g., 24/24/27 ms at 13.3 FPS 3x instead of 14/14/45 ms sawtooth).
-            if (shown_at > 0) {
-                const int64_t base_frame = done_interval > 0 ? done_interval
-                                         : (s.line && j.set->frame_ns > 0) ? j.set->frame_ns : interval;
-                const bool real_backlog = fg.queued_jobs.load(std::memory_order_relaxed) >= 2 && fence_wait_ns < 2000000;
-                const int64_t num = real_backlog ? 41 : 48;   // 82% catch-up vs 96% steady spacing
-                const int64_t min_gap = std::clamp<int64_t>(base_frame * num / (50 * std::max(s.shown, 1)), 4000000, 55000000);
-                if (due < shown_at + min_gap) due = shown_at + min_gap;
             }
             const int64_t slot_was = slot;
             slot = due;
