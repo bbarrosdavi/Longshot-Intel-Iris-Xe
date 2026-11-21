@@ -112,6 +112,7 @@ struct State {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<Job> jobs;
+    std::atomic<int> queued_jobs{0};
     bool thread_started = false;
     OutSet* recorded = nullptr;   // (the set the last framegen_record filled, for framegen_queue)
     int64_t recorded_at = 0;
@@ -342,7 +343,7 @@ bool init() {
     const int radius = getenv("RX_VK_FRAMEGEN_RADIUS") ? std::clamp(atoi(getenv("RX_VK_FRAMEGEN_RADIUS")), 1, 16) : 8;
     const VkSpecializationMapEntry me{0, 0, 4};
     const VkSpecializationInfo spec{1, &me, 4, &radius};
-    if (!make_pipe(fg.copy, BUILTIN_SPV_ARGS(FG_COPY_COMP_SPV), {S, I}, 16) ||
+    if (!make_pipe(fg.copy, BUILTIN_SPV_ARGS(FG_COPY_COMP_SPV), {S, I, I, I}, 24) ||
         !make_pipe(fg.luma, BUILTIN_SPV_ARGS(FG_LUMA_COMP_SPV), {S, I}, 0) ||
         !make_pipe(fg.flow, BUILTIN_SPV_ARGS(FG_FLOW_COMP_SPV), {S, S, I}, 0, &spec) ||
         !make_pipe(fg.median, BUILTIN_SPV_ARGS(FG_MEDIAN_COMP_SPV), {S, I}, 0) ||
@@ -488,9 +489,22 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
     return true;
 }
 
+void compute_barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+}
+
 /// One pass: pipe over w x h in 8x8 groups, the bindings in order (a sampler when one is given: a sampled image)
 void pass(VkCommandBuffer cmd, const Pipe& p, std::initializer_list<std::pair<VkImageView, VkSampler>> bindings,
-          uint32_t w, uint32_t h, const void* push = nullptr, uint32_t push_bytes = 0) {
+          uint32_t w, uint32_t h, const void* push = nullptr, uint32_t push_bytes = 0,
+          const char* span_name = nullptr, bool narrow_compute = false) {
     VkDescriptorImageInfo ii[8];
     VkWriteDescriptorSet ws[8];
     uint32_t n = 0;
@@ -503,11 +517,14 @@ void pass(VkCommandBuffer cmd, const Pipe& p, std::initializer_list<std::pair<Vk
         ws[n].pImageInfo = &ii[n];
         n++;
     }
+    const bool timed = span_name && gprof_begin(cmd);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, n, ws);
     if (push_bytes) vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
     vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
-    full_barrier(cmd);
+    if (timed) gprof_end(cmd, span_name);
+    if (narrow_compute) compute_barrier(cmd);
+    else full_barrier(cmd);
 }
 
 // The fixed CRT profiles need no history or LUTs. Only the selected pipeline is made, and no CRT
@@ -779,7 +796,9 @@ void display_main() {
         // frame slot, a swapchain image or a new swapchain: the review, 2026-11-17. A wait there grows with the delay; the
         // copy's own time to submit (the game's held submits, the queue's lock) is the pipeline's and counts in the delay:
         // timed from after it, a CPU that takes 3 ms to submit left every set out, and the delay stayed at 0)
-        if (k == 0) s.as_came = t0 - j.queued <= 3000000 && now_ns() - t0 <= 3000000;
+        // (Batch 10J) Allow up to 15 ms for swapchain acquire/submit on iGPUs (3 ms rejected 100% of sets on Iris Xe,
+        // leaving fg.late_ns permanently stuck at 0.0 ms and dumping 2x frames <2 ms apart).
+        if (k == 0) s.as_came = t0 - j.queued <= 15000000 && now_ns() - t0 <= 15000000;
     };
     // The copies of a set presented ahead still to go to the GPU, in order, for as many of its frames as `room` (the spare
     // swapchain images not held by the set before)
@@ -793,7 +812,8 @@ void display_main() {
         s.j = j;
         if (last_at) {
             const int64_t d = j.at - last_at;
-            if (d > 0 && d < 100000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 50000000)) / 8;
+            // (Batch 10J) Support smooth pacing below 20 FPS (up to 120 ms interval / 200 ms acceptance window).
+            if (d > 0 && d < 200000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 120000000)) / 8;
         }
         last_at = j.at;
         if (!stat.since) stat.since = j.at;
@@ -876,6 +896,7 @@ void display_main() {
             const int shown = j.set->made + 1;
             if (!on_line(j.set) || shown < 2 || shown > spare || spare - left < 1) return;
             fg.jobs.pop_front();
+            fg.queued_jobs.fetch_sub(1, std::memory_order_relaxed);
         }
         take(taken[1], j, spare - left, left);
         taken[1].early = true;
@@ -889,6 +910,7 @@ void display_main() {
                 fg.cv.wait(lk, [] { return !fg.jobs.empty(); });
                 j = fg.jobs.front();
                 fg.jobs.pop_front();
+                fg.queued_jobs.fetch_sub(1, std::memory_order_relaxed);
             }
             take(taken[0], j, (int)dev.swap_spare.load(std::memory_order_relaxed), 0);
             held = 1;
@@ -899,7 +921,8 @@ void display_main() {
         // (taken early: its copies that the set before left no images for)
         copy_up_to(s, (int)dev.swap_spare.load(std::memory_order_relaxed));
         const bool first = s.ahead && s.pending[0].used;   // (its first copy made ahead)
-        if (first) vkWaitForFences(dev.device, 1, &s.pending[0].done, VK_TRUE, 100000000ull);   // (100 ms at most)
+        // (Batch 10J) 500 ms fence wait (100 ms timed out on <20 FPS iGPUs with 2 frames in flight).
+        if (first) vkWaitForFences(dev.device, 1, &s.pending[0].done, VK_TRUE, 500000000ull);
         // (longshot) A fixed multiplier's set on the game's timeline, presented ahead (its first copy's end waited for): its own
         // delay and how late its first frame can be shown against its time, a millisecond to spare, set the delay of the sets
         // after it (pace_delay). The copy's end as seen while the set before was shown (ready_at, taken early), else now: a set
@@ -940,7 +963,15 @@ void display_main() {
             }
             if (due < now) due = now;
             if (!timed && due > j.at + interval + s.step) due = j.at + interval + s.step;
-            if (timed && due > now + 100000000) due = now;   // (a game frame time gone wrong: not held back)
+            // (Batch 10J) 250 ms sanity guard (matches gap threshold; 100 ms snapped <20 FPS frames to now)
+            if (timed && due > now + 250000000) due = now;
+            // (Batch 10J) Anti-bunching: never dump ANY frame (including a taken-early set's k==0 right after the
+            // previous set's game frame) < min_gap after shown_at unless a backlog is building in fg.jobs.
+            if (shown_at > 0 && fg.queued_jobs.load(std::memory_order_relaxed) < (k > 0 ? 2 : 1)) {
+                const int64_t base_frame = (s.line && j.set->frame_ns > 0) ? j.set->frame_ns : interval;
+                const int64_t min_gap = std::clamp<int64_t>(base_frame * 4 / (5 * std::max(s.shown, 1)), 4000000, 50000000);
+                if (due < shown_at + min_gap) due = shown_at + min_gap;
+            }
             const int64_t slot_was = slot;
             slot = due;
             // (the wait in steps of 2 ms at most while the next set may still be taken early: at 2x it comes while this set's
@@ -987,6 +1018,9 @@ void display_main() {
             next_show = t + s.step;
             (t - (s.line ? own : due) > 2000000 ? stat.late : stat.on_time)++;
         }
+        // (Batch 10J) No fence wait here: every copy reading j.set->frame[] was submitted on dev.queue before this point,
+        // and the framegen_record that reuses this set starts with a full_barrier (ALL_COMMANDS), which orders it after
+        // those copies in queue submission order. Waiting stalled the display thread behind the next game frame's GPU work.
         {
             std::lock_guard lk(fg.mu);
             j.set->busy = false;
@@ -1498,11 +1532,22 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     const uint32_t uw = (uint32_t)w, uh = (uint32_t)h;
     const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
     full_barrier(cmd);
-    const int32_t pc[4] = {x0, y0, w, h};
-    pass(cmd, fg.copy, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
-    pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
+    // (Batch 10J) Fused fg_copy: reads src ONCE, writes fg.frames[cur], optionally writes set->frame[game_slot]
+    // directly (skipping the 16.6 MB full-res vkCmdCopyImage), and computes quarter-size luma in SLM (skipping fg_luma).
+    const bool dlss_held = blend && m > 1 && dlss_fg_holds();
+    const bool fsr_wanted = fsr3fi::frames_wanted() != 0;
+    const bool need_luma = !dlss_held && (!fsr_wanted || auto_rate);
+    const bool direct_game = !auto_rate && m > 1 && blend && !dlss_held && !fsr_wanted;
+    const int32_t pc[6] = {x0, y0, w, h, direct_game ? 1 : 0, need_luma ? 1 : 0};
+    const VkImageView game_dst_view = direct_game ? set->frame[m - 1].view : fg.frames[cur].view;
+    pass(cmd, fg.copy,
+         {{src, fg.nearest},
+          {fg.frames[cur].view, VK_NULL_HANDLE},
+          {game_dst_view, VK_NULL_HANDLE},
+          {fg.lumas[cur].view, VK_NULL_HANDLE}},
+         uw, uh, pc, sizeof pc, "fg_copy", true);
     // (AMD FSR 3.1's source with the HUD marked, when it is asked: read by fsr3fi_frames below)
-    hud_source(cmd, cur, sw, sh, x0, y0, uw, uh);
+    if (fsr_wanted) hud_source(cmd, cur, sw, sh, x0, y0, uw, uh);
     set->made = 0;
     set->shown = -1;
     set->by_time = false;   // (a reused set: only a fixed multiplier's below sets it)
@@ -1525,7 +1570,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         for (int k = 0; k < n; k++)
             if (t[k] <= 0.999f) made_t[made_n] = t[k], made_slot[made_n++] = k;
         const int fsr_n = blend ? made_n : 0;
-        const bool fsr = fsr3fi::frames_wanted() &&
+        const bool fsr = fsr_wanted &&
                          fsr3fi_frames(cmd, *set, cur, uw, uh, sequence, native_pq, made_t, made_slot, fsr_n) == fsr_n &&
                          fsr_n > 0;
         bool flow = false;
@@ -1533,6 +1578,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
             set->game[k] = t[k] > 0.999f;
             set->due[k] = at[k] + fg.game_ns;
             if (set->game[k]) {
+                full_barrier(cmd);
                 const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                     {0, 0, 0}, {uw, uh, 1}};
                 vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[k].image,
@@ -1543,12 +1589,13 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
             if (!flow) {
                 flow = true;
                 pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
-                                    {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
-                pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
+                                    {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch, nullptr, 0, "fg_flow", true);
+                pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}},
+                     cw, ch, nullptr, 0, "fg_median", true);
             }
             pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
-                                 {fg.flows[1].view, fg.nearest}, {set->frame[k].view, VK_NULL_HANDLE}},
-                 uw, uh, &t[k], 4);
+                                 {fg.flows[1].view, fg.linear}, {set->frame[k].view, VK_NULL_HANDLE}},
+                 uw, uh, &t[k], 4, "fg_synth", true);
         }
         set->shown = n;
         set->made = n > 0 && !set->game[n - 1] ? n : std::max(0, n - 1);   // (for framegen_made_image: any made)
@@ -1577,7 +1624,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     // (longshot) Where DLSS-G did not make them, AMD FSR 3.1's frame interpolation where it is asked (vk_fsr3fi.h): the set's
     // made frames at k/m, 1/2 at 2x, 1/3 and 2/3 at 3x. Given every present it is asked, with none to make too (nothing to
     // blend from), so the next set has its history; any it does not make stays with the interpolation below
-    if (!held && set->made == 0 && m > 1 && fsr3fi::frames_wanted()) {
+    if (!held && set->made == 0 && m > 1 && fsr_wanted) {
         float made_t[kMaxMult];
         int made_slot[kMaxMult];
         for (int k = 1; k < m; k++) made_t[k - 1] = (float)k / (float)m, made_slot[k - 1] = k - 1;
@@ -1586,14 +1633,19 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
             set->made = fsr_n, maker = FgMaker::Fsr3;
     }
     if (!held && set->made == 0 && blend && m > 1) {
+        if (!need_luma) {   // (fallback if FSR/DLSS failed on a frame where luma was skipped in fg_copy)
+            pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}},
+                 qw, qh, nullptr, 0, "fg_luma", true);
+        }
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
-                            {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
-        pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
+                            {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch, nullptr, 0, "fg_flow", true);
+        pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}},
+             cw, ch, nullptr, 0, "fg_median", true);
         for (int k = 1; k < m; k++) {
             const float t = (float)k / (float)m;
             pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
-                                 {fg.flows[1].view, fg.nearest}, {set->frame[k - 1].view, VK_NULL_HANDLE}},
-                 uw, uh, &t, 4);
+                                 {fg.flows[1].view, fg.linear}, {set->frame[k - 1].view, VK_NULL_HANDLE}},
+                 uw, uh, &t, 4, "fg_synth", true);
         }
         set->made = m - 1;
         maker = FgMaker::BuiltIn;
@@ -1612,10 +1664,14 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         set->extra_ns = extra;
         set->by_time = true;
     }
-    const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
-                        {uw, uh, 1}};
-    vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[set->made].image,
-                   VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    // (Batch 10J) Skip redundant full-res vkCmdCopyImage when fused fg_copy already wrote set->frame[m - 1] directly.
+    if (!(direct_game && set->made == m - 1)) {
+        full_barrier(cmd);
+        const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                            {uw, uh, 1}};
+        vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[set->made].image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
     full_barrier(cmd);
     fg.have_prev = true;
     fg.cur = prev;
@@ -1628,6 +1684,7 @@ void framegen_queue(uint64_t value) {
     if (!fg.recorded) return;
     std::lock_guard lk(fg.mu);
     fg.jobs.push_back({fg.recorded, fg.recorded_at, value, now_ns()});
+    fg.queued_jobs.fetch_add(1, std::memory_order_relaxed);
     fg.recorded = nullptr;
     fg.cv.notify_all();
 }

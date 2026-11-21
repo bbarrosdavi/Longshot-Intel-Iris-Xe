@@ -5356,6 +5356,12 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         // thread's present follows it on the one queue. RX_VK_SHOT_MADE shots need it in this recording.)
         static const bool fg_inline = env_on("RX_VK_SHOT_MADE");
         const bool fg_after = framegen_on() && tex && !fg_inline;
+        // (Batch 10J) Protect present source texture lifetime across fg_after (which runs in recording value+1
+        // after r signals timeline=value): prevent texture_frame() eviction while FG GPU commands still read tex.
+        if (tex && framegen_on()) {
+            tex->last_frame = texture_frame_no();
+            tex->last_value = std::max(tex->last_value, value + 1);
+        }
         interpolated = framegen_on() && tex && fg_inline &&
                        framegen_record(r.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample), sw,
                                        sh, crop, present_native_pq.load(std::memory_order_relaxed));
@@ -5473,6 +5479,9 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         else menu_note_frame(true);   // (the FPS counter's, as frame generation's thread counts what it shows)
         {   // (RX_VK_WAIT_GPU=<frames>: the replay no further ahead of the GPU than that)
             static uint64_t values[8];
+            static uint64_t fg_values[2];
+            static int64_t fg_seq = 0;
+            static const bool env_set = getenv("RX_VK_WAIT_GPU") != nullptr;
             static const int ahead = [] {
                 const char* e = getenv("RX_VK_WAIT_GPU");
                 const long count = e ? std::strtol(e, nullptr, 10) : 0;
@@ -5480,10 +5489,20 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                 if (count > capacity) logf("vk: RX_VK_WAIT_GPU=%ld exceeds the ring capacity; using %ld", count, capacity);
                 return (int)std::clamp<long>(count, 0, capacity);
             }();
+            // (Batch 10J) On Mesa Intel with FrameGen active and no explicit RX_VK_WAIT_GPU, cap in-flight depth to 2 frames:
+            // protects 2-slot fg.frames[0..1]/fg.lumas[0..1], prevents i915 ring overrun/TDR when unfocused, and cuts FG input lag.
             if (ahead > 0) {
                 const uint64_t old = values[presents % ahead];
                 values[presents % ahead] = value;
                 if (old) wait_value(old);
+            } else if (!env_set && interpolated && dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
+                const uint64_t old = fg_values[fg_seq & 1];
+                fg_values[fg_seq & 1] = value;
+                fg_seq++;
+                if (old) wait_value(old);
+            } else if (!interpolated && fg_seq) {
+                fg_values[0] = fg_values[1] = 0;
+                fg_seq = 0;
             }
         }
         if (presents % 300 == 0) pipeline_cache_save(false);
@@ -5883,6 +5902,8 @@ std::atomic<uint32_t> present_kind{0};   // (vk_framegen.cpp: 1 while a made fra
 std::mutex present_image_mu;
 static bool present_out(uint32_t index, std::unique_lock<std::mutex>& qk);   // (present_image's end, below)
 thread_local PendingPresent* present_defer_into = nullptr;
+static thread_local VkFence tl_present_last_fence = VK_NULL_HANDLE;
+VkFence present_last_fence() { return tl_present_last_fence; }
 static VkFence present_copy_done = VK_NULL_HANDLE;   // (present_image's copy, while it presents: the presenter thread may take it)
 namespace {
 bool present_thread_on();
@@ -6214,6 +6235,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     si.pNext = reflex_submit_id(nullptr, reflex_present_frame);
     res = vkQueueSubmit2(dev.queue, 1, &si, f.done);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
+    tl_present_last_fence = (res == VK_SUCCESS) ? f.done : VK_NULL_HANDLE;
     if (present_defer_into) {   // (present ahead: the copy is queued; present_commit shows it at its time)
         present_defer_into->used = true;
         present_defer_into->index = index;
