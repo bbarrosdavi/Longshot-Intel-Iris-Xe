@@ -962,6 +962,7 @@ int memory_gpu_written(uint64_t guest, uint64_t size) {
 bool memory_gpu_writes_any() { return !gpu_writes.empty(); }
 void memory_stamp_gpu(uint64_t guest, uint64_t size) {
     if (!size) return;
+    draw_flush_ub_reads();
     memory_gpu_writes_note(guest, size);
     memory_stamp(guest, size);
     if (!gpu_pages_on()) return;
@@ -1166,7 +1167,21 @@ void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size
         destroy_buffer(buffer, alloc);
     }
 }
+// (Batch 10I) 4-entry MRU cache of recent cap_bufs entries under pools_mu: avoids std::map lookup on 78% of UBO/handle reads
+struct CapMru { uint32_t gen = 0; CapBuf* cb = nullptr; };
+CapMru cap_mru[4]{};
+uint32_t cap_mru_next = 0;
+inline void cap_mru_clear() { for (auto& m : cap_mru) m = {}; }
+inline CapBuf* cap_buf_find_locked(uint32_t gen) {
+    for (int i = 0; i < 4; i++)
+        if (cap_mru[i].gen == gen && cap_mru[i].cb) return cap_mru[i].cb;
+    auto b = cap_bufs.find(gen);
+    if (b == cap_bufs.end()) return nullptr;
+    cap_mru[cap_mru_next++ & 3] = {gen, &b->second};
+    return &b->second;
+}
 void cap_buf_retire(std::map<uint32_t, CapBuf>::iterator it) {
+    cap_mru_clear();
     cap_bytes -= it->second.size;
     cap_buf_free(it->second.buffer, it->second.alloc, it->second.map, it->second.size);
     cap_bufs.erase(it);
@@ -1486,32 +1501,62 @@ struct SubmittedPage {   // (a page no capture holds, as of pgen and view: the r
 // another, and with one page kept nearly every read missed and took pools_mu (program_for's answer handles). A page a
 // capture holds is not kept: its words are copied from the capture under pools_mu at each read, not the whole 4 KB page
 // into a copy of the thread's own (that copy was a third of the replay's thread in Kokiri Forest on NVIDIA Linux)
-constexpr int kSubmittedPages = 32;
+constexpr int kSubmittedPages = 256;
 thread_local SubmittedPage submitted_pages[kSubmittedPages];
-inline SubmittedPage& submitted_page_for(uint64_t page) {   // (a page and its neighbours, and pages 32 apart, in different slots)
-    return submitted_pages[(page + (page >> 5) * 13) & (kSubmittedPages - 1)];
+inline SubmittedPage& submitted_page_for(uint64_t page) {   // (a page and its neighbours, and pages 256 apart, in different slots)
+    return submitted_pages[(page + (page >> 8) * 13) & (kSubmittedPages - 1)];
 }
 
 void late_fix_cpu_read(uint32_t page, VkBuffer buffer, uint8_t* slot);   // (pools_mu held: the late pages' fix, below)
 bool late_defer_any();   // (pools_mu held: RX_VK_LATE_DEFER, below)
 void late_defer_cpu_read(uint32_t page, uint32_t gen, uint32_t slot, VmaAllocation alloc, uint8_t* map);
 namespace {
-/// What a replay read settles without pools_mu: 0 no memory there, 1 read from guest memory and that stands (no capture, or
-/// its one page in none as of the thread's kept answer), 2 its pages are to be looked up in the captures (guest: its address)
+/// What a replay read settles without pools_mu:
+/// 0 = no memory there,
+/// 1 = read from guest memory and that stands (no capture, or its one page in none as of the thread's kept answer),
+/// 2 = single-page read (<1TB) not yet copied from guest memory (avoids double-copy into write-combined stream on capture hit),
+/// 3 = multi-page or >1TB read already copied from guest memory, needs capture overlay under pools_mu.
 int submitted_read_unlocked(uint64_t gpu, void* dst, uint64_t n, uint64_t& guest) {
-    // (once a capture exists, every uniform word took pools_mu to ask whether its page was in one. A page in none keeps
-    // that answer until a stamp or a new capture)
+    if (!n || !capture_on() || !captures_seen.load(std::memory_order_relaxed))
+        return host->gpu_read(gpu, dst, n) ? 1 : 0;
+    if (gpu < (1ull << 40)) {
+        guest = gpu;
+        const uint64_t page0 = guest >> kPageShift, page1 = (guest + n - 1) >> kPageShift;
+        if (page0 == page1) {
+            const uint64_t view = cap_view_gen.load(std::memory_order_acquire);
+            const SubmittedPage& submitted_page = submitted_page_for(page0);
+            if (submitted_page_reuse(page0, page_gen(page0), view, submitted_page.page, submitted_page.pgen,
+                                     submitted_page.view))
+                return host->gpu_read(gpu, dst, n) ? 1 : 0;
+            return 2;
+        }
+    }
     if (!host->gpu_read(gpu, dst, n)) return 0;
-    if (!n || !capture_on() || !captures_seen.load(std::memory_order_relaxed)) return 1;
     guest = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
     if (!guest) return 1;
-    const uint64_t page0 = guest >> kPageShift, page1 = (guest + n - 1) >> kPageShift;
-    const uint64_t view = cap_view_gen.load(std::memory_order_acquire);
-    const SubmittedPage& submitted_page = submitted_page_for(page0);
-    if (page0 == page1 && submitted_page_reuse(page0, page_gen(page0), view, submitted_page.page, submitted_page.pgen,
-                                               submitted_page.view))
-        return 1;
-    return 2;
+    return 3;
+}
+/// (pools_mu held) single-page fast path (status 2): copies once from capture if captured, else marks need_live=true
+int64_t submitted_read_locked_single(uint64_t guest, void* dst, uint64_t n, bool& need_live) {
+    const uint64_t page0 = guest >> kPageShift;
+    const CapEntry e = cap_entry(page0);
+    if (e.gen && e.gen == page_gen(page0)) {
+        CapBuf* cb = cap_buf_find_locked(e.gen);
+        if (cb && cb->map) {
+            uint8_t* slot_ptr = (uint8_t*)cb->map + (uint64_t)e.slot * 4096;
+            late_fix_cpu_read((uint32_t)page0, cb->buffer, slot_ptr);
+            if (late_defer_any()) late_defer_cpu_read((uint32_t)page0, e.gen, e.slot, cb->alloc, (uint8_t*)cb->map);
+            std::memcpy(dst, slot_ptr + (guest - (page0 << kPageShift)), n);
+            need_live = false;
+            return 1;
+        }
+    }
+    SubmittedPage& submitted_page = submitted_page_for(page0);
+    submitted_page.page = page0;
+    submitted_page.pgen = page_gen(page0);
+    submitted_page.view = cap_view_gen.load(std::memory_order_relaxed);
+    need_live = true;
+    return 0;
 }
 /// (pools_mu held) the pages of that read a capture holds, copied over what guest memory gave: how many
 int64_t submitted_read_locked(uint64_t guest, void* dst, uint64_t n) {
@@ -1520,12 +1565,12 @@ int64_t submitted_read_locked(uint64_t guest, void* dst, uint64_t n) {
     for (uint64_t page = guest >> kPageShift; page < (guest + n + 4095) >> kPageShift; page++) {
         const CapEntry e = cap_entry(page);
         if (!e.gen || e.gen != page_gen(page)) continue;
-        auto b = cap_bufs.find(e.gen);
-        if (b == cap_bufs.end() || !b->second.map) continue;
-        late_fix_cpu_read((uint32_t)page, b->second.buffer, (uint8_t*)b->second.map + (uint64_t)e.slot * 4096);
-        if (late_defer_any()) late_defer_cpu_read((uint32_t)page, e.gen, e.slot, b->second.alloc, (uint8_t*)b->second.map);
+        CapBuf* cb = cap_buf_find_locked(e.gen);
+        if (!cb || !cb->map) continue;
+        late_fix_cpu_read((uint32_t)page, cb->buffer, (uint8_t*)cb->map + (uint64_t)e.slot * 4096);
+        if (late_defer_any()) late_defer_cpu_read((uint32_t)page, e.gen, e.slot, cb->alloc, (uint8_t*)cb->map);
         const uint64_t a = std::max(page << kPageShift, guest), z = std::min((page + 1) << kPageShift, guest + n);
-        std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
+        std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)cb->map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
         from++;
     }
     if (page0 == page1 && from == 0) {   // (in no capture: guest memory stands for its next words too)
@@ -1540,7 +1585,7 @@ void submitted_read_counted(int64_t looked_up, int64_t from) {
     static std::atomic<int64_t> reads{0}, pages_from{0};
     pages_from += from;
     const int64_t before = reads.fetch_add(looked_up);
-    if (before / 20000 != (before + looked_up) / 20000)
+    if (before / 500000 != (before + looked_up) / 500000)
         logf("vk: replay reads of guest memory as submitted: %lld (%lld pages from the captures)", (long long)(before + looked_up),
              (long long)pages_from.load());
 }
@@ -1548,13 +1593,16 @@ void submitted_read_counted(int64_t looked_up, int64_t from) {
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     uint64_t guest = 0;
     const int r = submitted_read_unlocked(gpu, dst, n, guest);
-    if (r != 2) return r != 0;
+    if (r <= 1) return r != 0;
     int64_t from = 0;
+    bool need_live = false;
     {
         std::lock_guard lk(pools_mu);
-        from = submitted_read_locked(guest, dst, n);
+        if (r == 2) from = submitted_read_locked_single(guest, dst, n, need_live);
+        else from = submitted_read_locked(guest, dst, n);
     }
     submitted_read_counted(1, from);
+    if (need_live) return host->gpu_read(gpu, dst, n);
     return true;
 }
 /// Several replay reads at once (a draw's uniform ranges, uniform_range): each as memory_read_as_submitted, with pools_mu
@@ -1564,18 +1612,34 @@ void memory_read_as_submitted_many(const SubmittedRead* reads, size_t count) {
     constexpr size_t kMost = 64;
     uint64_t guests[kMost];
     size_t late[kMost], nlate = 0;
+    int status[kMost];
+    size_t live[kMost], nlive = 0;
     for (size_t i = 0; i < count; i++) {
         if (i >= kMost) {
             memory_read_as_submitted(reads[i].gpu, reads[i].dst, reads[i].n);
             continue;
         }
-        if (submitted_read_unlocked(reads[i].gpu, reads[i].dst, reads[i].n, guests[i]) == 2) late[nlate++] = i;
+        const int r = submitted_read_unlocked(reads[i].gpu, reads[i].dst, reads[i].n, guests[i]);
+        if (r >= 2) status[nlate] = r, late[nlate++] = i;
     }
     if (!nlate) return;
     int64_t from = 0;
     {
         std::lock_guard lk(pools_mu);
-        for (size_t k = 0; k < nlate; k++) from += submitted_read_locked(guests[late[k]], reads[late[k]].dst, reads[late[k]].n);
+        for (size_t k = 0; k < nlate; k++) {
+            const size_t idx = late[k];
+            if (status[k] == 2) {
+                bool need_live = false;
+                from += submitted_read_locked_single(guests[idx], reads[idx].dst, reads[idx].n, need_live);
+                if (need_live) live[nlive++] = idx;
+            } else {
+                from += submitted_read_locked(guests[idx], reads[idx].dst, reads[idx].n);
+            }
+        }
+    }
+    for (size_t k = 0; k < nlive; k++) {
+        const size_t idx = live[k];
+        host->gpu_read(reads[idx].gpu, reads[idx].dst, reads[idx].n);
     }
     submitted_read_counted((int64_t)nlate, from);
 }

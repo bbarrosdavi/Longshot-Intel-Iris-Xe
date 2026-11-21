@@ -390,6 +390,7 @@ int memory_gpu_written(uint64_t guest, uint64_t size);
 bool memory_gpu_writes_any();
 /// (vk_draw.cpp) whether uniform buffers are copied into the stream as submitted (RX_VK_UB_SNAPSHOT; every Intel GPU)
 bool uniform_snapshot_on();
+void draw_flush_ub_reads();
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
 /// A future submission completion covering images retired during replay; zero: no safe value.

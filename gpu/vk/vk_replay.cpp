@@ -1222,23 +1222,33 @@ struct UbGapCache {
     size_t first = 0, lim = 0;
     bool on = false;
 };
-thread_local UbGapCache ub_gap_cache;
+// (Batch 10I) 4-entry ring of non-overlapping gaps: prevents thrashing when a draw reads c3/c4/SSBOs across inline UPDATE_UBs
+constexpr size_t kUbGapSlots = 4;
+thread_local UbGapCache ub_gap_cache[kUbGapSlots];
+thread_local size_t ub_gap_next = 0;
 bool ub_gap_holds(uint64_t addr, uint64_t n, size_t first, size_t lim) {
-    return n && ub_gap_cache.on && ub_gap_cache.epoch == ub_list_epoch.load(std::memory_order_relaxed) &&
-           ub_gap_cache.first == first && ub_gap_cache.lim == lim && addr >= ub_gap_cache.lo &&
-           addr + n >= addr && addr + n <= ub_gap_cache.hi;
+    if (!n || addr + n < addr) return false;
+    if (first >= lim) return true;
+    const uint64_t epoch = ub_list_epoch.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < kUbGapSlots; i++) {
+        const UbGapCache& g = ub_gap_cache[i];
+        if (g.on && g.epoch == epoch && g.first == first && g.lim == lim && addr >= g.lo && addr + n <= g.hi)
+            return true;
+    }
+    return false;
 }
 bool ub_try_gap(size_t first, size_t lim, uint64_t addr, uint64_t n) {
     if (first > lim) return false;
+    if (first == lim) return true;
     const uint64_t epoch = ub_list_epoch.load(std::memory_order_relaxed);
     // (a background thread's range is empty: it reads nothing of the deque, not even its start, while the replay
     // thread changes it)
     using It = std::deque<UbUpdate>::const_iterator;
-    const It from = first == lim ? It{} : ub_updates.cbegin() + first, to = first == lim ? It{} : from + (lim - first);
+    const It from = ub_updates.cbegin() + first, to = from + (lim - first);
     uint64_t lo = 0, hi = 0;
     if (!ub_gap(from, to, addr, n, &lo, &hi)) return false;
     if (ub_list_epoch.load(std::memory_order_relaxed) != epoch) return false;   // (the list changed: do not keep the gap)
-    ub_gap_cache = {epoch, lo, hi, first, lim, true};
+    ub_gap_cache[ub_gap_next++ & (kUbGapSlots - 1)] = {epoch, lo, hi, first, lim, true};
     return true;
 }
 // (a draw reads the same uniform words as the draw before it. The gap is what says later updates missed the word:
@@ -1248,12 +1258,12 @@ struct UbWord {
     uint32_t page = 0, v = 0;
     bool on = false;
 };
-thread_local UbWord ub_words[128];
+// (Batch 10I) 1024-entry L1-resident word cache (was 128): prevents eviction across 32/64-element handle tables & SSBOs
+constexpr uint32_t kUbWords = 1024;
+thread_local UbWord ub_words[kUbWords];
 uint32_t ub_word_index(uint64_t addr) {
-    // Words 512 bytes or a page apart share the low seven word bits. Add higher bits to separate those strides
-    // while keeping runs of up to 64 words collision-free. Hits still compare the full address in ub_word_hit.
     const uint64_t word = addr >> 2;
-    return (uint32_t)((word + (word >> 7) + (word >> 14)) & 127);
+    return (uint32_t)((word + (word >> 10) + (word >> 20)) & (kUbWords - 1));
 }
 bool ub_word_hit(uint64_t addr, size_t lim, uint32_t* out) {
     UbWord& w = ub_words[ub_word_index(addr)];
@@ -2268,7 +2278,9 @@ bool part_ends_before_draw() {
 }
 
 void maybe_split(VkCommandBuffer& cmd) {
-    static const int64_t every = getenv("RX_VK_CHUNK") ? atoll(getenv("RX_VK_CHUNK")) : 240;
+    static const int64_t every = getenv("RX_VK_CHUNK")
+                                     ? atoll(getenv("RX_VK_CHUNK"))
+                                     : (dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ? 720 : 240);
     if (split_off || !rec_cur || every <= 0 || ++part_work < every || rec_parts + 1 >= kMaxParts || dump_on()) return;
     if (part_ends_before_draw()) {   // (at the next plain draw: replay(). The submission's end comes first when none follows)
         part_end_wanted = true;

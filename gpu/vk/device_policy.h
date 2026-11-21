@@ -522,7 +522,7 @@ inline DevicePolicy device_policy(const DeviceFacts& f) {
     p.intel_compile_gate = f.windows && f.intel() && !p.intel_side_by_side_auto;
     // (corrected: Intel's Windows driver, whose compiler issue 496 is, and not the vendor, which also held ANV's compute
     // builds to one at a time. To go back: f.intel())
-    p.compute_builds_serial = f.intel();
+    p.compute_builds_serial = f.windows && f.intel();
     p.pcache_fetch_lock = f.windows && f.intel();
     p.split_before_draw = f.intel();
     p.astc_on_cpu = f.windows && f.amd() && (f.device_id == 0x164E || f.device_id == 0x13C0 || f.device_id == 0x1114);

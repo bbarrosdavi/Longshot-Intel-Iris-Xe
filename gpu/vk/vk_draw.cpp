@@ -3306,19 +3306,21 @@ VkSampler sampler_make(int id, bool compare, bool one_level);
 // changed (sampler_registrations_generation). RX_VK_SAMPLER_CACHE=0 turns off both this table and the parameters' cache inside
 // sampler_make; =1 or the Sampler cache row turns the parameters' cache on (this table stays on, as it is without the option)
 bool sampler_cache_on();   // (longshot, RX_VK_SAMPLER_CACHE and the Sampler cache row: defined below with the descriptor fingerprint's)
-VkSampler sampler_for(int id, bool compare, bool one_level) {
+struct SamplerFastEntry { uint64_t gen; VkSampler s; uint64_t frame; };
+thread_local SamplerFastEntry sampler_fast_table[2][2][4096];   // (gen 0: never filled; the generation starts at 1)
+inline VkSampler sampler_for_fast(int id, bool compare, bool one_level, uint64_t gen, uint64_t frame) {
     static const bool on = !getenv("RX_VK_SAMPLER_CACHE") || atoi(getenv("RX_VK_SAMPLER_CACHE")) != 0;
-    if (!on || id < 0 || id >= 4096) return sampler_make(id, compare, one_level);
-    struct Entry { uint64_t gen; VkSampler s; uint64_t frame; };
-    static thread_local Entry table[2][2][4096];   // (gen 0: never filled; the generation starts at 1)
-    const uint64_t gen = sampler_registrations_generation();   // (read first: a registration after it makes the next call miss)
-    // (near the device's sampler limit, an entry lasts a present: the book sees the samplers in use, sampler_book)
-    const uint64_t frame = sampler_book.watching.load(std::memory_order_relaxed) ? texture_frame_no() : 0;
-    Entry& e = table[compare ? 1 : 0][one_level ? 1 : 0][id];
+    if (!on || (unsigned)id >= 4096u) return sampler_make(id, compare, one_level);
+    SamplerFastEntry& e = sampler_fast_table[compare ? 1 : 0][one_level ? 1 : 0][id];
     if (e.gen == gen && e.frame == frame) return e.s;
     const VkSampler made = sampler_make(id, compare, one_level);
-    if (made) e = {gen, made, frame};   // (a failed creation is retryable without a new registration)
+    if (made) e = {gen, made, frame};
     return made;
+}
+VkSampler sampler_for(int id, bool compare, bool one_level) {
+    const uint64_t gen = sampler_registrations_generation();
+    const uint64_t frame = sampler_book.watching.load(std::memory_order_relaxed) ? texture_frame_no() : 0;
+    return sampler_for_fast(id, compare, one_level, gen, frame);
 }
 VkSampler sampler_make(int id, bool compare, bool one_level) {
     nvn_samp_par p{};
@@ -3570,10 +3572,21 @@ struct HandleHit {
     bool sampling;    // (its use reads the texture's contents)
 };
 TLS_OBJECT(handle_hits, FlatMap<uint64_t, HandleHit>)
+// (Batch 10I) Direct-mapped 4096-entry L1/L2 TLS fast cache ahead of handle_hits FlatMap: 1 load, 0 hash probes on 99% of lookups
+struct HandleFastSlot {
+    uint64_t key = UINT64_MAX;
+    HandleHit hit{};
+};
+constexpr uint32_t kHandleFast = 4096;
+thread_local HandleFastSlot handle_fast[kHandleFast];
 // (longshot) RX_VK_TRACE_TEX=<w>x<h>,...: each draw sampling a texture of that size is logged with its state, every 30th frame, 600 lines: a
 // model that does not show is found by its textures, and whether the game draws it, and how, read from the line
 thread_local const Texture* trace_tex_hit = nullptr;
 thread_local uint32_t trace_tex_mask = 0;
+bool trace_tex_enabled() {
+    static const bool on = getenv("RX_VK_TRACE_TEX") && *getenv("RX_VK_TRACE_TEX");
+    return on;
+}
 bool trace_tex_wanted(const Texture* t) {
     static const std::vector<std::pair<uint32_t, uint32_t>> want = [] {
         std::vector<std::pair<uint32_t, uint32_t>> v;
@@ -3606,31 +3619,46 @@ bool log_img_wanted(uint64_t key) {   // (longshot) RX_VK_LOG_IMG=<key prefix,..
     return false;
 }
 
-VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, VkFormat storage_as = VK_FORMAT_UNDEFINED,
-                            Texture** tex_out = nullptr, uint32_t* level_out = nullptr) {
-    const uint32_t version = texture_slot_version((int)(handle & 0xFFFFF));
-    const uint64_t dgen = texture_destroy_generation();
-    const uint64_t key = (uint64_t)(handle & 0xFFFFF) | (uint64_t)want << 20 | (uint64_t)use << 28 | (uint64_t)storage_as << 32;
+VkImageView texture_view_of_pre(uint32_t handle, uint32_t version, uint64_t dgen, uint32_t tepoch, VkImageViewType want, ViewUse use,
+                                VkFormat storage_as = VK_FORMAT_UNDEFINED, Texture** tex_out = nullptr, uint32_t* level_out = nullptr) {
+    const uint32_t slot = handle & 0xFFFFF;
+    const uint64_t key = (uint64_t)slot | (uint64_t)want << 20 | (uint64_t)use << 28 | (uint64_t)storage_as << 32;
     static const bool log_hits = env_on("RX_VK_LOG_HITS");
+    HandleFastSlot& hf = handle_fast[(slot ^ ((uint32_t)want << 9) ^ ((uint32_t)use << 11)) & (kHandleFast - 1)];
+    if (!log_hits && hf.key == key && hf.hit.version == version && hf.hit.destroy_gen == dgen) {
+        if (hf.hit.tex && hf.hit.tex_epoch != tepoch) {
+            if (!texture_touch_quick(hf.hit.tex, hf.hit.sampling)) {
+                ParLock lk;
+                texture_touch(hf.hit.tex, hf.hit.sampling);
+            }
+            hf.hit.tex_epoch = tepoch;
+        }
+        if (tex_out) *tex_out = hf.hit.tex;
+        if (level_out) *level_out = hf.hit.level;
+        return hf.hit.view;
+    }
     static int64_t st_hit, st_new, st_ver, st_gen, st_n;
-    const auto it = handle_hits().find(key);
+    auto& hits = handle_hits();
+    const auto it = hits.find(key);
     if (log_hits) {   // (the counters were a second search of this map on every binding, with the log off)
         if (++st_n % 200000 == 0)
             logf("vk: handle hits %lld, new %lld, slot re-registered %lld, a texture destroyed %lld", (long long)st_hit,
                  (long long)st_new, (long long)st_ver, (long long)st_gen);
-        if (it == handle_hits().end()) st_new++;
+        if (it == hits.end()) st_new++;
         else if (it->second.version != version) st_ver++;
         else if (it->second.destroy_gen != dgen) st_gen++;
         else st_hit++;
     }
-    if (it != handle_hits().end() && it->second.version == version && it->second.destroy_gen == dgen) {
-        if (it->second.tex && it->second.tex_epoch != texture_epoch()) {   // (once a submission: its age and contents)
+    if (it != hits.end() && it->second.version == version && it->second.destroy_gen == dgen) {
+        if (it->second.tex && it->second.tex_epoch != tepoch) {   // (once a submission: its age and contents)
             if (!texture_touch_quick(it->second.tex, it->second.sampling)) {
                 ParLock lk;
                 texture_touch(it->second.tex, it->second.sampling);
             }
-            it->second.tex_epoch = texture_epoch();
+            it->second.tex_epoch = tepoch;
         }
+        hf.key = key;
+        hf.hit = it->second;
         if (tex_out) *tex_out = it->second.tex;
         if (level_out) *level_out = it->second.level;
         return it->second.view;
@@ -3642,7 +3670,7 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     VkImageView view = VK_NULL_HANDLE;
     Texture* tex = nullptr;
     uint32_t level = 0;
-    const bool known = texture_of((int)(handle & 0xFFFFF), &t, &v, &has_view);
+    const bool known = texture_of((int)slot, &t, &v, &has_view);
     if (known) {
         tex = texture_get(&t, use == ViewUse::Sample || use == ViewUse::Storage);
         if (tex) view = texture_view(tex, &t, has_view ? &v : nullptr, want, use, &last_view_format, storage_as);
@@ -3650,21 +3678,29 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     }
     if (!view) {   // (what a shader reads as the dummy instead: once per texture slot)
         static std::unordered_map<uint32_t, int> told;
-        if (told.size() < 64 && !told[handle & 0xFFFFF]++) {
+        if (told.size() < 64 && !told[slot]++) {
             if (!known)
-                logf("vk: texture slot %#x (handle %#x) is not registered: sampled as the dummy", handle & 0xFFFFF, handle);
+                logf("vk: texture slot %#x (handle %#x) is not registered: sampled as the dummy", slot, handle);
             else
                 logf("vk: texture slot %#x (handle %#x): %s; NVN target %d format %#x %ux%ux%u levels %u gpu %#llx, view %s "
                      "(format %#x target %d), wanted view type %d use %d",
-                     handle & 0xFFFFF, handle, tex ? "no view of it" : "no image for it", t.d.target, t.d.format, t.d.width,
+                     slot, handle, tex ? "no view of it" : "no image for it", t.d.target, t.d.format, t.d.width,
                      t.d.height, t.d.depth, t.d.levels, (unsigned long long)t.gpu, has_view ? "yes" : "no",
                      has_view && v.set_format ? v.format : 0, has_view && v.set_target ? v.target : -1, (int)want, (int)use);
         }
     }
-    handle_hits()[key] = {view, tex, texture_destroy_generation(), level, version, texture_epoch(), use == ViewUse::Sample || use == ViewUse::Storage};
+    const HandleHit hh{view, tex, texture_destroy_generation(), level, version, texture_epoch(), use == ViewUse::Sample || use == ViewUse::Storage};
+    hits[key] = hh;
+    hf.key = key;
+    hf.hit = hh;
     if (tex_out) *tex_out = tex;
     if (level_out) *level_out = level;
     return view;
+}
+VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, VkFormat storage_as = VK_FORMAT_UNDEFINED,
+                            Texture** tex_out = nullptr, uint32_t* level_out = nullptr) {
+    return texture_view_of_pre(handle, texture_slot_version((int)(handle & 0xFFFFF)), texture_destroy_generation(), texture_epoch(),
+                               want, use, storage_as, tex_out, level_out);
 }
 
 /// A uniform buffer's descriptor range: the bank uploaded (driver banks, c1) or the user buffer in its pool
@@ -3727,8 +3763,10 @@ void ub_reads_flush() {
     }
     p.clear();
 }
-struct UbReadsScope {   // (build_descriptors: its reads made when it is over, whichever way it ends)
-    ~UbReadsScope() { ub_reads_flush(); }
+struct UbReadsScope {   // (Batch 10I: batch across draws up to 48 reads to cut pools_mu acquisitions 30x; always flushed before GPU submit or stamp)
+    ~UbReadsScope() {
+        if (ub_read_batch_mode() == 2 || ub_reads_pending().size() >= 48) ub_reads_flush();
+    }
 };
 /// (longshot) A recording's uniform copies, by address and size: a draw that binds the range an earlier draw of the recording had
 /// copied into the stream, with the same captures in view (memory_capture_view), is given that copy instead of one of its own. In
@@ -3940,7 +3978,7 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         if (memo && !hit)
             memo->addr = u.addr, memo->n = n, memo->view = view, memo->epoch = cur->ub_snap_epoch, memo->at = at, memo->buf = cur->stream;
         static int64_t copied;
-        if (++copied % 5000 == 1)
+        if (++copied % 500000 == 1)
             logf("vk: uniform buffer %#llx +%#llx copied into the stream (%s; %lld so; after a GPU write in the submission: "
                  "%lld bound in place, %lld copied all the same; after one in a submission still on the GPU: %lld bound in "
                  "place, %lld copied all the same)", (unsigned long long)u.addr, (unsigned long long)n,
@@ -4191,6 +4229,7 @@ void dump_ssbos(VkCommandBuffer cmd, const Program& p, const char* when) {
 }
 
 bool pending_clear_tracks(const Texture* tex);
+bool pending_clear_tracks_any();
 void build_descriptors(const NvnState& s, const Program& p) {
     // (longshot) the thread's writer asked for once: each dw() is a thread-local lookup, a call in a shared library, and a
     // build made dozens of them
@@ -4484,6 +4523,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 }
                 if (b && d.is_written) {
                     const auto t1 = slow_desc_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    ub_reads_flush();   // (flush deferred UBO reads before memory_stamp_gpu bumps page/capture gens)
                     const uint64_t guest = host->gpu_guest(base);
                     if (guest) { ParLock lk; memory_stamp_gpu(guest, n); }
                     if (slow_desc_timing()) slow_descriptor(t1, "stamp", base, n);
@@ -4515,96 +4555,110 @@ void build_descriptors(const NvnState& s, const Program& p) {
         };
         texel_views(info.texture_buffer_descriptors, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, false);
         texel_views(info.image_buffer_descriptors, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, true);
-        for (const auto& d : info.texture_descriptors) {
+        if (!info.texture_descriptors.empty()) {
             FINE_SCOPE(FT_TEX);
-            VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d.count);
-            const size_t first = out.imgs.size();
-            const VkImageViewType vt = view_type(d.type);
-            // (Lichii bd0171f7) A handle table's array: the shader indexes it per pixel with an index it read itself (OoT's
-            // clustered lights: a light index from the pixel's list), and element k is table entry k's texture (that light's
-            // shadow map). The handles of all elements at once: the constant words and storage addresses the program reads
-            // are read once
-            static thread_local std::vector<uint32_t> table;
-            const bool is_table = d.handle_program != ~0U && d.count > 1;
-            if (is_table) table.resize(d.count), stage_handles(s, st, d.handle_program, d.count, table.data());
-            uint32_t prev_handle = 0;
-            VkImageView prev_view = VK_NULL_HANDLE;
-            Texture* prev_tex = nullptr;
-            bool have_prev = false;
-            for (uint32_t k = 0; k < d.count; k++) {
-                // (Fritchii d603d98bb) A handle word where a storage buffer of the same program keeps its address is not a
-                // handle: OoT's water samples each light's texture with a handle loaded per pixel from the light buffer, and
-                // the translation falls back to the first constant word on its path, c0[0x520], the light buffer's address.
-                // Its low bits named an unrelated texture that changed with the double-buffered buffer: the water flickered
-                // every other frame. No texture there now
-                // (fragment stages only, the water's case: in other stages (the foliage culling's) the textures went missing and
-                // the foliage was culled whenever Link swung his sword)
-                // (Handle tables now give those samples their own textures: this is for what the translation still cannot
-                // compute per draw)
-                const uint32_t handle = is_table ? table[k]
-                                        : (st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT && handle_is_storage_pointer(info, d, k))
-                                            ? 0u : handle_of(s, st, d, k);
-                desc_fp_note(handle);   // (Descriptor reuse)
-                Texture* tex = nullptr;
-                VkImageView view = VK_NULL_HANDLE;
-                if (is_table && have_prev && handle == prev_handle) {   // (a table repeats entries: unused ones are 0)
-                    view = prev_view, tex = prev_tex;
-                } else {
-                    upload_defer_ok = st.vk_stage != VK_SHADER_STAGE_COMPUTE_BIT;   // (a draw's: its new ASTC textures may wait a frame)
-                    view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex) : VK_NULL_HANDLE;
-                    upload_defer_ok = false;
-                    // (Lichii bd0171f7) A depth-compare sample of a colour texture is undefined and differs between vendors: a
-                    // handle read from memory (an unused or stale table entry) that names one binds nothing
-                    if (is_table && view && tex && d.is_depth && !is_depth_format(tex->format)) {
-                        static std::atomic<int> told{0};
-                        if (told++ < 8)
-                            logf("vk: handle table: element %u of program %016llx names texture #%u (format %d) for a depth "
-                                 "comparison: bound as nothing", k, (unsigned long long)p.key, tex->id, (int)tex->format);
-                        view = VK_NULL_HANDLE, tex = nullptr;
-                    }
-                    if (is_table) prev_handle = handle, prev_view = view, prev_tex = tex, have_prev = true;
-                }
-                // (the shader clamps its index to the last element: a table that names a texture there may run past the
-                // array, and its lights from that index on all take this one's texture. Said once)
-                if (is_table && k + 1 == d.count && view) {
-                    static std::atomic<bool> told{false};
-                    if (!told.exchange(true))
-                        logf("vk: handle table: last element %u of program %016llx names texture #%u: the table may have more "
-                             "entries than the array, and those take this texture (said once)", k, (unsigned long long)p.key,
-                             tex ? tex->id : 0);
-                }
-                if (dump_on()) dump_input('t', (uint32_t)(out.imgs.size() - 0), handle, view ? tex : nullptr);
-                if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
-                if (log_img_wanted(p.key)) {
-                    static std::atomic<int> told{0};
-                    if (told++ < 40)
-                        logf("vk: img prog %016llx texture %u: handle %#x, shader integer %d type %d depth %d, view format "
-                             "%d, texture #%d format %d %ux%ux%u x%u levels %u sparse %d view %p", (unsigned long long)p.key, k,
-                             handle, (int)d.is_integer, (int)d.type, (int)d.is_depth, (int)last_view_format,
-                             tex ? (int)tex->id : -1, tex ? (int)tex->format : -1, tex ? tex->width : 0, tex ? tex->height : 0,
-                             tex ? tex->depth : 0, tex ? tex->layers : 0, tex ? tex->levels : 0, tex ? (int)tex->sparse : 0,
-                             (void*)view);
-                }
-                if (dump_on() && view && tex && dump_sampled_wanted(p.key)) {
-                    static std::unordered_set<uint32_t> done;
-                    static int last_seq = 0;
-                    if (dump_seq() < last_seq) done.clear();
-                    last_seq = dump_seq();
-                    if (done.size() < 96 && done.insert(tex->id).second) dump_sampled().push_back(tex);
-                }
-                if (watch_prog() && p.key == watch_prog())
-                    watch_note("vk: watch %016llx: texture %u handle %#x -> #%u %#llx %ux%ux%u image %p view %p%s",
-                               (unsigned long long)p.key, k, handle, tex ? tex->id : 0, (unsigned long long)(tex ? tex->gpu : 0),
-                               tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
-                               (void*)view, view ? "" : " (dummy)");
-                if (view && tex && (tex->gpu_written || pending_clear_tracks(tex))) draw_sampled().push_back(tex);
-                if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
-                // (an image of one level: no anisotropy of the row's, sampler_make)
-                out.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth, tex && tex->levels <= 1), view,
-                                    VK_IMAGE_LAYOUT_GENERAL});
+            const uint64_t sgen = sampler_registrations_generation();
+            const uint64_t sframe = sampler_book.watching.load(std::memory_order_relaxed) ? texture_frame_no() : 0;
+            const uint32_t tepoch = texture_epoch();
+            uint64_t dgen = desc_destroy_seen;
+            const bool is_frag = st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+            const bool is_comp = st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT;
+            uint32_t sb_cbuf_mask = 0;
+            if (is_frag) {
+                for (const auto& sb : info.storage_buffers_descriptors)
+                    if (sb.cbuf_index < 32) sb_cbuf_mask |= 1u << sb.cbuf_index;
             }
-            w.pImageInfo = &out.imgs[first];
-            out.writes.push_back(w);
+            const bool fp_on = desc_fp_on;
+            auto& fp_vec = desc_fp();
+            auto& sampled_vec = draw_sampled();
+            const bool pc_active = pending_clear_tracks_any();
+            const bool diag_any = dump_on() || trace_tex_enabled() || log_img_wanted(p.key) || (watch_prog() && p.key == watch_prog());
+            for (const auto& d : info.texture_descriptors) {
+                VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d.count);
+                const size_t first = out.imgs.size();
+                const VkImageViewType vt = view_type(d.type);
+                static thread_local std::vector<uint32_t> table;
+                const bool is_table = d.handle_program != ~0U && d.count > 1;
+                if (is_table) table.resize(d.count), stage_handles(s, st, d.handle_program, d.count, table.data());
+                const bool check_ptr = is_frag && !is_table && d.handle_program == ~0U &&
+                                       (d.handle_is_pointer_word || (d.cbuf_index < 32 && (sb_cbuf_mask & (1u << d.cbuf_index))));
+                uint32_t prev_handle = 0;
+                VkImageView prev_view = VK_NULL_HANDLE;
+                Texture* prev_tex = nullptr;
+                bool have_prev = false;
+                for (uint32_t k = 0; k < d.count; k++) {
+                    const uint32_t handle = is_table ? table[k]
+                                            : (check_ptr && handle_is_storage_pointer(info, d, k))
+                                                ? 0u : handle_of(s, st, d, k);
+                    const uint32_t slot = handle & 0xFFFFF;
+                    const uint32_t ver = (fp_on || handle) ? texture_slot_version((int)slot) : 0u;
+                    if (fp_on) {
+                        fp_vec.push_back((uint64_t)ver << 20 | slot);
+                        desc_fp_dummy |= handle == 0;
+                    }
+                    Texture* tex = nullptr;
+                    VkImageView view = VK_NULL_HANDLE;
+                    if (is_table && have_prev && handle == prev_handle) {
+                        view = prev_view, tex = prev_tex;
+                    } else if (handle) {
+                        upload_defer_ok = !is_comp;
+                        view = texture_view_of_pre(handle, ver, dgen, tepoch, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex);
+                        upload_defer_ok = false;
+                        // (a texture_get miss may have evicted textures and bumped destroy_gen; refresh dgen if so)
+                        const uint64_t dgen_now = texture_destroy_generation();
+                        if (dgen_now != dgen) dgen = dgen_now;
+                        if (is_table && view && tex && d.is_depth && !is_depth_format(tex->format)) {
+                            static std::atomic<int> told{0};
+                            if (told++ < 8)
+                                logf("vk: handle table: element %u of program %016llx names texture #%u (format %d) for a depth "
+                                     "comparison: bound as nothing", k, (unsigned long long)p.key, tex->id, (int)tex->format);
+                            view = VK_NULL_HANDLE, tex = nullptr;
+                        }
+                        if (is_table) prev_handle = handle, prev_view = view, prev_tex = tex, have_prev = true;
+                    } else if (is_table) {
+                        prev_handle = 0, prev_view = VK_NULL_HANDLE, prev_tex = nullptr, have_prev = true;
+                    }
+                    if (is_table && k + 1 == d.count && view) {
+                        static std::atomic<bool> told{false};
+                        if (!told.exchange(true))
+                            logf("vk: handle table: last element %u of program %016llx names texture #%u: the table may have more "
+                                 "entries than the array, and those take this texture (said once)", k, (unsigned long long)p.key,
+                                 tex ? tex->id : 0);
+                    }
+                    if (diag_any) {
+                        if (dump_on()) dump_input('t', (uint32_t)(out.imgs.size() - 0), handle, view ? tex : nullptr);
+                        if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
+                        if (log_img_wanted(p.key)) {
+                            static std::atomic<int> told{0};
+                            if (told++ < 40)
+                                logf("vk: img prog %016llx texture %u: handle %#x, shader integer %d type %d depth %d, view format "
+                                     "%d, texture #%d format %d %ux%ux%u x%u levels %u sparse %d view %p", (unsigned long long)p.key, k,
+                                     handle, (int)d.is_integer, (int)d.type, (int)d.is_depth, (int)last_view_format,
+                                     tex ? (int)tex->id : -1, tex ? (int)tex->format : -1, tex ? tex->width : 0, tex ? tex->height : 0,
+                                     tex ? tex->depth : 0, tex ? tex->layers : 0, tex ? tex->levels : 0, tex ? (int)tex->sparse : 0,
+                                     (void*)view);
+                        }
+                        if (dump_on() && view && tex && dump_sampled_wanted(p.key)) {
+                            static std::unordered_set<uint32_t> done;
+                            static int last_seq = 0;
+                            if (dump_seq() < last_seq) done.clear();
+                            last_seq = dump_seq();
+                            if (done.size() < 96 && done.insert(tex->id).second) dump_sampled().push_back(tex);
+                        }
+                        if (watch_prog() && p.key == watch_prog())
+                            watch_note("vk: watch %016llx: texture %u handle %#x -> #%u %#llx %ux%ux%u image %p view %p%s",
+                                       (unsigned long long)p.key, k, handle, tex ? tex->id : 0, (unsigned long long)(tex ? tex->gpu : 0),
+                                       tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
+                                       (void*)view, view ? "" : " (dummy)");
+                    }
+                    if (view && tex && (tex->gpu_written || (pc_active && pending_clear_tracks(tex)))) sampled_vec.push_back(tex);
+                    if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
+                    out.imgs.push_back({sampler_for_fast((int)(handle >> 20), d.is_depth, tex && tex->levels <= 1, sgen, sframe), view,
+                                        VK_IMAGE_LAYOUT_GENERAL});
+                }
+                w.pImageInfo = &out.imgs[first];
+                out.writes.push_back(w);
+            }
         }
         for (const auto& d : info.image_descriptors) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, d.count);
@@ -4673,6 +4727,7 @@ struct Pushed {
 };
 TLS_OBJECT(pushed, std::array<Pushed, 2>)   // [graphics, compute]
 } // namespace
+void draw_flush_ub_reads() { ub_reads_flush(); }
 std::string state_list_snapshot(bool* present) { return state_list_bytes(present); }   // (vk_draw.h: the menu's)
 bool uniform_snapshot_on() {   // (vk_internal.h: ub_snapshot_wanted's answer for vk_memory.cpp's guard and vk_replay.cpp's parallel replay)
     static const bool on = ub_snapshot_wanted();
@@ -5777,7 +5832,15 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
         // session each, PR 952). The banks and c1, left out unchanged beside a draw's own new copies, draw right: what tells the
         // two apart is not known. Before the sharing each draw had copies of its own, so every one of its uniform buffer writes
         // had changed and was pushed: they still all are, the textures and storage buffers only when changed, as before
-        static const bool ub_every = ub_snapshot_wanted() && ub_snap_dedup_mode() == 1;
+        // (Batch 10I) The ub_every workaround is for Intel Windows driver 32.0.101.9154 (Arc B580) delta-push bug.
+        // On Mesa ANV (Linux), vkCmdPushDescriptorSetKHR properly retains unchanged UBO descriptors, allowing true
+        // delta-push and zero-push skips. RX_VK_UB_PUSH_EVERY=0/1 overrides.
+        static const bool ub_every = [] {
+            const char* e = getenv("RX_VK_UB_PUSH_EVERY");
+            if (e && *e) return atoi(e) != 0;
+            if (dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) return false;
+            return ub_snapshot_wanted() && ub_snap_dedup_mode() == 1;
+        }();
         const auto again = [&](const VkWriteDescriptorSet& w) { return ub_every && w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; };
         // (the same layout, so the same count of words in each write: compared and kept in place)
         for (size_t i = 0; i < wr.writes.size(); i++) {
@@ -5802,6 +5865,28 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
         return true;
     }
     ps.cmd = VK_NULL_HANDLE;   // (a set bound: what was pushed is not known to stay)
+    // (Batch 10I) Per-recording reuse cache for over-push-limit descriptor sets (e.g. clustered-light FS with >32 descriptors).
+    // Valid strictly within cur->ub_snap_epoch (sets live in cur->pool until the recording resets).
+    struct PoolSetCacheEntry {
+        uint64_t epoch = 0, hash = 0;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        std::vector<uint64_t> words;
+    };
+    static thread_local PoolSetCacheEntry set_cache[64];
+    static thread_local std::vector<uint64_t> cur_words;
+    cur_words.clear();
+    for (const VkWriteDescriptorSet& w : wr.writes) words_append(w, cur_words);
+    uint64_t sh = (uint64_t)(uintptr_t)p.set_layout * 0x9E3779B97F4A7C15ull ^ (uint64_t)cur_words.size();
+    for (uint64_t v : cur_words) sh = (sh ^ v) * 0xBF58476D1CE4E5B9ull;
+    sh ^= sh >> 31;
+    PoolSetCacheEntry& ce = set_cache[sh & 63];
+    const uint64_t rec_epoch = cur ? cur->ub_snap_epoch : 0;
+    if (rec_epoch && ce.epoch == rec_epoch && ce.hash == sh && ce.layout == p.set_layout && ce.set != VK_NULL_HANDLE &&
+        ce.words == cur_words) {
+        vkCmdBindDescriptorSets(cmd, bp, p.layout, 0, 1, &ce.set, 0, nullptr);
+        return true;
+    }
     if (g_fine) {
         fine_n[FC_POOL_SETS]++;
         for (const VkWriteDescriptorSet& w : wr.writes) fine_n[FC_POOL_DESCS] += w.descriptorCount;
@@ -5831,6 +5916,10 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
     for (auto& w : wr.writes) w.dstSet = set;
     vkUpdateDescriptorSets(dev.device, (uint32_t)wr.writes.size(), wr.writes.data(), 0, nullptr);
     vkCmdBindDescriptorSets(cmd, bp, p.layout, 0, 1, &set, 0, nullptr);
+    if (rec_epoch) {
+        ce.epoch = rec_epoch, ce.hash = sh, ce.layout = p.set_layout, ce.set = set;
+        ce.words.swap(cur_words);
+    }
     return true;
 }
 
@@ -6125,6 +6214,7 @@ inline bool pending_clear_has(const PendingClear& pc, const Texture* tex) {
     return false;
 }
 bool pending_clear_tracks(const Texture* tex) { return pending_clear_has(pending_clear(), tex); }
+bool pending_clear_tracks_any() { return pending_clear().active; }
 inline bool pending_clear_untouched(const PendingClear& pc, const std::vector<const Texture*>& sampled) {
     if (!pc.active) return true;
     for (const Texture* t : sampled)
@@ -7095,6 +7185,7 @@ VkCommandBuffer demote_cmd_outside_pass() {
 } // namespace
 
 void draw_flush_recording(int slot) {
+    ub_reads_flush();
     ParLock lk;
     const RecordingRes& r = res[slot];
     // Earlier descriptors still name streams we outgrew; later retained streams were not used this recording.
@@ -7106,6 +7197,7 @@ void draw_flush_recording(int slot) {
 }
 
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
+    ub_reads_flush();
     rec_cmd = cmd;
     rec_value = value;
     texture_set_demote_cmd_fn(demote_cmd_outside_pass);
@@ -9468,7 +9560,7 @@ int mfb_batch_add(NvnState& s, const DrawArgs& d) {
     std::swap(it.sampled, draw_sampled());
     it.fp_on = desc_fp_on;
     if (desc_fp_on) {
-        it.fp = desc_fp();
+        it.fp.swap(desc_fp());
         it.fp_dummy = desc_fp_dummy;
         it.samp = desc_samp_seen;
         it.destroy = desc_destroy_seen;
@@ -10085,7 +10177,7 @@ static void draw_impl(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, const
     if (dump_on()) log_dump_draw(s, p, d);
     PROF_HOT(PROF_CMDS);
     texture_watch_prog(p.key);
-    if (!pre && !same_desc) gfx_sampled() = draw_sampled();
+    if (!pre && !same_desc) gfx_sampled().swap(draw_sampled());
     static const bool barrier_every = env_on("RX_VK_BARRIER_EVERY_DRAW");   // (an experiment: a pass each)
     if (barrier_every) end_pass(cmd);
     reactive_scene_draw(cmd, p, s, at);
@@ -10219,7 +10311,7 @@ static void draw_impl(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, const
         cb.desc.ub = ub_gen, cb.desc.dgen = texture_destroy_generation();
         cb.desc.fp_on = desc_fp_on;
         if (desc_fp_on)   // (Descriptor reuse: what its handles resolved; the next such draw may keep it through other slots' churn)
-            cb.desc.fp = desc_fp(), cb.desc.fp_dummy = desc_fp_dummy, cb.desc.samp = desc_samp_seen,
+            cb.desc.fp.swap(desc_fp()), cb.desc.fp_dummy = desc_fp_dummy, cb.desc.samp = desc_samp_seen,
             cb.desc.destroy = desc_destroy_seen;
     } else {
         st_desc_reused++;

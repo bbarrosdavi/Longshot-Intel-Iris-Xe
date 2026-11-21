@@ -241,8 +241,11 @@ inline int words_same_store(const VkWriteDescriptorSet& w, uint64_t* o, const ui
     if ((size_t)(end - o) != 1 + (size_t)w.descriptorCount * per) return -1;
     bool same = true;
     auto put = [&](uint64_t v) {
-        same &= *o == v;
-        *o++ = v;
+        if (*o != v) {
+            same = false;
+            *o = v;
+        }
+        o++;
     };
     put((uint64_t)w.descriptorType << 32 | w.dstBinding);
     for (uint32_t k = 0; k < w.descriptorCount; k++) {
