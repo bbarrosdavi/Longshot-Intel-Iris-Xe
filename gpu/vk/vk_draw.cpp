@@ -7899,10 +7899,25 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
         // programs the same position to the last bit, and the ground came out in holes: the sky through them, a white forest.
         // A small margin towards the camera instead. RX_VK_EQ_BIAS=<units>, 0: as the game asks
         static const float eq_bias = dev.policy.equal_depth_bias;   // (device_policy.h: 64 on Intel, then the switch)
+        static const bool eq_skip_alpha = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
         if (eq_bias > 0 && d.dt && !d.dw && d.dop == VK_COMPARE_OP_EQUAL) {
-            d.dop = VK_COMPARE_OP_LESS_OR_EQUAL;
-            d.bias_en = VK_TRUE;
-            d.bias[0] = -eq_bias, d.bias[1] = 0.0f, d.bias[2] = 0.0f;
+            bool skip_bias = false;
+            if (eq_skip_alpha) {
+                if (s.color.blend_en & 1u) {
+                    skip_bias = true;
+                } else {
+                    for (const Stage& st : p.stages)
+                        if (st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT && st.info.uses_demote_to_helper_invocation) {
+                            skip_bias = true;
+                            break;
+                        }
+                }
+            }
+            if (!skip_bias) {
+                d.dop = VK_COMPARE_OP_LESS_OR_EQUAL;
+                d.bias_en = VK_TRUE;
+                d.bias[0] = -eq_bias, d.bias[1] = 0.0f, d.bias[2] = 0.0f;
+            }
         }
     }
     d.st = stencil && s.ds.st;

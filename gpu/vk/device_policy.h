@@ -503,11 +503,11 @@ inline DevicePolicy device_policy(const DeviceFacts& f) {
     }
     p.frag_shuffle_fallback = f.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY;
     p.position_invariant = !f.nvidia();
-    // (opt/iris-xe) Mesa ANV honours OpDecorate Position Invariant (position_invariant=true), so
-    // depth prepass and colour pass match bit-for-bit without equal_depth_bias. Keeping 64 turns
-    // EQUAL into LESS_OR_EQUAL, causing alpha-tested Z-prepass geometry (Link's hair cards, foliage)
-    // to draw solid black transparent fringes over faces/backgrounds and defeat Early-Z.
-    p.equal_depth_bias = (f.intel() && f.driver_id != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) ? 64.0f : 0.0f;
+    // (opt/iris-xe) Keep 64.0f on all Intel GPUs (including Mesa ANV) so distant terrain never fails
+    // EQUAL depth tests ("white forest" flashing hillside under FSR3 jitter); vk_draw.cpp skips
+    // equal_depth_bias on Mesa ANV alpha-tested (discard) and blended draws so close-up hair cards
+    // stay free of black fringes.
+    p.equal_depth_bias = f.intel() ? 64.0f : 0.0f;
     p.mesh_no_optimizer = f.amd() && !f.radv();
     // (corrected: the driver the deadlock is in, RADV, and not "AMD off Windows", which also took AMDVLK. To go back:
     // !f.windows && f.amd(), here and in create_device)

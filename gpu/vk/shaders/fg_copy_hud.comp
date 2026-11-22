@@ -1,10 +1,8 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-// (Batch 12B) Fused game-frame crop copy + direct game-slot write + HUD alpha mask into fg.frames[cur].a.
-// Alpha = 0.0 marks HUD pixels (opaque, semi-transparent, or animated), 1.0 marks clean 3D scene pixels:
-//   - hud_mode bit 0 (1): exact before/after diff against temporal upscale output (s.output vs out after HUD);
-//     bit 2 (4): square s.output before comparing (matches dlss_out.comp kSquare=true for SDR).
-//   - hud_mode bit 1 (2): motion-contradiction HUD fallback (dlss=0): static pixel where 3D MV > 4 px.
+// (Batch 14) Fused game-frame crop copy + direct game-slot write + 1px RCAS-safe HUD alpha mask into fg.frames[cur].a.
+// Alpha = 0.0 marks HUD pixels (+ 1px cross border so RCAS sharpening halos around HUD icons never smear into 3D),
+// 1.0 marks clean 3D scene pixels.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1) uniform sampler2D aux0;   // mode 1: s.output (before HUD); mode 2: prev fg.frame
@@ -21,6 +19,14 @@ layout(push_constant) uniform P {
     vec2 mv_scale;
 } pc;
 
+bool hud_diff_at(ivec2 p, bool sq) {
+    vec3 before = max(texelFetch(aux0, p, 0).rgb, vec3(0.0));
+    if (sq) before *= before;
+    const vec3 after = texelFetch(aux1, p, 0).rgb;
+    const vec3 tol = max(vec3(0.004), before * vec3(0.016, 0.016, 0.032));
+    return any(greaterThan(abs(before - after), tol));
+}
+
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(g, pc.size))) return;
@@ -29,12 +35,13 @@ void main() {
     if (pc.write_game != 0) imageStore(dst_game, g, vec4(vec3(c), 1.0));
     bool is_hud = false;
     if ((pc.hud_mode & 1) != 0) {
-        vec3 before = max(texelFetch(aux0, q, 0).rgb, vec3(0.0));
-        if ((pc.hud_mode & 4) != 0) before *= before;
-        const vec3 after = texelFetch(aux1, q, 0).rgb;
-        // B10G11R11 quantization tolerance: R11/G11 have 6-bit mantissa (~0.8%), B10 has 5-bit (~1.6%).
-        const vec3 tol = max(vec3(0.004), before * vec3(0.016, 0.016, 0.032));
-        is_hud = any(greaterThan(abs(before - after), tol));
+        const bool sq = (pc.hud_mode & 4) != 0;
+        const ivec2 hi = textureSize(aux0, 0) - 1;
+        is_hud = hud_diff_at(q, sq) ||
+                 hud_diff_at(min(q + ivec2(1, 0), hi), sq) ||
+                 hud_diff_at(max(q - ivec2(1, 0), ivec2(0)), sq) ||
+                 hud_diff_at(min(q + ivec2(0, 1), hi), sq) ||
+                 hud_diff_at(max(q - ivec2(0, 1), ivec2(0)), sq);
     } else if ((pc.hud_mode & 2) != 0) {
         const f16vec3 prev = f16vec3(texelFetch(aux0, g, 0).rgb);
         const f16vec3 d = abs(c - prev);

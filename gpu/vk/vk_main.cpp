@@ -236,14 +236,11 @@ bool create_instance() {
     }
 #endif
 #ifndef _WIN32
-    // (longshot) Mesa's Intel compiler (driconf shader_spilling_rate, read when the driver loads, ignored by the others): when a
-    // program does not fit its registers it spills some and allocates the whole program again, rounds of one at first and then
-    // of (spilled so far / rate). Held to 32 lanes an Iris Xe has 32 registers a lane, and MKW's large compute programs spill
-    // thousands: at Mesa 26.2's default abccf81b45c5eb50, which play dispatches, was not built after 20 minutes and 13 GB, at 2
-    // in 32 s and 1.7 GB; 7a548525c239b91b 531 s and 7.6 GB, at 2 87 s and 4 GB (i9-13900H, 2026-11-14). The programs that do
-    // not spill are built as before; the driver's estimate of those that do moved from 12% better to 53% worse (3 was 165 s for
-    // abccf81b45c5eb50, 4 not built in 8 minutes). A value the player set is kept
-    setenv("shader_spilling_rate", "2", 0);
+    // (longshot) Do not force shader_spilling_rate=2 on Mesa ANV: at rate=2 Mesa 26.2's Gen12 register spiller
+    // over-spills heavy PBR fragment shaders (53% worse register pressure) and triggers a Gen12 spill corruption bug
+    // (neon RGB=76.0 4x2 blocks on shadowed windows/ledges/crates). With compute_pin unpinning 32-lane compute shaders,
+    // Mesa's default spilling rate (11) compiles all OoT compute shaders in <2 s with zero neon artifacts.
+    // A value the player set via shader_spilling_rate is still respected.
 #endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "mkw-recomp";
