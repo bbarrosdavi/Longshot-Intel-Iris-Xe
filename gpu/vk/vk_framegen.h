@@ -51,6 +51,7 @@ struct PendingPresent {
 extern thread_local PendingPresent* present_defer_into;
 bool present_commit(const PendingPresent& p);   // (false: not shown, nothing deferred or a swapchain made again since)
 VkFence present_last_fence();   // (Batch 10J: last direct present_image GPU copy fence on this thread)
+bool present_next_slot_ready(); // (Batch 12A: non-blocking check that next present slot's fence is already signaled)
 /// The Insert menu's output effects at dw x dh: window scaling/sharpness/sides, then the optional SDR CRT.
 /// Returns null when Off or unavailable, leaving the existing direct-copy path. CRT runs after frame generation.
 /// pq: src is Native HDR10, scaled in RGB10A2; the SDR CRT is bypassed, never applied to PQ codes.

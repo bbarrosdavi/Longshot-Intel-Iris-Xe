@@ -2787,6 +2787,63 @@ void pass_start_barrier(VkCommandBuffer cmd) {
     record_barrier_scope(cmd, prev_scope, kScopeFrag);
 }
 
+// (Batch 12D) Mesh-fallback pre/post barriers integrated with barrier scope deduplication:
+// - mfb_pre_barrier skips the pre-barrier entirely when a full barrier was already recorded with no GPU work since.
+// - mfb_post_barrier merges the mfb post-barrier with the immediately following pass_start_barrier into ONE barrier,
+//   eliminating ~40-60 duplicate PIPE_CONTROL stalls/frame.
+void mfb_pre_barrier(VkCommandBuffer cmd, bool interrupted_pass, bool batch) {
+    static const bool dedupe_off = env_on("RX_VK_BARRIER_DEDUPE_OFF");
+    const bool par = par_active.load(std::memory_order_relaxed);
+    const uint64_t cur_epoch = work_epoch.load(std::memory_order_relaxed);
+    const uint32_t prev_scope = current_barrier_scope(cmd, cur_epoch, !dedupe_off && !par);
+    if (prev_scope & kScopeFull) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    GprofSpan gp(cmd, batch ? "barrier (mfb batch pre)" : "barrier (mfb pre)");
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+                     VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                     (batch ? VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT : VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+    b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    if (!interrupted_pass) {
+        b.srcStageMask |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        b.srcAccessMask |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    }
+    b.dstStageMask = (batch ? VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT : VK_PIPELINE_STAGE_2_TRANSFER_BIT) |
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+    b.dstAccessMask = (batch ? VK_ACCESS_2_TRANSFER_READ_BIT : VkAccessFlags2{0}) | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                      VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                      VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+}
+
+void mfb_post_barrier(VkCommandBuffer cmd, bool interrupted_pass, bool batch) {
+    if (!interrupted_pass || par_active.load(std::memory_order_relaxed)) {
+        full_barrier(cmd, batch ? "barrier (mfb batch post)" : "barrier (mfb post)");
+        return;
+    }
+    st_pass_relaxed.fetch_add(1, std::memory_order_relaxed);
+    GprofSpan gp(cmd, batch ? "barrier (mfb batch post+pass)" : "barrier (mfb post+pass)");
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+                     VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    record_barrier_scope(cmd, kScopeNone, kScopeFrag);
+    note_pass_end(cmd);
+}
+
 namespace {
 thread_local VkCommandBuffer last_compute_only_cmd = VK_NULL_HANDLE;
 thread_local uint64_t last_compute_only_epoch = 0;

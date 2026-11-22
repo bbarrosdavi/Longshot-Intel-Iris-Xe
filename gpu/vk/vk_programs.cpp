@@ -242,12 +242,15 @@ void load_work(LoadJob& job) {
                 } else {
                     census.load_computes_cold++;   // (its first dispatch asks again, and compiles on a worker: as before)
                 }
-            } else if (notes != index_notes.end()) {
-                for (const NoteAt& n : notes->second) {
-                    if (n.variant != p->variant || !pipe_note_at(notes_in, n.at, note.get())) continue;
-                    bytes += (int64_t)sizeof(PipeNote);
-                    if (const VkPipeline pl = source.graphics(*p, *note)) census.load_pipes += pipeline_keep_ready(n.key, pl);
-                    else census.load_pipes_cold++;   // (its first draw makes it, as before)
+            } else {
+                if (p->fallback) (void)fallback_compute_from_caches(*p);
+                if (notes != index_notes.end()) {
+                    for (const NoteAt& n : notes->second) {
+                        if (n.variant != p->variant || !pipe_note_at(notes_in, n.at, note.get())) continue;
+                        bytes += (int64_t)sizeof(PipeNote);
+                        if (const VkPipeline pl = source.graphics(*p, *note)) census.load_pipes += pipeline_keep_ready(n.key, pl);
+                        else census.load_pipes_cold++;   // (its first draw makes it, as before)
+                    }
                 }
             }
             census.load_programs++;
@@ -419,6 +422,7 @@ void programs_index(std::vector<NoteRef> notes, const std::unordered_set<uint64_
          notes.size(), index_notes.size(), index_signatures.size(), index_computes.size(), ms_between(t0, Clock::now()), index_kept.size(),
          workers_cap(false), workers_cap(true), pipeline_source().name());
 }
+bool programs_indexed() { return index_ready.load(std::memory_order_acquire); }
 
 void programs_slow_upload(double ms, uint32_t width, uint32_t height, uint32_t nvn_format) {
     if (!programs_life_flag) return;
@@ -443,7 +447,7 @@ void module_ids_on() {
 }
 
 void programs_frames_note() {
-    if (!programs_load_at_create()) return;
+    if (!programs_load_at_create() || !precompile_covers_notes()) return;
     // (what the loads at create calls asked of the caches and no cache had: load_work counts them)
     const long long lacked = census.load_pipes_cold.load(std::memory_order_relaxed) + census.load_computes_cold.load(std::memory_order_relaxed);
     if (!load_default::caches_lacked(lacked) || wait_marked.exchange(true)) return;

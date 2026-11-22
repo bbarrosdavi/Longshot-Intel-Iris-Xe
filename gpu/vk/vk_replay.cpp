@@ -368,6 +368,8 @@ VkQueryPool ts_pool = VK_NULL_HANDLE;
 bool ts_pending[kRecordings];
 int64_t st_gpu_ns, st_gpu_max_ns;
 // (frame overlap, below with the render thread: what each recording did, and the GPU's time between recordings)
+bool fo_tracking();
+void fo_log(double frames);
 void fo_recording_begin(const Recording& r);
 void fo_recording_end(const Recording& r);
 void fo_collect(const Recording& r, const uint64_t* t);
@@ -1002,6 +1004,7 @@ std::unordered_map<uint64_t, uint32_t> ev_values;
 // (longshot) The CPU's signals, while a replay holds replay_mu: the main thread stopped for it in nvnEventSignal, ~1.7 ms
 // a frame of the critical path. They wait here for the replay's next look at the events (ev_cpu_apply).
 std::mutex ev_cpu_mu;
+std::condition_variable ev_cpu_cv;
 std::vector<std::pair<uint64_t, uint32_t>> ev_cpu_pending;
 std::atomic<bool> ev_cpu_any{false};
 // (longshot) how many signals the CPU has made, and how many of them a look at the stopped queues has been taken since
@@ -2290,7 +2293,22 @@ void maybe_split(VkCommandBuffer& cmd) {
     static const int64_t every = getenv("RX_VK_CHUNK")
                                      ? atoll(getenv("RX_VK_CHUNK"))
                                      : (dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ? 720 : 240);
-    if (split_off || !rec_cur || every <= 0 || ++part_work < every || rec_parts + 1 >= kMaxParts || dump_on()) return;
+    // (Batch 12B) On Mesa Intel, kick off part 0 early (default 120 draws) ONLY when the GPU is idle or on its last
+    // recording, cutting the 10-13 ms idle-GPU bubble after frame N-1 finishes while keeping RX_VK_CHUNK=720 batching
+    // for all subsequent parts when the GPU is already busy. RX_VK_FIRST_CHUNK=0 disables.
+    static const int64_t first_every = getenv("RX_VK_FIRST_CHUNK")
+                                           ? atoll(getenv("RX_VK_FIRST_CHUNK"))
+                                           : (dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ? 120 : 0);
+    if (split_off || !rec_cur || every <= 0 || rec_parts + 1 >= kMaxParts || dump_on()) return;
+    ++part_work;
+    bool want = part_work >= every;
+    if (!want && rec_parts == 0 && first_every > 0 && first_every < every &&
+        part_work >= first_every && (part_work % first_every) == 0 && rec_timeline) {
+        uint64_t done_seq = 0;
+        if ((::vkx::vkGetSemaphoreCounterValue)(dev.device, rec_timeline, &done_seq) == VK_SUCCESS && done_seq + 1 >= rec_seq)
+            want = true;
+    }
+    if (!want) return;
     if (part_ends_before_draw()) {   // (at the next plain draw: replay(). The submission's end comes first when none follows)
         part_end_wanted = true;
         return;
@@ -2962,7 +2980,11 @@ void update_blocked() {
     for (const auto& [queue, q] : qruns) n += q.blocked();
     ev_wait_in_memory.store(n && waits_on_memory_event(), std::memory_order_release);
     if (n && !blocked_n.load()) blocked_since = std::chrono::steady_clock::now();
-    blocked_n = n;
+    blocked_n.store(n, std::memory_order_release);
+    if (n && ev_cpu_any.load(std::memory_order_acquire)) {
+        std::lock_guard ek(ev_cpu_mu);
+        ev_cpu_cv.notify_one();
+    }
     if (!n) {   // (the stopped work has gone on: its releases now)
         std::vector<nvn_tex> ts;
         std::vector<nvn_prog> ps;
@@ -2991,9 +3013,29 @@ void log_order_stats() {
 // ~8 a frame. The burst's recording is tagged with the newest value among them (what is used in it is kept until
 // that one is done; the timeline is signalled at its end as far as allowed, as for any). ----
 bool burst_open = false;
+bool burst_holds_replay = false;
 uint64_t burst_value = 0;
+// (Batch 12E-CPU) Hold replay_mu (DrainingMutex) across the entire burst instead of unlocking after each
+// run_submit/resume_queue inside the burst: avoids mid-burst synchronous recorder drains while rec_cur is still open.
+struct ReplayBurstLock {
+    bool own = false;
+    ReplayBurstLock() {
+        if (burst_open) {
+            if (!burst_holds_replay) replay_mu.lock(), burst_holds_replay = true;
+        } else {
+            replay_mu.lock();
+            own = true;
+        }
+    }
+    ~ReplayBurstLock() {
+        if (own) replay_mu.unlock();
+    }
+    ReplayBurstLock(const ReplayBurstLock&) = delete;
+    ReplayBurstLock& operator=(const ReplayBurstLock&) = delete;
+};
 void burst_begin(uint64_t value) {
     burst_open = !dump_on();
+    burst_holds_replay = false;
     burst_value = value;
     for (const auto& [queue, q] : qruns) {
         if (q.waiting) burst_value = std::max(burst_value, q.value);
@@ -3005,9 +3047,14 @@ void rb_span_close();   // (RX_VK_LOG_RB_WRITERS: below, with the readback's)
 void burst_end() {
     if (!burst_open) return;
     burst_open = false;
-    {
-        std::lock_guard lk(replay_mu);
-        if (rec_cur) rb_span_close(), finish_recording(burst_value);
+    if (rec_cur) {
+        if (!burst_holds_replay) replay_mu.lock(), burst_holds_replay = true;
+        rb_span_close();
+        finish_recording(burst_value);
+    }
+    if (burst_holds_replay) {
+        burst_holds_replay = false;
+        replay_mu.unlock();
     }
     // (the looks taken in this burst count only now: what they let on is recorded, its write-backs are in the page table
     // and its recording is submitted. Said at the look's end, a readback that came before this point found the counts
@@ -3049,6 +3096,15 @@ bool async_on();
 // keeping helper threads made on first use inside a replay off the reserved core, as Windows does)
 uint64_t replay_pin_mask() {
     static const uint64_t m = [] {
+        if (const char* e = getenv("RX_VK_REPLAY_PIN_MASK")) {
+            char* end = nullptr;
+            const uint64_t v = strtoull(e, &end, 16);
+            if (end && end != e && *end == '\0') {
+                if (v) logf("vk: replays run on logical processors %#llx while they replay (RX_VK_REPLAY_PIN_MASK)", (unsigned long long)v);
+                else logf("vk: RX_VK_REPLAY_PIN_MASK=0: replays not pinned");
+                return v;
+            }
+        }
         const uint64_t r = host->reserved_cpus ? host->reserved_cpus() : 0;
         if (r) logf("vk: replays run on logical processors %#llx while they replay", (unsigned long long)r);
         return r;
@@ -3063,7 +3119,10 @@ struct ReplayPin {
         if (async_on()) return;
         counted = true;
         if (replay_pin_depth++) return;   // (the outermost one: a submit's replay inside its capture's)
-        if (const uint64_t m = replay_pin_mask()) replay_pin_prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)m);
+        if (const uint64_t m = replay_pin_mask()) {
+            const DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)m);
+            replay_pin_prev = prev == (DWORD_PTR)m ? 0 : prev;
+        }
     }
     ~ReplayPin() {
         if (!counted || --replay_pin_depth) return;
@@ -3078,7 +3137,7 @@ struct ReplayPin {
 /// memory_work: its memory work first (else done as it came)
 bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, bool memory_work, int cb = 0,
                 const uint8_t* p = nullptr, bool may_stop = false) {
-    std::lock_guard lk(replay_mu);
+    ReplayBurstLock lk;
     ReplayPin pin;
     SlowWatch slow("submit");
     PROF(PROF_SUBMIT);
@@ -3160,7 +3219,7 @@ void resume_queue(uint64_t queue, bool forced) {
                 cpu_event = cpu_events.count(wait_at(q.p).gpu) != 0;
             }
             if (cpu_event) {
-                std::lock_guard lk(replay_mu);
+                ReplayBurstLock lk;
                 if (rec_cur) rb_span_close(), finish_recording(burst_open ? burst_value : q.value);   // (its mirrors synced again after)
                 memory_capture_now(q.value, completed());
                 st_resume_captures++;
@@ -3284,11 +3343,31 @@ std::atomic<int> gpu_waiters{0};   // (the game's threads in a wait for the GPU 
 std::atomic<int64_t> st_hold_gpu{0}, st_hold_gpu_forced{0};
 void sync_watch() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk order");
+    uint64_t seen_signals = 0;
     for (;;) {
-        Sleep(1);
-        if (!blocked_n.load()) continue;
+        const bool had_blocked = blocked_n.load(std::memory_order_acquire) > 0;
+        const uint64_t cur_sig = ev_cpu_signals.load(std::memory_order_acquire);
+        if (!had_blocked || cur_sig == seen_signals) {
+            std::unique_lock ek(ev_cpu_mu);
+            if (blocked_n.load(std::memory_order_acquire) > 0) {
+                ev_cpu_cv.wait_for(ek, std::chrono::milliseconds(1), [&] {
+                    return ev_cpu_signals.load(std::memory_order_acquire) != seen_signals;
+                });
+            } else {
+                ev_cpu_cv.wait_for(ek, std::chrono::milliseconds(4), [&] {
+                    return blocked_n.load(std::memory_order_acquire) > 0 &&
+                           ev_cpu_signals.load(std::memory_order_acquire) != seen_signals;
+                });
+            }
+        }
+        if (!blocked_n.load(std::memory_order_acquire)) continue;
         std::unique_lock lk(sync_order_mu, std::try_to_lock);
-        if (!lk) continue;
+        if (!lk) {
+            // Avoid busy-spinning while another thread holds sync_order_mu during replay.
+            Sleep(1);
+            continue;
+        }
+        seen_signals = ev_cpu_signals.load(std::memory_order_acquire);
         burst_begin(0);   // (a signal from the CPU the thread that made it could not act on)
         schedule();
         burst_end();
@@ -5289,7 +5368,7 @@ std::shared_ptr<std::vector<uint8_t>> shot_pixels(uint64_t at_value, int64_t at_
     const uint8_t* const sm = (const uint8_t*)shot_maps[at_present & 1];
     return std::make_shared<std::vector<uint8_t>>(sm, sm + (size_t)kShotW * kShotH * 4);
 }
-void do_present(const nvn_tex* t, const int crop[4]) {
+void do_present(const nvn_tex* t, const int crop[4], uint64_t* wait_out = nullptr) {
     static PendingShot pending;
     // (longshot) NVIDIA Reflex (vk_reflex.cpp): this frame's simulation ended, its submission starts; on the way out (after the
     // present) the driver's sleep until the next frame should begin. AMD Anti-Lag 2 (vk_antilag.cpp) waits there as well: the
@@ -5311,6 +5390,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
     bool shot = false, interpolated = false;
     VkImage made_src = VK_NULL_HANDLE;
     VkImage headless_fx = VK_NULL_HANDLE;   // CRT output at the capture pixel grid, reused by both screenshot routes
+    uint64_t wait_old = 0;
     {
         std::lock_guard lk(replay_mu);
         bench_frame(presents);
@@ -5504,12 +5584,12 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             if (ahead > 0) {
                 const uint64_t old = values[presents % ahead];
                 values[presents % ahead] = value;
-                if (old) wait_value(old);
+                if (old) wait_old = old;
             } else if (!env_set && interpolated && dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
                 const uint64_t old = fg_values[fg_seq & 1];
                 fg_values[fg_seq & 1] = value;
                 fg_seq++;
-                if (old) wait_value(old);
+                if (old) wait_old = old;
             } else if (!interpolated && fg_seq) {
                 fg_values[0] = fg_values[1] = 0;
                 fg_seq = 0;
@@ -5709,6 +5789,11 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             pending = {true, value, presents, {}};
         }
         log_frame_stats();
+    }
+    if (!async_on() && fo_tracking() && presents % 120 == 0) fo_log(120.0);
+    if (wait_old) {
+        if (wait_out) *wait_out = wait_old;
+        else wait_value(wait_old);
     }
     if (dev.offscreen) frame_log_present();   // (no window: the copy into the offscreen image above is its present)
     if (dev.offscreen || interpolated) return;
@@ -5914,6 +5999,14 @@ static bool present_out(uint32_t index, std::unique_lock<std::mutex>& qk);   // 
 thread_local PendingPresent* present_defer_into = nullptr;
 static thread_local VkFence tl_present_last_fence = VK_NULL_HANDLE;
 VkFence present_last_fence() { return tl_present_last_fence; }
+bool present_next_slot_ready() {
+    std::unique_lock lk(present_image_mu, std::try_to_lock);
+    if (!lk.owns_lock() || !dev.swapchain) return false;
+    const uint32_t slots = framegen_on() ? std::clamp<uint32_t>(dev.swap_slots.load(std::memory_order_relaxed), 3u,
+                                                                 (uint32_t)kPresentSlotsMax) : 3u;
+    const Frame& f = frames[frame_index % slots];
+    return f.done != VK_NULL_HANDLE && vkWaitForFences(dev.device, 1, &f.done, VK_TRUE, 0) == VK_SUCCESS;
+}
 static VkFence present_copy_done = VK_NULL_HANDLE;   // (present_image's copy, while it presents: the presenter thread may take it)
 namespace {
 bool present_thread_on();
@@ -6727,7 +6820,7 @@ int presents_ahead() {   // (RX_VK_PRESENTS_AHEAD=<n>: how many presents the gam
 // between recordings, idle and in upload command buffers, by where in the frame (bh_log's second line).
 /// Whether recordings are counted: the render thread, its recordings made in order
 bool fo_tracking() {
-    static const bool on = async_on() && !par_threads();
+    static const bool on = (async_on() || env_on("RX_VK_FRAME_OVERLAP")) && !par_threads();
     return on && rec_timeline != VK_NULL_HANDLE;
 }
 struct FoSlot {
@@ -7322,15 +7415,39 @@ void present(const nvn_tex* t, const int crop[4]) {
     programs_presented();   // (the programs' life: whether the game is in a load)
     FpsRender fr;
     if (!async_on()) {
-        std::lock_guard order(sync_order_mu);
-        ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
-        if (sync_waits_on()) {
-            drain(0);   // (the frame's work whole before it is shown)
-            update_blocked();
-            present_value = ++q_values;
-            return do_present(t, crop);
+        uint64_t wait_old = 0;
+        {
+            std::unique_lock order(sync_order_mu);
+            if (sync_waits_on() && blocked_n.load(std::memory_order_acquire)) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold_ms());
+                while (cpu_wait_unmet()) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) break;
+                    const uint64_t sig0 = ev_cpu_signals.load(std::memory_order_acquire);
+                    order.unlock();
+                    {
+                        std::unique_lock ek(ev_cpu_mu);
+                        ev_cpu_cv.wait_until(ek, deadline, [&] {
+                            return ev_cpu_signals.load(std::memory_order_acquire) != sig0;
+                        });
+                    }
+                    order.lock();
+                }
+            }
+            ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
+            if (sync_waits_on()) {
+                drain(0);   // (the frame's work whole before it is shown)
+                update_blocked();
+                present_value = ++q_values;
+                if (fo_tracking()) fo_present.store(present_value, std::memory_order_release);
+            }
+            do_present(t, crop, &wait_old);
         }
-        return do_present(t, crop);
+        if (wait_old) {
+            FpsWait gpu_wait(fps_stats::kWaitGpu);
+            wait_value(wait_old);
+        }
+        return;
     }
     {   // (the render thread's whole frames, gate_on) The present is handed over after the CPU's signal its frame's work waits
         // for: the main thread makes that signal when it has written the frame's data, and the presenting thread, its poll
@@ -7424,11 +7541,14 @@ void register_texture_queued(int id, const nvn_tex* t, const nvn_view* v) {
 }
 void event_signal_queued(uint64_t gpu, uint32_t value) {
     if (!async_on()) {
-        std::lock_guard lk(ev_cpu_mu);
-        ev_cpu_pending.emplace_back(gpu, value);
-        ev_cpu_captures[gpu] = memory_captures_begun();   // (after the game's writes for it: cpu_signal_uncaptured)
-        ev_cpu_any.store(true, std::memory_order_release);
-        ev_cpu_signals.fetch_add(1, std::memory_order_release);   // (after it is in the list: schedule)
+        {
+            std::lock_guard lk(ev_cpu_mu);
+            ev_cpu_pending.emplace_back(gpu, value);
+            ev_cpu_captures[gpu] = memory_captures_begun();   // (after the game's writes for it: cpu_signal_uncaptured)
+            ev_cpu_any.store(true, std::memory_order_release);
+            ev_cpu_signals.fetch_add(1, std::memory_order_release);   // (after it is in the list: schedule)
+        }
+        ev_cpu_cv.notify_all();
         return;   // (sync_watch or the next submit lets the stopped ones on: not this thread, ~1.7 ms a frame of the critical path)
     }
     Job j{JOB_EVENT_SIGNAL};

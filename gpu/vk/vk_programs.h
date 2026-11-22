@@ -31,6 +31,8 @@ void programs_frames_note();
 /// (precompile_run, before play) what a create call looks its program up in: every note by its place, and the compute
 /// programs the lists name
 void programs_index(std::vector<NoteRef> notes, const std::unordered_set<uint64_t>& compute_keys);
+/// Whether programs_index has already initialized load-at-create tables for this session
+bool programs_indexed();
 /// (program_cache_load, shader_mu held) a load queued for that program key is run here if no worker has begun it, or waited for,
 /// and what it read is published before this returns
 void programs_load_wait(uint64_t key);

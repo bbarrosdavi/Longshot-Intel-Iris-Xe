@@ -4753,6 +4753,8 @@ VkResult extern_guarded_graphics(VkPipelineCache cache, const VkGraphicsPipeline
 VkResult extern_guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     return guarded_compute(cache, ci, pl);
 }
+void mfb_pre_barrier(VkCommandBuffer cmd, bool interrupted_pass, bool batch);
+void mfb_post_barrier(VkCommandBuffer cmd, bool interrupted_pass, bool batch);
 namespace {
 thread_local uint64_t tl_module_prog_key = 0;
 
@@ -5739,6 +5741,34 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
     const uint32_t c64_0    = make_u64_c(0ull);
     const uint32_t c64_12   = make_u64_c(12ull);
 
+    std::sort(active.begin(), active.end(), [](const HoistGroup& a, const HoistGroup& b) {
+        return a.insert_after_off < b.insert_after_off;
+    });
+    struct BlkShared { uint32_t gp_addr = 0, zero_page = 0, rp_b = 0; };
+    std::unordered_map<uint32_t, BlkShared> blk_shared;
+    auto get_shared = [&](uint32_t blk, std::vector<uint32_t>& h, bool need_rp) -> BlkShared& {
+        BlkShared& bs = blk_shared[blk];
+        if (!bs.gp_addr) {
+            const uint32_t pc_ac = bound++;
+            bs.gp_addr = bound++;
+            bs.zero_page = bound++;
+            const uint32_t init_code[] = {
+                (5u << 16) | 65u,  pc_ptr_t, pc_ac, pc_var_id, pc_idx_id,
+                (4u << 16) | 61u,  u64_t, bs.gp_addr, pc_ac,
+                (5u << 16) | 128u, u64_t, bs.zero_page, bs.gp_addr, c64_zoff,
+            };
+            h.insert(h.end(), std::begin(init_code), std::end(init_code));
+        }
+        if (need_rp && !bs.rp_b) {
+            bs.rp_b = bound++;
+            const uint32_t rp_code[] = {
+                (5u << 16) | 128u, u64_t, bs.rp_b, bs.gp_addr, c64_roff,
+            };
+            h.insert(h.end(), std::begin(rp_code), std::end(rp_code));
+        }
+        return bs;
+    };
+
     std::unordered_map<uint32_t, std::vector<uint32_t>> insert_after;
     struct RepSpan { uint32_t end_off; std::vector<uint32_t> nw; };
     std::unordered_map<uint32_t, RepSpan> replacements;
@@ -5746,23 +5776,23 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
 
     for (auto& g : active) {
         const uint32_t blo = g.key.blo, bhi = g.key.bhi;
+        const uint32_t blk = get_def(blo)->blk;
         auto& h = insert_after[g.insert_after_off];
         if (g.is_direct) {
             // Same-page fast path for direct/constant-offset struct loads (span <= 64):
             // 1 guest_pages lookup + (blo & 4095) < (4097 - max_end), no guest_run_pages load needed.
+            const BlkShared& bs = get_shared(blk, h, false);
+            const uint32_t gp_addr = bs.gp_addr, zero_page = bs.zero_page;
             const uint32_t c_poff_lim = need_u32(4097u - g.max_end);
-            const uint32_t pc_ac = bound++, gp_addr = bound++;
             const uint32_t t1 = bound++, t2 = bound++, t3 = bound++, t4 = bound++;
             const uint32_t t5 = bound++, t6 = bound++, t7 = bound++, t8 = bound++;
             const uint32_t t9 = bound++, t10 = bound++, slot = bound++;
             const uint32_t s8 = bound++, s8_64 = bound++, hp_a = bound++, hp_ps = bound++, hp_pe = bound++, host_page = bound++;
             const uint32_t poff = bound++, poff_64 = bound++, host_base = bound++;
-            const uint32_t ok_page = bound++, nz_page = bound++, ok_both = bound++, zero_page = bound++, safe_base = bound++;
+            const uint32_t ok_page = bound++, nz_page = bound++, ok_both = bound++, safe_base = bound++;
             g.host_base_id = safe_base;
 
             const uint32_t code[] = {
-                (5u << 16) | 65u,  pc_ptr_t, pc_ac, pc_var_id, pc_idx_id,
-                (4u << 16) | 61u,  u64_t, gp_addr, pc_ac,
                 (5u << 16) | 199u, u32_t, t1, bhi, c_fe,
                 (5u << 16) | 170u, u1_t,  t2, t1, c_16,
                 (5u << 16) | 170u, u1_t,  t3, bhi, c_127,
@@ -5786,7 +5816,6 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
                 (5u << 16) | 176u, u1_t,  ok_page, poff, c_poff_lim,
                 (5u << 16) | 171u, u1_t,  nz_page, host_page, c64_0,
                 (5u << 16) | 167u, u1_t,  ok_both, ok_page, nz_page,
-                (5u << 16) | 128u, u64_t, zero_page, gp_addr, c64_zoff,
                 (6u << 16) | 169u, u64_t, safe_base, ok_both, host_base, zero_page,
             };
             h.insert(h.end(), std::begin(code), std::end(code));
@@ -5812,22 +5841,21 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
             continue;
         }
 
-        const uint32_t pc_ac = bound++, gp_addr = bound++;
+        const BlkShared& bs = get_shared(blk, h, true);
+        const uint32_t gp_addr = bs.gp_addr, zero_page = bs.zero_page, rp_b = bs.rp_b;
         const uint32_t t1 = bound++, t2 = bound++, t3 = bound++, t4 = bound++;
         const uint32_t t5 = bound++, t6 = bound++, t7 = bound++, t8 = bound++;
         const uint32_t t9 = bound++, t10 = bound++, slot = bound++;
         const uint32_t s8 = bound++, s8_64 = bound++, hp_a = bound++, hp_ps = bound++, hp_pe = bound++, host_page = bound++;
-        const uint32_t s4 = bound++, s4_64 = bound++, rp_b = bound++, rp_a = bound++, rp_ps = bound++, rp_pe = bound++;
+        const uint32_t s4 = bound++, s4_64 = bound++, rp_a = bound++, rp_ps = bound++, rp_pe = bound++;
         const uint32_t run_p = bound++, run_64 = bound++, run_b = bound++;
         const uint32_t poff = bound++, poff_64 = bound++, host_base = bound++;
-        const uint32_t need_b = bound++, gt_ok = bound++, sub_b = bound++, safe_lim = bound++, zero_page = bound++;
+        const uint32_t need_b = bound++, gt_ok = bound++, sub_b = bound++, safe_lim = bound++;
         g.host_base_id = host_base;
         g.safe_lim_id = safe_lim;
         g.zero_page_id = zero_page;
 
         const uint32_t code[] = {
-            (5u << 16) | 65u,  pc_ptr_t, pc_ac, pc_var_id, pc_idx_id,
-            (4u << 16) | 61u,  u64_t, gp_addr, pc_ac,
             (5u << 16) | 199u, u32_t, t1, bhi, c_fe,
             (5u << 16) | 170u, u1_t,  t2, t1, c_16,
             (5u << 16) | 170u, u1_t,  t3, bhi, c_127,
@@ -5847,7 +5875,6 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
             (6u << 16) | 61u,  u64_t, host_page, hp_pe, 2u, 8u,
             (5u << 16) | 196u, u32_t, s4, slot, c_2,
             (4u << 16) | 113u, u64_t, s4_64, s4,
-            (5u << 16) | 128u, u64_t, rp_b, gp_addr, c64_roff,
             (5u << 16) | 128u, u64_t, rp_a, rp_b, s4_64,
             (4u << 16) | 120u, psb_u32.ptr_struct, rp_ps, rp_a,
             (5u << 16) | 65u,  psb_u32.ptr_elem, rp_pe, rp_ps, c_0,
@@ -5861,7 +5888,6 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
             (5u << 16) | 172u, u1_t,  gt_ok, run_b, need_b,
             (5u << 16) | 130u, u64_t, sub_b, run_b, need_b,
             (6u << 16) | 169u, u64_t, safe_lim, gt_ok, sub_b, c64_0,
-            (5u << 16) | 128u, u64_t, zero_page, gp_addr, c64_zoff,
         };
         h.insert(h.end(), std::begin(code), std::end(code));
 
@@ -5975,6 +6001,877 @@ bool transform_spirv_bda_hoist(const uint32_t* words, size_t count, uint64_t pro
              (unsigned long long)ns, (unsigned long long)nb, (unsigned long long)nc);
     return true;
 }
+
+bool coalesce_guard_on() {
+    static const bool on = [] {
+        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const char* e = getenv("RX_VK_COALESCE_GUARD");
+        const bool v = (e && *e) ? (atoi(e) != 0) : intel_mesa;
+        if (v) logf("vk: RX_VK_COALESCE_GUARD=1 (coalesce repeated SESE lane-guard diamonds in compute shaders)");
+        return v;
+    }();
+    return on;
+}
+
+int minreg_sched_mode() {
+    static const int mode = [] {
+        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const char* e = getenv("RX_VK_MINREG_SCHED");
+        const int v = (e && *e) ? atoi(e) : (intel_mesa ? 1 : 0);
+        if (v) logf("vk: RX_VK_MINREG_SCHED=%d (chain-priority register-pressure scheduler for VS/CS GI-probe blocks)", v);
+        return v;
+    }();
+    return mode;
+}
+
+bool minreg_sched_on() { return minreg_sched_mode() != 0; }
+
+inline bool spv_no_result_op(uint32_t op) {
+    switch (op) {
+        case 0: case 8: case 56: case 62: case 63: case 64: case 99:
+        case 218: case 219: case 220: case 221: case 224: case 225: case 228:
+        case 246: case 247: case 249: case 250: case 251: case 252:
+        case 253: case 254: case 255: case 256: case 257: case 317: case 319:
+        case 4416: case 5274: case 5294: case 5295:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool spv_is_terminator(uint32_t op) {
+    return op == 249u || op == 250u || op == 251u || op == 252u ||
+           op == 253u || op == 254u || op == 255u || op == 4416u;
+}
+
+inline bool spv_is_side_effect(uint32_t op) {
+    if (op == 57u || op == 62u || op == 63u || op == 64u || op == 99u ||
+        op == 224u || op == 225u || op == 252u || op == 319u ||
+        op == 4416u || op == 5274u || op == 5294u || op == 5295u)
+        return true;
+    if (op >= 218u && op <= 221u) return true;
+    if (op >= 227u && op <= 244u) return true;   // OpAtomic*
+    if (op >= 333u && op <= 370u) return true;   // OpGroupNonUniform*
+    return false;
+}
+
+inline uint32_t spv_result_id(const uint32_t* w, uint32_t wc, uint32_t op) {
+    if (op == 248u) return wc >= 2 ? w[1] : 0u;   // OpLabel
+    if (spv_no_result_op(op)) return 0u;
+    return wc >= 3 ? w[2] : 0u;
+}
+
+template <typename Fn>
+inline void spv_for_each_use_id(const uint32_t* w, uint32_t wc, uint32_t op, Fn&& fn) {
+    if (op == 248u || op == 246u || op == 247u || op == 249u || op == 253u || op == 255u || op == 0u || op == 8u || op == 317u)
+        return;
+    if (op == 250u || op == 251u || op == 254u) {
+        if (wc >= 2) fn(w[1]);
+        return;
+    }
+    if (op == 62u || op == 63u) {
+        if (wc >= 2) fn(w[1]);
+        if (wc >= 3) fn(w[2]);
+        return;
+    }
+    if (op == 61u || op == 81u) {
+        if (wc >= 4) fn(w[3]);
+        return;
+    }
+    if (op == 82u || op == 79u) {
+        if (wc >= 4) fn(w[3]);
+        if (wc >= 5) fn(w[4]);
+        return;
+    }
+    if (op == 12u) {
+        if (wc >= 4) fn(w[3]);
+        for (uint32_t k = 5; k < wc; k++) fn(w[k]);
+        return;
+    }
+    if (op == 245u) {
+        for (uint32_t k = 3; k + 1 < wc; k += 2) fn(w[k]);
+        return;
+    }
+    if (op == 99u) {
+        for (uint32_t k = 1; k < wc; k++) {
+            if (k == 4) continue;
+            fn(w[k]);
+        }
+        return;
+    }
+    if (op == 87u || op == 88u || op == 89u || op == 90u || op == 95u || op == 96u || op == 97u || op == 98u) {
+        const uint32_t mask_pos = (op == 89u || op == 90u || op == 96u || op == 97u) ? 6u : 5u;
+        for (uint32_t k = 3; k < wc; k++) {
+            if (k == mask_pos) continue;
+            fn(w[k]);
+        }
+        return;
+    }
+    const uint32_t start = spv_no_result_op(op) ? 1u : 3u;
+    for (uint32_t k = start; k < wc; k++) fn(w[k]);
+}
+
+std::atomic<uint64_t> st_cg_shaders{0}, st_cg_diamonds{0};
+std::atomic<uint64_t> st_mrs_shaders{0}, st_mrs_blocks{0};
+
+// (Batch 12D) Coalesce repeated single-block guard diamonds (`if (%cond) { op; }` with >= 20 occurrences in a
+// barrier-free SESE region of a compute shader, e.g. Eden's per-load/per-store lane guard in GI-probe MFB shaders)
+// into ONE outer `if (%cond) { ... }`, flattening trivial pure scalar micro-diamonds into OpSelect.
+bool transform_spirv_coalesce_guard(const uint32_t* words, size_t count, uint64_t prog_key, std::vector<uint32_t>& out) {
+    if (count < 5 || words[0] != 0x07230203u) return false;
+    if (spirv_exec_model(words, count) != 5u) return false;   // GLCompute only
+
+    uint32_t bound = words[3];
+    std::unordered_set<uint32_t> entry_ids;
+    std::unordered_set<uint32_t> scalar_types;
+    struct Inst { uint32_t off, wc, op; };
+    struct FnSpan { uint32_t id; size_t start_off, end_off; std::vector<Inst> insts; };
+    std::vector<FnSpan> funcs;
+    FnSpan cur_fn{};
+    bool in_fn = false;
+
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+        if (op == 15u && wc >= 3) entry_ids.insert(words[i + 2]);
+        if ((op == 20u || op == 21u || op == 22u) && wc >= 2) scalar_types.insert(words[i + 1]);
+        if (op == 54u && wc == 5) {
+            in_fn = true;
+            cur_fn = FnSpan{words[i + 2], i, 0, {}};
+        }
+        if (in_fn) cur_fn.insts.push_back(Inst{uint32_t(i), wc, op});
+        if (op == 56u && in_fn) {
+            cur_fn.end_off = i + wc;
+            funcs.push_back(std::move(cur_fn));
+            in_fn = false;
+        }
+        i += wc;
+    }
+
+    const FnSpan* entry = nullptr;
+    for (const auto& f : funcs)
+        if (entry_ids.count(f.id)) { entry = &f; break; }
+    if (!entry || entry->insts.size() < 100) return false;
+
+    const auto& ins = entry->insts;
+    const size_t N = ins.size();
+
+    std::unordered_map<uint32_t, size_t> lbl_idx;
+    std::vector<uint32_t> inst_blk(N, 0);
+    uint32_t cur_blk = 0;
+    for (size_t k = 0; k < N; k++) {
+        if (ins[k].op == 248u && ins[k].wc == 2) {
+            cur_blk = words[ins[k].off + 1];
+            lbl_idx[cur_blk] = k;
+        }
+        inst_blk[k] = cur_blk;
+    }
+
+    struct Diamond {
+        size_t sm_idx, t_lbl_idx, br_idx, m_lbl_idx, phi_end;
+        uint32_t cond, t_lbl, m_lbl;
+    };
+    auto match_diamond = [&](size_t k, Diamond& d) -> bool {
+        if (k + 4 >= N) return false;
+        if (ins[k].op != 247u || ins[k].wc != 3 || words[ins[k].off + 2] != 0u) return false;
+        const uint32_t M = words[ins[k].off + 1];
+        if (ins[k + 1].op != 250u || ins[k + 1].wc < 4) return false;
+        const uint32_t cond = words[ins[k + 1].off + 1];
+        const uint32_t T = words[ins[k + 1].off + 2];
+        const uint32_t F = words[ins[k + 1].off + 3];
+        if (F != M || T == M) return false;
+        if (ins[k + 2].op != 248u || ins[k + 2].wc != 2 || words[ins[k + 2].off + 1] != T) return false;
+        auto it_m = lbl_idx.find(M);
+        if (it_m == lbl_idx.end() || it_m->second <= k + 3) return false;
+        const size_t m_idx = it_m->second;
+        if (ins[m_idx - 1].op != 249u || ins[m_idx - 1].wc != 2 || words[ins[m_idx - 1].off + 1] != M) return false;
+        for (size_t j = k + 3; j < m_idx - 1; j++) {
+            const uint32_t op = ins[j].op;
+            if (op == 248u || op == 246u || op == 247u || spv_is_terminator(op) || op == 224u || op == 225u)
+                return false;
+        }
+        size_t pe = m_idx + 1;
+        while (pe < N && ins[pe].op == 245u) {
+            if (ins[pe].wc != 7) return false;
+            const uint32_t l0 = words[ins[pe].off + 4], l1 = words[ins[pe].off + 6];
+            if (l0 != T && l1 != T) return false;
+            pe++;
+        }
+        d = Diamond{k, k + 2, m_idx - 1, m_idx, pe, cond, T, M};
+        return true;
+    };
+
+    std::vector<size_t> seg_bounds;
+    seg_bounds.push_back(0);
+    for (size_t k = 0; k < N; k++)
+        if (ins[k].op == 224u || ins[k].op == 225u) seg_bounds.push_back(k);
+    seg_bounds.push_back(N);
+
+    struct BestCand { size_t seg_s = 0, seg_e = 0, count = 0; uint32_t cond = 0; } best{};
+    for (size_t si = 0; si + 1 < seg_bounds.size(); si++) {
+        const size_t ss = (si == 0) ? 0 : seg_bounds[si] + 1;
+        const size_t se = seg_bounds[si + 1];
+        std::unordered_map<uint32_t, size_t> cond_cnt;
+        for (size_t k = ss; k < se; k++) {
+            Diamond d{};
+            if (match_diamond(k, d)) { cond_cnt[d.cond]++; k = d.m_lbl_idx; }
+        }
+        for (const auto& [c, cnt] : cond_cnt)
+            if (cnt >= 20 && cnt > best.count) best = BestCand{ss, se, cnt, c};
+    }
+    if (best.count < 20) return false;
+
+    std::vector<Diamond> diams;
+    std::unordered_map<size_t, size_t> diam_by_sm;
+    std::vector<uint8_t> in_cond_diamond(N, 0);
+    for (size_t k = best.seg_s; k < best.seg_e; k++) {
+        Diamond d{};
+        if (match_diamond(k, d) && d.cond == best.cond) {
+            diam_by_sm[d.sm_idx] = diams.size();
+            for (size_t j = d.sm_idx; j < d.phi_end; j++) in_cond_diamond[j] = 1;
+            diams.push_back(d);
+            k = d.m_lbl_idx;
+        }
+    }
+    if (diams.size() < 20) return false;
+
+    size_t reg_s = diams.front().sm_idx;
+    size_t reg_e = diams.back().phi_end;
+    if (reg_s == 0 || ins[reg_s].op == 248u || ins[reg_s].op == 245u || ins[reg_s].op == 59u) return false;
+    if (ins[reg_s - 1].op == 246u || ins[reg_s - 1].op == 247u || spv_is_terminator(ins[reg_s - 1].op)) return false;
+    for (size_t k = reg_s; k < N; k++)
+        if (spv_result_id(words + ins[k].off, ins[k].wc, ins[k].op) == best.cond) return false;
+
+    for (int iter = 0; iter < 32; iter++) {
+        size_t new_e = reg_e;
+        for (size_t k = reg_s; k < reg_e; k++) {
+            const uint32_t op = ins[k].op;
+            const uint32_t* w = words + ins[k].off;
+            auto check_lbl = [&](uint32_t lid) {
+                auto it = lbl_idx.find(lid);
+                if (it != lbl_idx.end() && it->second >= new_e) {
+                    size_t pe = it->second + 1;
+                    while (pe < N && ins[pe].op == 245u) pe++;
+                    if (pe > new_e) new_e = pe;
+                }
+            };
+            if (op == 247u && ins[k].wc >= 2) check_lbl(w[1]);
+            else if (op == 246u && ins[k].wc >= 3) { check_lbl(w[1]); check_lbl(w[2]); }
+            else if (op == 249u && ins[k].wc >= 2) check_lbl(w[1]);
+            else if (op == 250u && ins[k].wc >= 4) { check_lbl(w[2]); check_lbl(w[3]); }
+            else if (op == 251u && ins[k].wc >= 3) {
+                check_lbl(w[2]);
+                for (uint32_t j = 4; j < ins[k].wc; j += 2) check_lbl(w[j]);
+            }
+        }
+        if (new_e > best.seg_e) return false;
+        if (new_e == reg_e) break;
+        reg_e = new_e;
+    }
+
+    if (reg_e >= N) return false;
+    if (ins[reg_e - 1].op == 246u || ins[reg_e - 1].op == 247u || spv_is_terminator(ins[reg_e - 1].op)) return false;
+    if (ins[reg_e].op == 248u || ins[reg_e].op == 245u) return false;
+
+    std::unordered_set<uint32_t> inner_labels;
+    std::unordered_set<uint32_t> inner_defs;
+    for (size_t k = reg_s; k < reg_e; k++) {
+        const uint32_t op = ins[k].op;
+        if (op == 224u || op == 225u || op == 252u || op == 253u || op == 254u || op == 255u || op == 4416u)
+            return false;
+        if (op == 248u) inner_labels.insert(words[ins[k].off + 1]);
+        const uint32_t rid = spv_result_id(words + ins[k].off, ins[k].wc, op);
+        if (rid) inner_defs.insert(rid);
+        if (!in_cond_diamond[k] && spv_is_side_effect(op)) return false;
+    }
+
+    for (size_t k = 0; k < N; k++) {
+        const bool inside = (k >= reg_s && k < reg_e);
+        const uint32_t op = ins[k].op;
+        const uint32_t* w = words + ins[k].off;
+        auto check_edge = [&](uint32_t lid) -> bool {
+            const bool tgt_in = inner_labels.count(lid) != 0;
+            return inside ? tgt_in : !tgt_in;
+        };
+        if (op == 247u && ins[k].wc >= 2 && !check_edge(w[1])) return false;
+        if (op == 246u && ins[k].wc >= 3 && (!check_edge(w[1]) || !check_edge(w[2]))) return false;
+        if (op == 249u && ins[k].wc >= 2 && !check_edge(w[1])) return false;
+        if (op == 250u && ins[k].wc >= 4 && (!check_edge(w[2]) || !check_edge(w[3]))) return false;
+        if (op == 251u && ins[k].wc >= 3) {
+            if (!check_edge(w[2])) return false;
+            for (uint32_t j = 4; j < ins[k].wc; j += 2)
+                if (!check_edge(w[j])) return false;
+        }
+        if (!inside) {
+            bool escapes = false;
+            spv_for_each_use_id(w, ins[k].wc, op, [&](uint32_t uid) {
+                if (inner_defs.count(uid)) escapes = true;
+            });
+            if (escapes) return false;
+        }
+    }
+
+    auto is_pure_micro_diamond = [&](const Diamond& d) -> bool {
+        const size_t body_n = d.br_idx - (d.t_lbl_idx + 1);
+        if (body_n > 8 || d.phi_end <= d.m_lbl_idx + 1) return false;
+        for (size_t j = d.m_lbl_idx + 1; j < d.phi_end; j++)
+            if (!scalar_types.count(words[ins[j].off + 1])) return false;
+        for (size_t j = d.t_lbl_idx + 1; j < d.br_idx; j++) {
+            const uint32_t op = ins[j].op;
+            if (spv_is_side_effect(op) || spv_no_result_op(op) || op == 61u || op == 65u || op == 66u ||
+                op == 120u || op == 134u || op == 135u || op == 136u || op == 137u || op == 138u ||
+                op == 139u || op == 140u || op == 141u || (op >= 87u && op <= 108u))
+                return false;
+        }
+        return true;
+    };
+
+    // Single-region guard: avoid coalescing multi-path >10k-line shaders (e.g. d4abbcb4) where merging two 5k blocks spikes RA spills.
+    {
+        size_t big_blks = 0, cur_len = 0;
+        for (size_t k = reg_s; k < reg_e;) {
+            auto it_d = diam_by_sm.find(k);
+            if (it_d != diam_by_sm.end()) {
+                const Diamond& d = diams[it_d->second];
+                cur_len += (d.br_idx - (d.t_lbl_idx + 1)) + (d.phi_end - (d.m_lbl_idx + 1));
+                k = d.phi_end;
+                continue;
+            }
+            Diamond md{};
+            if (match_diamond(k, md) && md.phi_end <= reg_e && is_pure_micro_diamond(md)) {
+                cur_len += (md.br_idx - (md.t_lbl_idx + 1)) + (md.phi_end - (md.m_lbl_idx + 1));
+                k = md.phi_end;
+                continue;
+            }
+            if (ins[k].op == 248u) {
+                if (cur_len >= 1000) big_blks++;
+                cur_len = 0;
+            } else {
+                cur_len++;
+            }
+            k++;
+        }
+        if (cur_len >= 1000) big_blks++;
+        if (big_blks > 1) return false;
+    }
+
+    const uint32_t cg_body = bound++;
+    const uint32_t cg_merge = bound++;
+
+    std::unordered_map<uint32_t, uint32_t> body_label_map;
+    std::vector<uint32_t> fn_words;
+    fn_words.reserve((entry->end_off - entry->start_off) + 32);
+    auto emit_inst = [&](size_t idx) {
+        const uint32_t* w = words + ins[idx].off;
+        fn_words.insert(fn_words.end(), w, w + ins[idx].wc);
+    };
+
+    for (size_t k = 0; k < reg_s; k++) emit_inst(k);
+    fn_words.push_back((3u << 16) | 247u); fn_words.push_back(cg_merge); fn_words.push_back(0u);
+    fn_words.push_back((4u << 16) | 250u); fn_words.push_back(best.cond); fn_words.push_back(cg_body); fn_words.push_back(cg_merge);
+    const size_t body_word_start = fn_words.size();
+    fn_words.push_back((2u << 16) | 248u); fn_words.push_back(cg_body);
+
+    uint32_t cur_surviving_lbl = cg_body;
+    size_t collapsed = 0;
+    for (size_t k = reg_s; k < reg_e;) {
+        auto it_d = diam_by_sm.find(k);
+        if (it_d != diam_by_sm.end()) {
+            const Diamond& d = diams[it_d->second];
+            for (size_t j = d.t_lbl_idx + 1; j < d.br_idx; j++) emit_inst(j);
+            for (size_t j = d.m_lbl_idx + 1; j < d.phi_end; j++) {
+                const uint32_t* w = words + ins[j].off;
+                const uint32_t true_v = (w[4] == d.t_lbl) ? w[3] : w[5];
+                fn_words.insert(fn_words.end(), {(4u << 16) | 83u, w[1], w[2], true_v});
+            }
+            body_label_map[d.t_lbl] = cur_surviving_lbl;
+            body_label_map[d.m_lbl] = cur_surviving_lbl;
+            collapsed++;
+            k = d.phi_end;
+            continue;
+        }
+        Diamond md{};
+        if (match_diamond(k, md) && md.phi_end <= reg_e && is_pure_micro_diamond(md)) {
+            for (size_t j = md.t_lbl_idx + 1; j < md.br_idx; j++) emit_inst(j);
+            for (size_t j = md.m_lbl_idx + 1; j < md.phi_end; j++) {
+                const uint32_t* w = words + ins[j].off;
+                const uint32_t true_v = (w[4] == md.t_lbl) ? w[3] : w[5];
+                const uint32_t false_v = (w[4] == md.t_lbl) ? w[5] : w[3];
+                fn_words.insert(fn_words.end(), {(6u << 16) | 169u, w[1], w[2], md.cond, true_v, false_v});
+            }
+            body_label_map[md.t_lbl] = cur_surviving_lbl;
+            body_label_map[md.m_lbl] = cur_surviving_lbl;
+            collapsed++;
+            k = md.phi_end;
+            continue;
+        }
+        if (ins[k].op == 248u) cur_surviving_lbl = words[ins[k].off + 1];
+        emit_inst(k);
+        k++;
+    }
+
+    fn_words.push_back((2u << 16) | 249u); fn_words.push_back(cg_merge);
+    const size_t suffix_word_start = fn_words.size();
+    fn_words.push_back((2u << 16) | 248u); fn_words.push_back(cg_merge);
+    const uint32_t split_end_blk = inst_blk[reg_e];
+    for (size_t k = reg_e; k < N; k++) emit_inst(k);
+
+    auto resolve_body_lbl = [&](uint32_t l) -> uint32_t {
+        for (int hops = 0; hops < 64; hops++) {
+            auto it = body_label_map.find(l);
+            if (it == body_label_map.end() || it->second == l) break;
+            l = it->second;
+        }
+        return l;
+    };
+    for (size_t i = body_word_start; i < suffix_word_start;) {
+        const uint32_t wc = fn_words[i] >> 16;
+        const uint32_t op = fn_words[i] & 0xFFFFu;
+        if (!wc || i + wc > suffix_word_start) return false;
+        if (op == 245u)
+            for (uint32_t j = 4; j < wc; j += 2) fn_words[i + j] = resolve_body_lbl(fn_words[i + j]);
+        i += wc;
+    }
+    if (split_end_blk) {
+        for (size_t i = suffix_word_start; i < fn_words.size();) {
+            const uint32_t wc = fn_words[i] >> 16;
+            const uint32_t op = fn_words[i] & 0xFFFFu;
+            if (!wc || i + wc > fn_words.size()) return false;
+            if (op == 245u)
+                for (uint32_t j = 4; j < wc; j += 2)
+                    if (fn_words[i + j] == split_end_blk) fn_words[i + j] = cg_merge;
+            i += wc;
+        }
+    }
+
+    out.clear();
+    out.reserve(count + 32);
+    out.insert(out.end(), words, words + entry->start_off);
+    out.insert(out.end(), fn_words.begin(), fn_words.end());
+    out.insert(out.end(), words + entry->end_off, words + count);
+    out[3] = bound;
+
+    const uint64_t ns = st_cg_shaders.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t nd = st_cg_diamonds.fetch_add(collapsed, std::memory_order_relaxed) + collapsed;
+    if (ns <= 8 || ns % 20 == 0)
+        logf("vk: COALESCE_GUARD %016llx: collapsed %zu diamonds (total %llu shaders / %llu diamonds)",
+             (unsigned long long)prog_key, collapsed, (unsigned long long)ns, (unsigned long long)nd);
+    return true;
+}
+
+// (Batch 12D) Intra-block chain-priority register-pressure scheduler for GI-probe Vertex (em=0) and Compute (em=5)
+// shaders. Defers vec4 probe loads until their FMA chain is active, cutting Gen12 SIMD8 spills by 41%-95% and
+// instructions by 16%-49% across ~405 main-pass VS + ~28 MFB CS shaders with 100% bit-exact math.
+bool transform_spirv_minreg_sched(const uint32_t* words, size_t count, uint64_t prog_key, std::vector<uint32_t>& out) {
+    if (count < 5 || words[0] != 0x07230203u) return false;
+    const uint32_t em = spirv_exec_model(words, count);
+    const int mode = minreg_sched_mode();
+    if (em != 0u && em != 5u) return false;
+    if (mode == 2 && em != 5u) return false;
+    if (mode == 3 && em != 0u) return false;
+
+    const uint32_t bound = words[3];
+    std::vector<uint8_t> type_width(bound, 1);
+    std::vector<uint8_t> is_v4_type(bound, 0);
+    std::vector<uint16_t> var_sc(bound, 0xFFFFu);
+    uint32_t glsl_ext_id = 0;
+
+    size_t first_fn = 0;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+        if (op == 11u && wc >= 4) {
+            const char* nm = reinterpret_cast<const char*>(&words[i + 2]);
+            if (strncmp(nm, "GLSL.std.450", 12) == 0) glsl_ext_id = words[i + 1];
+        } else if ((op == 21u || op == 22u) && wc >= 3) {
+            const uint32_t tid = words[i + 1], bits = words[i + 2];
+            if (tid < bound) type_width[tid] = (bits >= 64u) ? 2 : 1;
+        } else if (op == 23u && wc == 4) {
+            const uint32_t tid = words[i + 1], comp = words[i + 2], cnt = words[i + 3];
+            if (tid < bound) {
+                const uint8_t cw = (comp < bound) ? type_width[comp] : 1;
+                type_width[tid] = (uint8_t)std::min<uint32_t>(8u, cw * cnt);
+                if (cnt == 4u && cw == 1u) is_v4_type[tid] = 1;
+            }
+        } else if (op == 59u && wc >= 4) {
+            const uint32_t rid = words[i + 2];
+            if (rid < bound) var_sc[rid] = (uint16_t)words[i + 3];
+        } else if (op == 54u && !first_fn) {
+            first_fn = i;
+            break;
+        }
+        i += wc;
+    }
+    if (!first_fn) return false;
+
+    struct Inst { uint32_t off, wc, op; };
+    std::vector<uint32_t> tmp_out;
+    bool any_sched = false;
+    size_t blocks_sched = 0;
+
+    auto sc_bucket = [](uint16_t sc) -> uint8_t {
+        if (sc == 0u || sc == 1u || sc == 9u) return 0u;   // UniformConstant / Input / PushConstant (strictly read-only)
+        if (sc == 4u) return 1u;                           // Workgroup
+        if (sc == 7u) return 2u;                           // Function
+        if (sc == 0xFFFFu) return 4u;                      // Unknown pointer storage class -> aliases all buckets
+        return 3u;                                         // StorageBuffer / PhysicalStorageBuffer / Output / Private / Uniform(BufferBlock)
+    };
+
+    std::vector<uint16_t> ptr_sc = var_sc;
+    std::vector<int32_t> def_in_blk(bound, -1);
+
+    tmp_out.reserve(count);
+    tmp_out.insert(tmp_out.end(), words, words + first_fn);
+
+    for (size_t i = first_fn; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+
+        if (op == 54u) {
+            ptr_sc = var_sc;
+            tmp_out.insert(tmp_out.end(), words + i, words + i + wc);
+            i += wc;
+            continue;
+        }
+        if (op != 248u) {
+            tmp_out.insert(tmp_out.end(), words + i, words + i + wc);
+            i += wc;
+            continue;
+        }
+
+        tmp_out.insert(tmp_out.end(), words + i, words + i + wc);
+        i += wc;
+
+        std::vector<Inst> blk;
+        while (i < count) {
+            const uint32_t bw0 = words[i];
+            const uint32_t bwc = bw0 >> 16;
+            const uint32_t bop = bw0 & 0xFFFFu;
+            if (!bwc || i + bwc > count) return false;
+            if (bop == 248u || bop == 56u) break;
+            blk.push_back(Inst{uint32_t(i), bwc, bop});
+            i += bwc;
+            if (spv_is_terminator(bop)) break;
+        }
+
+        size_t bi = 0;
+        while (bi < blk.size() && (blk[bi].op == 245u || blk[bi].op == 59u)) {
+            if (blk[bi].op == 59u && blk[bi].wc >= 4) {
+                const uint32_t rid = words[blk[bi].off + 2];
+                if (rid < bound) ptr_sc[rid] = (uint16_t)words[blk[bi].off + 3];
+            }
+            bi++;
+        }
+        size_t ts = blk.size();
+        if (ts > bi && spv_is_terminator(blk[ts - 1].op)) {
+            ts--;
+            if (ts > bi && (blk[ts - 1].op == 246u || blk[ts - 1].op == 247u)) ts--;
+        }
+
+        for (size_t k = 0; k < bi; k++)
+            tmp_out.insert(tmp_out.end(), words + blk[k].off, words + blk[k].off + blk[k].wc);
+
+        const size_t m = ts - bi;
+        bool did_blk = false;
+
+        if (m >= 300) {
+            std::vector<uint8_t> widths(m, 0), is_v4(m, 0), is_ld(m, 0), is_side(m, 0), is_fma(m, 0);
+            std::vector<uint8_t> ld_bkt(m, 3), st_bkt(m, 4);
+            std::vector<uint32_t> def_ids;
+            def_ids.reserve(m);
+            size_t nv4 = 0;
+            std::vector<int32_t> v4_root_of(m, -1), v4_last_use(m, -1);
+
+            for (size_t idx = 0; idx < m; idx++) {
+                const Inst& in = blk[bi + idx];
+                const uint32_t* w = words + in.off;
+                const uint32_t rid = spv_result_id(w, in.wc, in.op);
+                if (rid && rid < bound) {
+                    def_in_blk[rid] = (int32_t)idx;
+                    def_ids.push_back(rid);
+                    const uint32_t rtype = w[1];
+                    widths[idx] = (rtype < bound) ? type_width[rtype] : 1;
+                    if (in.op == 65u || in.op == 66u) {
+                        const uint32_t base = w[3];
+                        if (base < bound) ptr_sc[rid] = ptr_sc[base];
+                    } else if (in.op == 120u) {
+                        ptr_sc[rid] = 5349u;
+                    } else if (in.op == 61u && in.wc >= 4) {
+                        is_ld[idx] = 1;
+                        const uint32_t ptr = w[3];
+                        const uint16_t sc = (ptr < bound) ? ptr_sc[ptr] : 0xFFFFu;
+                        ld_bkt[idx] = sc_bucket(sc);
+                        if (rtype < bound && is_v4_type[rtype]) {
+                            is_v4[idx] = 1;
+                            nv4++;
+                            v4_root_of[idx] = (int32_t)idx;
+                            v4_last_use[idx] = (int32_t)idx;
+                        }
+                    } else if ((in.op >= 87u && in.op <= 98u) || in.op == 100u) {
+                        // Image reads / fetches / samples must not cross OpImageWrite or barriers
+                        is_ld[idx] = 1;
+                        ld_bkt[idx] = 4u;
+                    } else if ((in.op == 81u || in.op == 124u || in.op == 83u) && in.wc >= 4) {
+                        const uint32_t src = w[3];
+                        if (src < bound && def_in_blk[src] >= 0) {
+                            const int32_t r = v4_root_of[def_in_blk[src]];
+                            if (r >= 0) { v4_root_of[idx] = r; v4_last_use[r] = (int32_t)idx; }
+                        }
+                    }
+                    if (in.op == 129u || in.op == 133u ||
+                        (in.op == 12u && in.wc >= 5 && w[3] == glsl_ext_id && w[4] == 50u))
+                        is_fma[idx] = 1;
+                }
+                spv_for_each_use_id(w, in.wc, in.op, [&](uint32_t uid) {
+                    if (uid < bound && def_in_blk[uid] >= 0) {
+                        const int32_t r = v4_root_of[def_in_blk[uid]];
+                        if (r >= 0 && (int32_t)idx > v4_last_use[r]) v4_last_use[r] = (int32_t)idx;
+                    }
+                });
+                if (spv_is_side_effect(in.op)) {
+                    is_side[idx] = 1;
+                    if (in.op == 62u && in.wc >= 2) {
+                        const uint32_t ptr = w[1];
+                        const uint16_t sc = (ptr < bound) ? ptr_sc[ptr] : 5349u;
+                        st_bkt[idx] = sc_bucket(sc);
+                    } else {
+                        st_bkt[idx] = 4u;
+                    }
+                }
+            }
+
+            uint32_t max_live_v4_ext = 0;
+            if (nv4 >= 8) {
+                std::vector<std::pair<int32_t, int32_t>> ev;
+                ev.reserve(nv4 * 2);
+                for (size_t idx = 0; idx < m; idx++) {
+                    if (is_v4[idx]) {
+                        ev.push_back({(int32_t)idx, +1});
+                        ev.push_back({v4_last_use[idx], -1});
+                    }
+                }
+                std::sort(ev.begin(), ev.end());
+                int32_t cur = 0;
+                for (auto [pos, d] : ev) {
+                    cur += d;
+                    if (cur > (int32_t)max_live_v4_ext) max_live_v4_ext = (uint32_t)cur;
+                }
+            }
+
+            if (nv4 >= 8 && max_live_v4_ext >= 16) {
+                std::vector<std::vector<uint32_t>> preds(m), succs(m);
+                auto add_edge = [&](uint32_t a, uint32_t b) {
+                    if (a < b) {
+                        auto& pb = preds[b];
+                        if (std::find(pb.begin(), pb.end(), a) == pb.end()) {
+                            pb.push_back(a);
+                            succs[a].push_back(b);
+                        }
+                    }
+                };
+
+                int32_t last_side = -1;
+                int32_t last_st[4] = {-1, -1, -1, -1};
+                std::vector<uint32_t> pend_ld[4];
+
+                for (size_t idx = 0; idx < m; idx++) {
+                    const Inst& in = blk[bi + idx];
+                    const uint32_t* w = words + in.off;
+                    spv_for_each_use_id(w, in.wc, in.op, [&](uint32_t uid) {
+                        if (uid < bound && def_in_blk[uid] >= 0) add_edge((uint32_t)def_in_blk[uid], (uint32_t)idx);
+                    });
+                    if (is_ld[idx]) {
+                        const uint8_t bkt = ld_bkt[idx];
+                        if (bkt >= 1 && bkt <= 3) {
+                            if (last_st[bkt] >= 0) add_edge((uint32_t)last_st[bkt], (uint32_t)idx);
+                            pend_ld[bkt].push_back((uint32_t)idx);
+                        } else if (bkt == 4u) {
+                            for (int b = 1; b <= 3; b++) {
+                                if (last_st[b] >= 0) add_edge((uint32_t)last_st[b], (uint32_t)idx);
+                                pend_ld[b].push_back((uint32_t)idx);
+                            }
+                        }
+                    }
+                    if (is_side[idx]) {
+                        if (last_side >= 0) add_edge((uint32_t)last_side, (uint32_t)idx);
+                        last_side = (int32_t)idx;
+                        const uint8_t bkt = st_bkt[idx];
+                        if (bkt >= 1 && bkt <= 3) {
+                            for (uint32_t ld : pend_ld[bkt]) add_edge(ld, (uint32_t)idx);
+                            pend_ld[bkt].clear();
+                            last_st[bkt] = (int32_t)idx;
+                        } else {
+                            for (int b = 1; b <= 3; b++) {
+                                for (uint32_t ld : pend_ld[b]) add_edge(ld, (uint32_t)idx);
+                                pend_ld[b].clear();
+                                last_st[b] = (int32_t)idx;
+                            }
+                        }
+                    }
+                }
+
+                std::vector<int32_t> addr_v4(m, -1);
+                for (int32_t idx = (int32_t)m - 1; idx >= 0; idx--) {
+                    if (is_v4[idx] || is_side[idx] || succs[idx].empty()) continue;
+                    bool all_v4 = true;
+                    int32_t best_v = INT32_MAX;
+                    for (uint32_t s : succs[idx]) {
+                        if (is_v4[s]) { if ((int32_t)s < best_v) best_v = (int32_t)s; }
+                        else if (addr_v4[s] >= 0) { if (addr_v4[s] < best_v) best_v = addr_v4[s]; }
+                        else { all_v4 = false; break; }
+                    }
+                    if (all_v4 && best_v != INT32_MAX) addr_v4[idx] = best_v;
+                }
+
+                std::vector<std::vector<uint32_t>> v4_front(m);
+                for (size_t idx = 0; idx < m; idx++) {
+                    if (!is_v4[idx]) continue;
+                    std::vector<uint32_t> front = succs[idx], nxt;
+                    for (int hop = 0; hop < 4; hop++) {
+                        nxt.clear();
+                        for (uint32_t x : front) {
+                            if (preds[x].size() == 1 && !succs[x].empty())
+                                nxt.insert(nxt.end(), succs[x].begin(), succs[x].end());
+                            else
+                                nxt.push_back(x);
+                        }
+                        front.swap(nxt);
+                    }
+                    std::sort(front.begin(), front.end());
+                    front.erase(std::unique(front.begin(), front.end()), front.end());
+                    v4_front[idx] = std::move(front);
+                }
+
+                std::vector<int32_t> rem_p(m), rem_u(m);
+                std::vector<uint8_t> sched(m, 0);
+                std::vector<uint32_t> ready, order;
+                ready.reserve(m);
+                order.reserve(m);
+                for (size_t idx = 0; idx < m; idx++) {
+                    rem_p[idx] = (int32_t)preds[idx].size();
+                    rem_u[idx] = (int32_t)succs[idx].size();
+                    if (rem_p[idx] == 0) ready.push_back((uint32_t)idx);
+                }
+
+                struct V4Score { int32_t neg_ca, neg_rn, mf; uint32_t v; };
+                auto score_v4 = [&](uint32_t v) -> V4Score {
+                    int32_t ca = 0, rn = 0, mf = 99;
+                    for (uint32_t x : v4_front[v]) {
+                        if (rem_p[x] < mf) mf = rem_p[x];
+                        if (rem_p[x] == 1) rn++;
+                        for (uint32_t p : preds[x])
+                            if (sched[p] && is_fma[p]) { ca++; break; }
+                    }
+                    return V4Score{-ca, -rn, mf, v};
+                };
+
+                struct Key {
+                    int32_t k0, k1, k2, k3, k4, k5;
+                    uint32_t u;
+                    bool operator<(const Key& o) const {
+                        if (k0 != o.k0) return k0 < o.k0;
+                        if (k1 != o.k1) return k1 < o.k1;
+                        if (k2 != o.k2) return k2 < o.k2;
+                        if (k3 != o.k3) return k3 < o.k3;
+                        if (k4 != o.k4) return k4 < o.k4;
+                        if (k5 != o.k5) return k5 < o.k5;
+                        return u < o.u;
+                    }
+                };
+
+                while (!ready.empty()) {
+                    size_t best_r = 0;
+                    Key best_k{INT32_MAX, 0, 0, 0, 0, 0, UINT32_MAX};
+                    for (size_t r = 0; r < ready.size(); r++) {
+                        const uint32_t u = ready[r];
+                        int32_t freed = 0;
+                        for (uint32_t p : preds[u]) if (rem_u[p] == 1) freed += widths[p];
+                        const int32_t out_w = (rem_u[u] > 0) ? (int32_t)widths[u] : 0;
+                        const int32_t delta = out_w - freed;
+                        int32_t min_sw = 0;
+                        if (!succs[u].empty()) {
+                            min_sw = INT32_MAX;
+                            for (uint32_t s : succs[u]) {
+                                const int32_t w_rem = rem_p[s] - 1;
+                                if (w_rem < min_sw) min_sw = w_rem;
+                            }
+                        }
+                        Key key{};
+                        if (is_v4[u]) {
+                            const V4Score vs = score_v4(u);
+                            const int32_t tier = (vs.neg_ca < 0 && vs.neg_rn < 0) ? 1 : 2;
+                            key = Key{tier, vs.neg_ca, vs.neg_rn, vs.mf, delta, (int32_t)vs.v, u};
+                        } else if (addr_v4[u] >= 0) {
+                            const V4Score vs = score_v4((uint32_t)addr_v4[u]);
+                            const int32_t tier = (vs.neg_ca < 0) ? 2 : 3;
+                            key = Key{tier, vs.neg_ca, vs.neg_rn, vs.mf, min_sw, delta, u};
+                        } else {
+                            const int32_t tier = (delta < 0 || (delta == 0 && freed > 0)) ? 0 : 1;
+                            key = Key{tier, delta, min_sw, 0, 0, 0, u};
+                        }
+                        if (key < best_k) { best_k = key; best_r = r; }
+                    }
+                    const uint32_t u = ready[best_r];
+                    ready[best_r] = ready.back();
+                    ready.pop_back();
+                    sched[u] = 1;
+                    order.push_back(u);
+                    for (uint32_t p : preds[u]) rem_u[p]--;
+                    for (uint32_t s : succs[u])
+                        if (--rem_p[s] == 0) ready.push_back(s);
+                }
+
+                if (order.size() == m) {
+                    for (uint32_t u : order) {
+                        const Inst& in = blk[bi + u];
+                        tmp_out.insert(tmp_out.end(), words + in.off, words + in.off + in.wc);
+                    }
+                    did_blk = true;
+                    any_sched = true;
+                    blocks_sched++;
+                }
+            }
+
+            for (uint32_t rid : def_ids) def_in_blk[rid] = -1;
+        } else {
+            for (size_t idx = 0; idx < m; idx++) {
+                const Inst& in = blk[bi + idx];
+                const uint32_t* w = words + in.off;
+                const uint32_t rid = spv_result_id(w, in.wc, in.op);
+                if (rid && rid < bound) {
+                    if (in.op == 65u || in.op == 66u) {
+                        const uint32_t base = w[3];
+                        if (base < bound) ptr_sc[rid] = ptr_sc[base];
+                    } else if (in.op == 120u) {
+                        ptr_sc[rid] = 5349u;
+                    }
+                }
+            }
+        }
+
+        if (!did_blk) {
+            for (size_t k = bi; k < ts; k++)
+                tmp_out.insert(tmp_out.end(), words + blk[k].off, words + blk[k].off + blk[k].wc);
+        }
+        for (size_t k = ts; k < blk.size(); k++)
+            tmp_out.insert(tmp_out.end(), words + blk[k].off, words + blk[k].off + blk[k].wc);
+    }
+
+    if (!any_sched) return false;
+    out = std::move(tmp_out);
+    const uint64_t ns = st_mrs_shaders.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t nb = st_mrs_blocks.fetch_add(blocks_sched, std::memory_order_relaxed) + blocks_sched;
+    if (ns <= 8 || ns % 50 == 0)
+        logf("vk: MINREG_SCHED %016llx (em=%u): %zu blocks scheduled (total %llu shaders / %llu blocks)",
+             (unsigned long long)prog_key, em, blocks_sched, (unsigned long long)ns, (unsigned long long)nb);
+    return true;
+}
 } // namespace
 
 VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShaderModule* m) {
@@ -6012,8 +6909,10 @@ VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShad
         }
         const int bda_mode = bda_ssbo_mode();
         const bool hoist_on = bda_hoist_on();
+        const bool cg_on = coalesce_guard_on();
+        const bool mrs_on = minreg_sched_on();
         const int fm = fast_math_mode();
-        if (bda_mode > 0 || hoist_on || fm > 0) {
+        if (bda_mode > 0 || hoist_on || cg_on || mrs_on || fm > 0) {
             std::vector<uint32_t> patched;
             bool did_patch = false;
             if (bda_mode > 0 && transform_spirv_bda_ssbo(words, count, bda_mode, prog_key, patched)) {
@@ -6025,6 +6924,24 @@ VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShad
                 std::vector<uint32_t> patched_h;
                 if (transform_spirv_bda_hoist(words, count, prog_key, patched_h)) {
                     patched = std::move(patched_h);
+                    words = patched.data();
+                    count = patched.size();
+                    did_patch = true;
+                }
+            }
+            if (cg_on) {
+                std::vector<uint32_t> patched_cg;
+                if (transform_spirv_coalesce_guard(words, count, prog_key, patched_cg)) {
+                    patched = std::move(patched_cg);
+                    words = patched.data();
+                    count = patched.size();
+                    did_patch = true;
+                }
+            }
+            if (mrs_on) {
+                std::vector<uint32_t> patched_mrs;
+                if (transform_spirv_minreg_sched(words, count, prog_key, patched_mrs)) {
+                    patched = std::move(patched_mrs);
                     words = patched.data();
                     count = patched.size();
                     did_patch = true;
@@ -9134,20 +10051,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     if (mfb_full_barriers) {
         full_barrier(cmd);
     } else {
-        VkPipelineStageFlags2 src_stage = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        VkAccessFlags2 src_access = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        if (!interrupted_pass) {
-            src_stage |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-            src_access |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        }
-        fallback_stage_barrier(
-            cmd, src_stage, src_access,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-            VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
-                VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
-            "barrier (mfb pre)");
+        mfb_pre_barrier(cmd, interrupted_pass, false);
     }
     const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
     // (the records' header: the draw's command with no vertices and one instance, the allocator at 0, and the mesh dispatch
@@ -9214,13 +10118,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     if (mfb_full_barriers) {
         full_barrier(cmd);   // (the records and the draw's command, which the draw reads as indirect arguments)
     } else {
-        fallback_stage_barrier(
-            cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT,
-            "barrier (mfb post)");
-        if (interrupted_pass) note_pass_end(cmd);
+        mfb_post_barrier(cmd, interrupted_pass, false);
     }
     return true;
 }
@@ -9988,20 +10886,7 @@ bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
     if (mfb_full_barriers) {
         full_barrier(cmd);
     } else {
-        VkPipelineStageFlags2 src_stage = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        VkAccessFlags2 src_access = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        if (!interrupted_pass) {
-            src_stage |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-            src_access |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        }
-        fallback_stage_barrier(
-            cmd, src_stage, src_access,
-            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-            VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT |
-                VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
-            "barrier (mfb batch pre)");
+        mfb_pre_barrier(cmd, interrupted_pass, true);
     }
 
     {
@@ -10111,13 +10996,7 @@ bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
     if (mfb_full_barriers) {
         full_barrier(cmd);
     } else {
-        fallback_stage_barrier(
-            cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT,
-            "barrier (mfb batch post)");
-        if (interrupted_pass) note_pass_end(cmd);
+        mfb_post_barrier(cmd, interrupted_pass, true);
     }
 
     dw().prog = nullptr;
@@ -13761,6 +14640,31 @@ int64_t draw_slotgen_saves() {   // (Descriptor reuse: of those, what the global
 }
 
 void pipeline_cache_play() {
+    // (Batch 12A) When RX_VK_PRECOMPILE=0 skipped precompile_run(), pcache was still null here (so play_cache_begin()
+    // aborted, causing 340 MB full-cache writes mid-gameplay) and programs_index() had never run (disabling RX_VK_LOAD=create
+    // so 15,000+ program create calls were ignored and ~2,000 pipelines compiled on the draw path in play). Initialize pcache
+    // and index the existing notes (~15 ms, zero compilation) before entering play.
+    if (!pcache) pcache_init();
+    if (programs_load_at_create() && !programs_indexed()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<NoteRef> refs = pipe_notes_refs();
+        if (!env_on("RX_VK_NO_PROGRAM_CACHE")) {
+            std::lock_guard lk(note_mu);
+            if (!note_file) {
+                for (const NoteRef& r : refs) noted.insert(r.key);
+                const std::vector<std::unique_ptr<PipeNote>> none;
+                notes_open_locked(&none);
+            }
+        }
+        if (!env_on("RX_VK_NO_STATE_LIST")) {
+            std::lock_guard lk(state_mu);
+            if (!state_file) state_open_locked();
+        }
+        const ComputePlan plan = computes_plan(precompile_computes_which(), !env_on("RX_VK_NO_STATE_LIST"));
+        programs_index(std::move(refs), plan.none ? std::unordered_set<uint64_t>{} : plan.keys);
+        logf("vk: precompile: index-only (RX_VK_LOAD=create): ready in %.1f ms",
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     play_cache_begin();
     programs_play_begin();   // (the census: what is made from here on is made in play)
 #ifdef __linux__
@@ -13851,6 +14755,50 @@ VkPipeline compute_pipeline_from_caches(const Program& p) {
     const VkPipeline pl = compute_pipeline_cached(p, true);
     ask_start_first = false;
     return pl;
+}
+bool fallback_compute_from_caches(Program& p) {
+    if (!dev.vk13.pipelineCreationCacheControl || !p.fallback || p.compute_state.load(std::memory_order_acquire) != 0)
+        return false;
+    const bool mesa_intel = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+    std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
+    bool any = false, ok = true;
+    ask_start_first = true;
+    for (size_t i = 0; i < p.stages.size() && ok; i++) {
+        const Stage& st = p.stages[i];
+        if (st.vk_stage != VK_SHADER_STAGE_COMPUTE_BIT) continue;
+        any = true;
+        VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        si.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        si.module = st.module;
+        si.pName = "main";
+        const compute_pin::Uses u = compute_stage_uses(st, p.shared_memory);
+        const bool simd8_mesh = mesa_intel && (st.nvn_stage == 7 || st.nvn_stage == 6) &&
+                                (st.info.wg_warp32 || !compute_pin::sees_lanes(u));
+        if (simd8_mesh) pin_subgroup_8(si, 32);
+        else pin_subgroup(si, 32);
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = si;
+        ci.layout = p.layout;
+        if (dev.task_mesh_fallback || env_on("RX_VK_NOOPT") || (mesa_intel && st.phis > 10000))
+            ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        ci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+        if (cached_compute(&ci, &made[i]) != VK_SUCCESS) ok = false;
+    }
+    ask_start_first = false;
+    if (!ok || !any) {
+        for (VkPipeline m : made)
+            if (m) vkDestroyPipeline(dev.device, m, nullptr);
+        return false;
+    }
+    int none = 0;
+    if (!p.compute_state.compare_exchange_strong(none, 1)) {
+        for (VkPipeline m : made)
+            if (m) vkDestroyPipeline(dev.device, m, nullptr);
+        return false;
+    }
+    p.fallback_compute = std::move(made);
+    p.compute_state.store(2, std::memory_order_release);
+    return true;
 }
 VkPipeline compute_pipeline_by_module_id(const Program& p, const uint8_t* id, uint32_t size) {
     if (!dev.vk13.pipelineCreationCacheControl || !size) return VK_NULL_HANDLE;

@@ -88,6 +88,27 @@ void temporal_idle();
 /// scene now, whether or not an engine then drew it (failed, refused, not this frame). Not in its own menus, movies and
 /// loading screens. Without the lock (an atomic frame number)
 bool temporal_scene_now();
+/// (Batch 12A/12B) Exact 3D camera + skinned-actor motion vectors, scene depth, and before/after HUD picture views
+/// computed this frame by the temporal chain (RG16F motion, render pixels toward the frame before, x right and y down,
+/// no jitter), for built-in FrameGen synthesis and exact HUD protection.
+struct TemporalMotion {
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageView depth_view = VK_NULL_HANDLE;
+    VkImageView hud_before_view = VK_NULL_HANDLE;   // s.output (before HUD)
+    VkImageView hud_after_view = VK_NULL_HANDLE;    // game's upscale output texture (after HUD)
+    VkImage hud_after_image = VK_NULL_HANDLE;
+    const Texture* hud_after_tex = nullptr;
+    uint64_t hud_after_gpu = 0;
+    uint64_t hud_after_gen = 0;
+    uint32_t render_w = 0, render_h = 0;
+    uint32_t tex_w = 0, tex_h = 0;
+    uint32_t hud_w = 0, hud_h = 0;
+    bool depth_reversed = false;
+    bool hud_square = false;
+    bool reset = false;
+    uint64_t frame = 0;
+};
+bool temporal_last_motion(TemporalMotion& out);
 void temporal_reset_failure();
 
 /// For the renderer's status line (vk_replay.cpp status_tick): while an engine draws, its details since the last call into b

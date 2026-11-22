@@ -666,11 +666,13 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         copy.imageExtent = {128, 1, 1};
         vkCmdCopyBufferToImage(cmd, uniforms.binding.buffer, g.lanczos_lut.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     }
-    // (Batch 11A) Per frame: clear previous_nearest_depth (atomicMax target) and 1x1 spd_atomic counter.
-    // g.spd_mips mips 0..5 are fully overwritten by both pyramid passes.
+    // (Batch 11A / 12D) Per frame: clear previous_nearest_depth (atomicMax target). When g.wave is true, both
+    // fsr3_luma_pyramid and fsr3_shading_change_pyramid auto-reset rw_spd_global_atomic to 0 in their last workgroup
+    // (cleared on first/reset only), saving 2 vkCmdClearColorImage + 2 barriers per frame.
     const VkClearColorValue zero{};
-    for (const Image* t : {&g.previous_nearest_depth, &g.spd_atomic})
-        vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
+    vkCmdClearColorImage(cmd, g.previous_nearest_depth.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
+    if (!g.wave || reset)
+        vkCmdClearColorImage(cmd, g.spd_atomic.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
     if (reset) {
         vkCmdClearColorImage(cmd, g.accumulation[p].image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
         VkClearColorValue info{};
@@ -702,11 +704,13 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         {current_luma, tex(g.farthest_depth), tex(g.spd_atomic), tex(g.frame_info), mip(0), mip(1), mip(2), mip(3), mip(4),
          mip(5), tex(g.farthest_depth_mip1), cb_fsr, cb_spd},
         spd_x, spd_y);
-    memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    vkCmdClearColorImage(cmd, g.spd_atomic.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
-    memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                   VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    if (!g.wave) {
+        memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        vkCmdClearColorImage(cmd, g.spd_atomic.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
+        memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    }
     run(g.wave ? P_SHADING_CHANGE_PYRAMID : P_SHADING_CHANGE_PYRAMID_NOWAVE,
         {current_luma, tex(g.luma[q]), tex(g.dilated_motion_vectors), exposure, tex(g.spd_atomic), mip(0), mip(1), mip(2),
          mip(3), mip(4), mip(5), cb_fsr, cb_spd},

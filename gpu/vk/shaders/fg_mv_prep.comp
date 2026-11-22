@@ -1,0 +1,34 @@
+#version 450
+// (Batch 12B) Lean motion + depth prep for built-in FrameGen when no temporal upscaler engine runs (dlss=0).
+// Skips reading the scene colour and skips allocating/writing RGBA16F s.color (-7.4 MB VRAM, -11 MB/frame BW).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D scene_depth;
+layout(binding = 1, r32f) uniform writeonly image2D depth_out;
+layout(binding = 2, rg16f) uniform writeonly image2D motion_out;
+layout(push_constant, row_major) uniform P {
+    mat4 reproject;   // (this frame's jittered clip space to the frame before's without its jitter)
+    vec2 jitter;      // (this frame's jitter in clip space: taken off, so the motion has none)
+    ivec2 size;
+    int flags;        // bit 0: compute camera motion (0 on first frame / reset)
+} pc;
+
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.size))) return;
+    const vec2 size = vec2(pc.size);
+    const vec2 uv = (vec2(g) + 0.5) / size;
+    const float d = textureLod(scene_depth, uv, 0.0).r;
+    imageStore(depth_out, g, vec4(d));
+    vec2 mv = vec2(0.0);
+    if ((pc.flags & 1) != 0 && d >= 0.0 && d <= 1.0) {
+        const vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d * 2.0 - 1.0, 1.0);
+        const vec4 before = pc.reproject * clip;
+        if (before.w > 1e-6) {
+            const vec2 then = before.xy / before.w;
+            const vec2 now = clip.xy - pc.jitter;
+            const vec2 px = vec2(then.x - now.x, now.y - then.y) * 0.5 * size;
+            if (all(lessThan(abs(px), vec2(16384.0)))) mv = px;
+        }
+    }
+    imageStore(motion_out, g, vec4(mv, 0.0, 0.0));
+}

@@ -5,6 +5,9 @@
 #include "hos.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -105,9 +108,62 @@ static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **p
     uint32_t *out = malloc(cap * sizeof *out);
     for (int r = 0; r < nranges; r++) {
         const uint64_t lo = ranges[r][0], hi = ranges[r][1] < hos_guest_size() ? ranges[r][1] : hos_guest_size();
+        if (lo >= hi) continue;
         uint64_t p1 = (hi + 4095) >> 12;
         if (p1 > A64_DIRTY_PAGES) p1 = A64_DIRTY_PAGES;
-        for (uint64_t p = lo >> 12; p < p1;) {
+        uint64_t p = lo >> 12;
+#ifdef __AVX2__
+        if (wide) {
+            const __m256i zero = _mm256_setzero_si256();
+            while (p + 256 <= p1) {
+                const uint8_t *m = &a64_dirty[p];
+                __m256i v0 = _mm256_loadu_si256((const __m256i *)(m + 0));
+                __m256i v1 = _mm256_loadu_si256((const __m256i *)(m + 32));
+                __m256i v2 = _mm256_loadu_si256((const __m256i *)(m + 64));
+                __m256i v3 = _mm256_loadu_si256((const __m256i *)(m + 96));
+                __m256i v4 = _mm256_loadu_si256((const __m256i *)(m + 128));
+                __m256i v5 = _mm256_loadu_si256((const __m256i *)(m + 160));
+                __m256i v6 = _mm256_loadu_si256((const __m256i *)(m + 192));
+                __m256i v7 = _mm256_loadu_si256((const __m256i *)(m + 224));
+                __m256i any = _mm256_or_si256(_mm256_or_si256(_mm256_or_si256(v0, v1), _mm256_or_si256(v2, v3)),
+                                              _mm256_or_si256(_mm256_or_si256(v4, v5), _mm256_or_si256(v6, v7)));
+                if (!_mm256_testz_si256(any, any)) {
+                    const __m256i vs[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
+                    for (int k = 0; k < 8; k++) {
+                        if (_mm256_testz_si256(vs[k], vs[k])) continue;
+                        uint32_t mask = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(vs[k], zero));
+                        while (mask) {
+                            unsigned b = (unsigned)__builtin_ctz(mask);
+                            mask &= mask - 1;
+                            const uint64_t pg = p + (uint64_t)(k * 32) + b;
+                            if (__atomic_exchange_n(&a64_dirty[pg], 0, __ATOMIC_ACQUIRE)) {
+                                if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+                                out[n++] = (uint32_t)pg;
+                            }
+                        }
+                    }
+                }
+                p += 256;
+            }
+            while (p + 32 <= p1) {
+                __m256i v = _mm256_loadu_si256((const __m256i *)&a64_dirty[p]);
+                if (!_mm256_testz_si256(v, v)) {
+                    uint32_t mask = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero));
+                    while (mask) {
+                        unsigned b = (unsigned)__builtin_ctz(mask);
+                        mask &= mask - 1;
+                        const uint64_t pg = p + b;
+                        if (__atomic_exchange_n(&a64_dirty[pg], 0, __ATOMIC_ACQUIRE)) {
+                            if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+                            out[n++] = (uint32_t)pg;
+                        }
+                    }
+                }
+                p += 32;
+            }
+        }
+#endif
+        for (; p < p1;) {
             if (wide && !(p & 255) && p + 256 <= p1 && marks_clear_256(&a64_dirty[p])) {   /* (256 pages at a time while none is marked) */
                 p += 256;
                 continue;

@@ -35,6 +35,8 @@ bool pipe_note_at(FILE* f, int64_t at, PipeNote* out);
 VkPipeline pipeline_from_caches(const Program& p, const PipeNote& n, bool* cold);
 /// A compute program's pipeline the same way
 VkPipeline compute_pipeline_from_caches(const Program& p);
+/// (Batch 12A) A mesh fallback program's compute pipelines from the caches alone, nothing compiled
+bool fallback_compute_from_caches(Program& p);
 /// The same for a program read without its code (no module): by its module's identifier. Null: no cache has it
 VkPipeline compute_pipeline_by_module_id(const Program& p, const uint8_t* id, uint32_t size);
 /// A pipeline made ahead of its first draw: the draw's lookup takes it (graphics_pipeline). False: that key has one already,
