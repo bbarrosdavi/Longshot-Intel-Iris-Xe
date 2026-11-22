@@ -1,12 +1,9 @@
 #version 450
-#extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-// (Batch 12D) FP16-accelerated 3D Motion-Vector single-output frame interpolation (2x / fallback).
-// - Skips reading fa(g) on moving 3D world pixels (-8.3 MB/frame BW).
-// - Exact HUD alpha protection (fa.a / fb.a == 0.0): locks opaque/translucent/animated HUD AND blocks HUD bleed.
-// - Parallax-ahead foreground NPC rescue in eval_smooth (on rare err > 0.16 pixels) + color-match-first rule in eval_edge:
-//   prevents moving foreground NPCs (bearded man, old man's head) from ever being erased into background cobblestones,
-//   while still depth-resolving true occlusion/disocclusion strips (cliff/sky edges) with zero halos.
+// (Batch 13) Clean, artifact-free FP16 single-output 3D Motion-Vector synthesis (2x / Auto / >3x FG).
+// - Uses exact 3D camera+actor motion vectors (skipping fg_flow) where warped (fa, fb) agree cleanly and stay off HUD.
+// - On unmatchable pixels (animated limbs, shadows, water splashes, moving speech bubbles, disocclusion seams), smoothly
+//   falls back to unwarped near=(t<=0.5?a0:b0), matching fg_synth.comp's zero-speckle, zero-hole, zero-flicker guarantee.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D fa;
 layout(binding = 1) uniform sampler2D fb;
@@ -14,12 +11,12 @@ layout(binding = 2) uniform sampler2D mv_tex;
 layout(binding = 3) uniform sampler2D depth_tex;
 layout(binding = 4, rgba8) uniform writeonly image2D dst;
 layout(push_constant) uniform P {
-    float t0;
-    float t1;
+    float t;
+    float _pad;
     vec2 uv_scale;
     vec2 uv_max;
     vec2 mv_scale;
-    float depth_sign;   // +1.0 normal depth (larger=farther), -1.0 reversed depth (smaller=farther)
+    float depth_sign;
 } pc;
 
 float16_t gap(f16vec3 x, f16vec3 y) {
@@ -32,194 +29,58 @@ vec2 sample_v(vec2 pos, vec2 inv_size) {
     return -textureLod(mv_tex, uv, 0.0).xy * pc.mv_scale;
 }
 
-float sample_far_depth(vec2 pos, vec2 inv_size) {
-    const vec2 uv = clamp(pos * inv_size * pc.uv_scale, vec2(0.0), pc.uv_max);
-    return textureLod(depth_tex, uv, 0.0).r * pc.depth_sign;
-}
-
 bool mv_consistent(vec2 v, vec2 v_chk) {
     const vec2 dv = v_chk - v;
-    return dot(dv, dv) <= max(4.0, 0.025 * dot(v, v));
-}
-
-f16vec3 eval_smooth(ivec2 g, vec2 p, vec2 inv_size, vec2 max_v, f16vec4 b0_4, float t, vec2 vm) {
-    const vec2 uv_a = (p - t * vm) * inv_size;
-    const vec2 uv_b = (p + (1.0 - t) * vm) * inv_size;
-    bool in_a = all(greaterThanEqual(uv_a, vec2(0.0))) && all(lessThanEqual(uv_a, vec2(1.0)));
-    bool in_b = all(greaterThanEqual(uv_b, vec2(0.0))) && all(lessThanEqual(uv_b, vec2(1.0)));
-    const f16vec4 a4 = f16vec4(textureLod(fa, clamp(uv_a, vec2(0.0), vec2(1.0)), 0.0));
-    const f16vec4 b4 = f16vec4(textureLod(fb, clamp(uv_b, vec2(0.0), vec2(1.0)), 0.0));
-    in_a = in_a && (a4.a > 0.98hf);
-    in_b = in_b && (b4.a > 0.98hf);
-    if (in_a && in_b) {
-        const float16_t err = gap(a4.rgb, b4.rgb);
-        if (err > 0.16hf) {
-            // Rare mismatch inside smooth background field: probe parallax-ahead along vm (1.35x) to rescue
-            // nearer foreground NPCs/heads moving faster than background during fast camera pans!
-            const vec2 v_fg = sample_v(p + (1.0 - t) * vm * 1.35, inv_size);
-            if (all(lessThan(abs(v_fg), max_v)) && dot(v_fg - vm, v_fg - vm) > 9.0) {
-                const vec2 uaf = (p - t * v_fg) * inv_size;
-                const vec2 ubf = (p + (1.0 - t) * v_fg) * inv_size;
-                bool iaf = all(greaterThanEqual(uaf, vec2(0.0))) && all(lessThanEqual(uaf, vec2(1.0)));
-                bool ibf = all(greaterThanEqual(ubf, vec2(0.0))) && all(lessThanEqual(ubf, vec2(1.0)));
-                const f16vec4 af4 = f16vec4(textureLod(fa, clamp(uaf, vec2(0.0), vec2(1.0)), 0.0));
-                const f16vec4 bf4 = f16vec4(textureLod(fb, clamp(ubf, vec2(0.0), vec2(1.0)), 0.0));
-                iaf = iaf && (af4.a > 0.98hf);
-                ibf = ibf && (bf4.a > 0.98hf);
-                if (iaf && ibf) {
-                    const float16_t errf = gap(af4.rgb, bf4.rgb);
-                    if (errf < 0.26hf && errf + 0.04hf < err) {
-                        return mix(af4.rgb, bf4.rgb, float16_t(t));
-                    }
-                }
-            }
-        }
-        if (err > 0.08hf) {
-            const float16_t agree = 1.0hf - smoothstep(0.08hf, 0.22hf, err);
-            return mix(b4.rgb, mix(a4.rgb, b4.rgb, float16_t(t)), agree);
-        }
-        return mix(a4.rgb, b4.rgb, float16_t(t));
-    }
-    if (in_b) return b4.rgb;
-    if (in_a) return a4.rgb;
-    const f16vec4 a0_4 = f16vec4(texelFetch(fa, g, 0));
-    return (a0_4.a < 0.5hf || t > 0.5) ? b0_4.rgb : a0_4.rgb;
-}
-
-f16vec3 eval_edge(vec2 p, vec2 inv_size, vec2 max_v, f16vec4 a0_4, f16vec4 b0_4, float16_t moved, float t,
-                  vec2 v0, float v0_sq, bool ok0, vec2 v_alt) {
-    vec2 v1 = v_alt;
-    if (v0_sq < 4.0 && dot(v1, v1) >= 4.0) {
-        const vec2 v1r = sample_v(p + (1.0 - t) * v1, inv_size);
-        if (dot(v1r, v1r) >= 4.0) v1 = v1r;
-    }
-    const bool ok1 = all(lessThan(abs(v1), max_v));
-
-    const vec2 bv0 = ok0 ? v0 : vec2(0.0);
-    const vec2 uv_a0 = (p - t * bv0) * inv_size;
-    const vec2 uv_b0 = (p + (1.0 - t) * bv0) * inv_size;
-    bool in_a0 = all(greaterThanEqual(uv_a0, vec2(0.0))) && all(lessThanEqual(uv_a0, vec2(1.0)));
-    bool in_b0 = all(greaterThanEqual(uv_b0, vec2(0.0))) && all(lessThanEqual(uv_b0, vec2(1.0)));
-    const f16vec4 a0_s = f16vec4(textureLod(fa, clamp(uv_a0, vec2(0.0), vec2(1.0)), 0.0));
-    const f16vec4 b0_s = f16vec4(textureLod(fb, clamp(uv_b0, vec2(0.0), vec2(1.0)), 0.0));
-    in_a0 = in_a0 && (a0_s.a > 0.98hf);
-    in_b0 = in_b0 && (b0_s.a > 0.98hf);
-    const float16_t err0 = (in_a0 && in_b0) ? gap(a0_s.rgb, b0_s.rgb) : ((in_a0 || in_b0) ? 0.16hf : 1.0hf);
-    const bool cons0 = ok0 && in_b0 && ((v0_sq < 4.0) ? true : mv_consistent(v0, v1));
-    // Bidirectional color match rescues narrow foreground heads/limbs even when v_chk1 steps 2 px off the edge.
-    const bool match0 = in_a0 && in_b0 && (err0 < 0.28hf);
-
-    bool have1 = false, in_a1 = false, in_b1 = false, cons1 = false, match1 = false;
-    f16vec3 a1_rgb = f16vec3(0.0hf), b1_rgb = f16vec3(0.0hf);
-    float16_t err1 = 1.0hf;
-    if (ok1 && dot(v1 - bv0, v1 - bv0) > 4.0 && !(cons0 && err0 < 0.06hf)) {
-        have1 = true;
-        const vec2 uv_a1 = (p - t * v1) * inv_size;
-        const vec2 uv_b1 = (p + (1.0 - t) * v1) * inv_size;
-        in_a1 = all(greaterThanEqual(uv_a1, vec2(0.0))) && all(lessThanEqual(uv_a1, vec2(1.0)));
-        in_b1 = all(greaterThanEqual(uv_b1, vec2(0.0))) && all(lessThanEqual(uv_b1, vec2(1.0)));
-        const f16vec4 a1_s = f16vec4(textureLod(fa, clamp(uv_a1, vec2(0.0), vec2(1.0)), 0.0));
-        const f16vec4 b1_s = f16vec4(textureLod(fb, clamp(uv_b1, vec2(0.0), vec2(1.0)), 0.0));
-        in_a1 = in_a1 && (a1_s.a > 0.98hf);
-        in_b1 = in_b1 && (b1_s.a > 0.98hf);
-        a1_rgb = a1_s.rgb;
-        b1_rgb = b1_s.rgb;
-        err1 = (in_a1 && in_b1) ? gap(a1_rgb, b1_rgb) : ((in_a1 || in_b1) ? 0.16hf : 1.0hf);
-        const vec2 v_chk1 = sample_v(p + (1.0 - t) * v1, inv_size);
-        cons1 = in_b1 && mv_consistent(v1, v_chk1);
-        match1 = in_a1 && in_b1 && (err1 < 0.28hf);
-    }
-
-    bool use1 = false;
-    bool prefer_a = false;
-    if (match0 || match1) {
-        const float16_t s0 = err0 + (cons0 ? 0.0hf : 0.06hf);
-        const float16_t s1 = err1 + (cons1 ? 0.0hf : 0.06hf);
-        use1 = match1 && (!match0 || s1 + 0.01hf < s0);
-        prefer_a = !(use1 ? cons1 : cons0);
-    } else {
-        // Neither candidate matches both frames (err >= 0.28): true occlusion/disocclusion or animated mismatch.
-        if (have1 && v0_sq >= 4.0) {
-            const float d0 = sample_far_depth(p, inv_size);
-            const float d1 = sample_far_depth(p + (1.0 - t) * bv0, inv_size);
-            // Only pick farther background when depth separation is real AND v_far isn't a worse mismatch on an animated NPC;
-            // if d0 is already nearer (foreground pixel at p in fb), only replace with farther v1 when v0 failed consistency.
-            if (abs(d1 - d0) > 1e-4) {
-                use1 = (d1 > d0) && !cons0;
-            } else {
-                use1 = err1 + 0.02hf < err0;
-            }
-        }
-        prefer_a = !(use1 ? cons1 : cons0);
-    }
-
-    const bool in_a = use1 ? in_a1 : in_a0;
-    const bool in_b = use1 ? in_b1 : in_b0;
-    const f16vec3 a = use1 ? a1_rgb : a0_s.rgb;
-    const f16vec3 b = use1 ? b1_rgb : b0_s.rgb;
-    const float16_t err = use1 ? err1 : err0;
-
-    f16vec3 warped;
-    if (in_a && in_b) {
-        const float16_t agree = 1.0hf - smoothstep(0.10hf, 0.28hf, err);
-        warped = mix(prefer_a ? a : b, mix(a, b, float16_t(t)), agree);
-    } else if (prefer_a && in_a) {
-        warped = a;
-    } else if (in_b) {
-        warped = b;
-    } else if (in_a) {
-        warped = a;
-    } else {
-        warped = (a0_4.a < 0.5hf || t > 0.5) ? b0_4.rgb : a0_4.rgb;
-    }
-    const f16vec3 still = (a0_4.a < 0.5hf) ? b0_4.rgb : mix(a0_4.rgb, b0_4.rgb, float16_t(t));
-    return mix(still, warped, moved);
+    return dot(dv, dv) <= max(9.0, 0.12 * dot(v, v));
 }
 
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     const ivec2 d = imageSize(dst);
     if (any(greaterThanEqual(g, d))) return;
+    const f16vec4 a0_4 = f16vec4(texelFetch(fa, g, 0));
     const f16vec4 b0_4 = f16vec4(texelFetch(fb, g, 0));
     if (b0_4.a < 0.5hf) {
-        const f16vec3 a0 = f16vec3(texelFetch(fa, g, 0).rgb);
-        imageStore(dst, g, vec4(vec3(mix(a0, b0_4.rgb, float16_t(pc.t0))), 1.0));
+        imageStore(dst, g, vec4(vec3(mix(a0_4.rgb, b0_4.rgb, float16_t(pc.t))), 1.0));
         return;
     }
+    const float16_t moved = smoothstep(0.03hf, 0.09hf, gap(a0_4.rgb, b0_4.rgb));
+    const f16vec3 still = (a0_4.a < 0.5hf) ? b0_4.rgb : mix(a0_4.rgb, b0_4.rgb, float16_t(pc.t));
+    if (moved <= 0.0hf) {
+        imageStore(dst, g, vec4(vec3(still), 1.0));
+        return;
+    }
+    const f16vec3 near = (a0_4.a < 0.5hf || pc.t > 0.5) ? b0_4.rgb : a0_4.rgb;
+    const f16vec3 fallback = mix(still, near, moved);
     const vec2 d_f = vec2(d);
     const vec2 p = vec2(g) + 0.5;
     const vec2 inv_size = 1.0 / d_f;
     const vec2 max_v = d_f * 0.45;
     const vec2 v0 = sample_v(p, inv_size);
-    const float v0_sq = dot(v0, v0);
-    const bool ok0 = all(lessThan(abs(v0), max_v));
-
-    vec2 v_alt = v0;
-    if (ok0 && v0_sq >= 4.0) {
-        v_alt = sample_v(p + (1.0 - pc.t0) * v0, inv_size);
-        if (mv_consistent(v0, v_alt)) {
-            imageStore(dst, g, vec4(vec3(eval_smooth(g, p, inv_size, max_v, b0_4, pc.t0, 0.5 * (v0 + v_alt))), 1.0));
-            return;
-        }
-    }
-    const f16vec4 a0_4 = f16vec4(texelFetch(fa, g, 0));
-    const float16_t moved = smoothstep(0.03hf, 0.09hf, gap(a0_4.rgb, b0_4.rgb));
-    if (moved <= 0.0hf) {
-        imageStore(dst, g, vec4(vec3(mix(a0_4.rgb, b0_4.rgb, float16_t(pc.t0))), 1.0));
+    if (!all(lessThan(abs(v0), max_v)) || dot(v0, v0) < 0.25) {
+        imageStore(dst, g, vec4(vec3(fallback), 1.0));
         return;
     }
-    if (v0_sq < 4.0) {
-        float best_d2 = v0_sq;
-        vec2 dir = vec2(1.0, 0.0);
-        [[dont_unroll]] for (int i = 0; i < 4; i++) {
-            const vec2 n1 = sample_v(p + dir * 8.0, inv_size);
-            const float d1 = dot(n1, n1);
-            if (d1 > best_d2) best_d2 = d1, v_alt = n1;
-            const vec2 n2 = sample_v(p + dir * 20.0, inv_size);
-            const float d2 = dot(n2, n2);
-            if (d2 > best_d2) best_d2 = d2, v_alt = n2;
-            dir = vec2(-dir.y, dir.x);
-        }
+    const vec2 v_mid = sample_v(p + (1.0 - pc.t) * v0, inv_size);
+    if (!mv_consistent(v0, v_mid)) {
+        imageStore(dst, g, vec4(vec3(fallback), 1.0));
+        return;
     }
-    imageStore(dst, g, vec4(vec3(eval_edge(p, inv_size, max_v, a0_4, b0_4, moved, pc.t0, v0, v0_sq, ok0, v_alt)), 1.0));
+    const vec2 vm = 0.5 * (v0 + v_mid);
+    const vec2 uv_a = (p - pc.t * vm) * inv_size;
+    const vec2 uv_b = (p + (1.0 - pc.t) * vm) * inv_size;
+    const bool in_bounds = all(greaterThanEqual(uv_a, vec2(0.0))) && all(lessThanEqual(uv_a, vec2(1.0))) &&
+                           all(greaterThanEqual(uv_b, vec2(0.0))) && all(lessThanEqual(uv_b, vec2(1.0)));
+    if (!in_bounds) {
+        imageStore(dst, g, vec4(vec3(fallback), 1.0));
+        return;
+    }
+    const f16vec4 a4 = f16vec4(textureLod(fa, uv_a, 0.0));
+    const f16vec4 b4 = f16vec4(textureLod(fb, uv_b, 0.0));
+    if (a4.a <= 0.98hf || b4.a <= 0.98hf) {
+        imageStore(dst, g, vec4(vec3(fallback), 1.0));
+        return;
+    }
+    const float16_t agree = 1.0hf - smoothstep(0.06hf, 0.22hf, gap(a4.rgb, b4.rgb));
+    imageStore(dst, g, vec4(vec3(mix(fallback, mix(a4.rgb, b4.rgb, float16_t(pc.t)), moved * agree)), 1.0));
 }

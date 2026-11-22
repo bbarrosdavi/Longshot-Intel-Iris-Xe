@@ -109,6 +109,9 @@ struct TemporalMotion {
     uint64_t frame = 0;
 };
 bool temporal_last_motion(TemporalMotion& out);
+/// (Batch 13) Fallback 3D camera+actor motion prep before framegen_record() when no upscaler dispatch ran this frame
+/// (e.g. dlss=0 Native/TAAU with built-in FrameGen on): runs lean fg_mv_prep.comp + actor_motion from the scene depth.
+void temporal_prepare_fg_motion(VkCommandBuffer cmd, uint32_t out_w, uint32_t out_h);
 void temporal_reset_failure();
 
 /// For the renderer's status line (vk_replay.cpp status_tick): while an engine draws, its details since the last call into b

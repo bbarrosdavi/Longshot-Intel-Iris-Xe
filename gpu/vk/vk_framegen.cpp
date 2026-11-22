@@ -1645,8 +1645,11 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         tm.hud_before_view && tm.hud_after_view && tm.hud_after_tex && tm.hud_after_image &&
         tm.hud_w == sw && tm.hud_h == sh &&
         texture_alive(tm.hud_after_gpu, tm.hud_after_tex, tm.hud_after_image);
-    const bool fallback_hud = !exact_hud && use_mv && fg.copy_hud.pipe && fg.have_prev;
-    const bool use_copy_hud = exact_hud || fallback_hud;
+    // (Batch 13) Use fg_copy_hud only when exact before/after HUD diff is available (FSR3/DLSS/XeSS).
+    // In dlss=0 mode, motion-contradiction heuristic falsely flags flat dark shadows/wood/bright stone rims as HUD
+    // (alpha=0), punching salt-and-pepper fallback dots into 3D scenes; fg_synth2_mv's moved==0 guard already keeps
+    // static HUD elements completely unwarped with zero false positives.
+    const bool use_copy_hud = exact_hud;
     const bool need_luma = !dlss_held && (!fsr_wanted || auto_rate) && !use_mv && !use_copy_hud;
     const int game_slot = blend ? (m - 1) : 0;
     const bool direct_game = !auto_rate && m > 1 && !dlss_held && !fsr_wanted;
@@ -1708,7 +1711,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         if (mv_told != mv_sig) {
             mv_told = mv_sig;
             logf("vk: frame interpolation: using exact 3D camera+actor motion vectors + depth (%ux%u -> %ux%u, HUD mask: %s, skipping fg_flow)",
-                 tm.render_w, tm.render_h, uw, uh, exact_hud ? "exact before/after" : "motion-contradiction");
+                 tm.render_w, tm.render_h, uw, uh, exact_hud ? "exact before/after" : "static-guard");
         }
     }
     // (AMD FSR 3.1's source with the HUD marked, when it is asked: read by fsr3fi_frames below)

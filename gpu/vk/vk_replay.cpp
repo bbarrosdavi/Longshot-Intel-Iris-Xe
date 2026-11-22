@@ -5451,6 +5451,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t* wait_out = nullpt
         if (tex && framegen_on()) {
             tex->last_frame = texture_frame_no();
             tex->last_value = std::max(tex->last_value, value + 1);
+            temporal_prepare_fg_motion(r.cmd, sw, sh);
         }
         interpolated = framegen_on() && tex && fg_inline &&
                        framegen_record(r.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample), sw,

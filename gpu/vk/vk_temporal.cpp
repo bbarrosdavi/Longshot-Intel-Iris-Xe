@@ -1435,6 +1435,102 @@ bool temporal_fg_inputs() {
     return temporal_mode() == ur::GAME && (fsr3fi::frames_wanted() != 0 || (!mv_off && framegen_on()));
 }
 
+void temporal_prepare_fg_motion(VkCommandBuffer cmd, uint32_t out_w, uint32_t out_h) {
+    if (!cmd || !temporal_fg_inputs()) return;
+    State& s = st();
+    if (out_w && out_h && !s.out_w.load(std::memory_order_relaxed)) {
+        s.out_w.store(out_w, std::memory_order_relaxed);
+        s.out_h.store(out_h, std::memory_order_relaxed);
+    }
+    std::lock_guard lk(s.mu);
+    const uint64_t now = texture_frame_no();
+    if (s.last_mv.frame == now) return;   // already produced by temporal_upscale() / fg_inputs() this frame
+    const Camera cam = s.cam;
+    if (!cam.valid || now - cam.frame > 1 || !cam.depth || cam.depth_gen != texture_destroy_generation() ||
+        !temporal_scene_format(cam.scene_format))
+        return;
+    const uint32_t rw = cam.width, rh = cam.height;
+    if (!rw || !rh || cam.depth->width != rw || cam.depth->height != rh ||
+        !(cam.depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || cam.depth->samples != VK_SAMPLE_COUNT_1_BIT ||
+        !(cam.depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
+        return;
+    s.cam.valid = false;
+    struct SkinsDone {
+        State& s;
+        ~SkinsDone() { s.skins.clear(); }
+    } skins_done{s};
+    if (!make_pipelines()) return;
+    const VkImageView dview = depth_view(cam.depth);
+    if (!dview) return;
+    free_dead(false);
+    s.asked = now, s.holding = true;
+    struct Disturbed {
+        ~Disturbed() { descriptors_disturbed(); }
+    } disturbed;
+    if (!s.mv_prep_tried) {
+        s.mv_prep_tried = true;
+        const VkDescriptorType mv_types[3] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+        (void)make_pipeline(BUILTIN_SPV_ARGS(FG_MV_PREP_COMP_SPV), mv_types, 3, 84, s.mv_prep_set, s.mv_prep_layout,
+                            s.mv_prep);
+    }
+    if (s.mv_prep == VK_NULL_HANDLE) return;
+    const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (!make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, rw, rh, copied) ||
+        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied))
+        return;
+    float previous[16];
+    std::memcpy(previous, s.fg_last_vp, sizeof previous);
+    dlss_math::unjitter(previous, s.fg_last_jitter);
+    struct {
+        float reproject[16];
+        float jitter[2];
+        int32_t size[2];
+        int32_t flags;
+    } pc{};
+    const bool history = s.fg_last_frame && now - s.fg_last_frame <= 2;
+    const bool motion = history && dlss_math::reprojection(cam.current, previous, pc.reproject);
+    pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
+    pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
+    pc.flags = motion ? 1 : 0;
+    const uint64_t fg_last = s.fg_last_frame;
+    s.fg_last_frame = now;
+    std::memcpy(s.fg_last_vp, cam.current, sizeof s.fg_last_vp);
+    s.fg_last_jitter[0] = cam.jitter[0], s.fg_last_jitter[1] = cam.jitter[1];
+    full_barrier(cmd);
+    const VkDescriptorImageInfo info[3] = {{s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, s.depth.view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, s.motion.view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[3]{};
+    for (uint32_t i = 0; i < 3; i++) {
+        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstBinding = i, w[i].descriptorCount = 1, w[i].pImageInfo = &info[i];
+        w[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.mv_prep);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.mv_prep_layout, 0, 3, w);
+    vkCmdPushConstants(cmd, s.mv_prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
+    temporal_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    (void)actor_motion(cmd, cam, previous, rw, rh, dview, motion, fg_last);
+    temporal_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                     VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
+    s.last_mv = {};
+    s.last_mv.view = motion ? s.motion.view : VK_NULL_HANDLE;
+    s.last_mv.depth_view = motion ? s.depth.view : VK_NULL_HANDLE;
+    s.last_mv.render_w = rw, s.last_mv.render_h = rh;
+    s.last_mv.tex_w = s.motion.width, s.last_mv.tex_h = s.motion.height;
+    s.last_mv.depth_reversed = false;
+    s.last_mv.reset = !motion;
+    s.last_mv.frame = now;
+}
+
 bool temporal_last_motion(TemporalMotion& out) {
     State& s = st();
     std::lock_guard lk(s.mu);
