@@ -6659,9 +6659,15 @@ void draw_flush_recording(int slot) {
 
 namespace {
 void mesh_conv_begin_recording();   // (below, with the indirect mesh draws' conversion)
+VkCommandBuffer demote_cmd_outside_pass() {
+    if (!rec_cmd) return VK_NULL_HANDLE;
+    end_pass(rec_cmd);
+    return rec_cmd;
+}
 } // namespace
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     rec_cmd = cmd;
+    texture_set_demote_cmd_fn(demote_cmd_outside_pass);
     mesh_conv_begin_recording();   // (RX_VK_MESH_CONV read for the recording; the last batch let go)
     rec_value = value;
     if ((size_t)slot >= res.size()) res.resize((size_t)slot + 1);

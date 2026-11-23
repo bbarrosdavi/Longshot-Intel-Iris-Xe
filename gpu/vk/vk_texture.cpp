@@ -418,13 +418,111 @@ uint64_t pool_cap() {
     }();
     return mb << 20;
 }
-uint64_t pool_key_of(const VkImageCreateInfo& ci) {
+uint64_t pool_key_of(const VkImageCreateInfo& ci, uint8_t fmt_list_kind = 0) {
     uint64_t k = mix((uint64_t)ci.flags, (uint64_t)ci.imageType << 32 | (uint64_t)ci.format);
     k = mix(k, (uint64_t)ci.extent.width << 32 | ci.extent.height);
     k = mix(k, (uint64_t)ci.extent.depth << 32 | ci.mipLevels);
     k = mix(k, (uint64_t)ci.arrayLayers << 32 | (uint64_t)ci.samples);
-    k = mix(k, (uint64_t)ci.usage << 8 | (uint64_t)ci.tiling);
+    k = mix(k, (uint64_t)ci.usage << 8 | (uint64_t)ci.tiling | ((uint64_t)fmt_list_kind << 40));
     return k | 1;   // (0: not pooled)
+}
+
+// ---- (opt/iris-xe) Explicit VkImageFormatListCreateInfo for mutable images ----
+// On Intel Gen12 (Alder Lake / Iris Xe, Mesa ANV), mutable images with STORAGE_BIT and no VkImageFormatListCreateInfo
+// trigger driver fallbacks disabling CCS_E compression and forcing software detiling on 64-bit formats.
+// Passing explicit CCS_E-safe format lists preserves FCV_CCS_E and hardware fast clears; if a texture is ever later
+// viewed with an unlisted format, demote_format_list() recreates it unrestricted, copies contents, and remembers it.
+enum FmtListKind : uint8_t {
+    kFmtListNone = 0,
+    kFmtList8Ccs = 1,
+    kFmtList16Ccs = 2,
+    kFmtList32Ccs = 3,
+    kFmtList64Ccs = 4,
+    kFmtList128Ccs = 5,
+    kFmtListBc64 = 6,
+};
+bool fmt_list_enabled() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_FMT_LIST");
+        const bool v = e ? !env_value_off(e) : (dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA);
+        if (v) logf("vk: RX_VK_FMT_LIST=1: explicit VkImageFormatListCreateInfo for mutable images (CCS_E / no 64-bit software detiling)");
+        return v;
+    }();
+    return on;
+}
+TextureDemoteCmdFn demote_cmd_fn = nullptr;
+std::unordered_set<uint64_t> no_fmt_list_keys;   // textures that needed an unlisted view format (remembered across evictions)
+uint64_t demote_addr_key(uint64_t gpu, uint32_t w, uint32_t h) { return mix(gpu, (uint64_t)w << 32 | h); }
+
+uint32_t fill_fmt_list(uint8_t kind, VkFormat img_fmt, VkFormat out[16]) {
+    uint32_t n = 0;
+    auto add = [&](VkFormat f) {
+        if (n < 16) out[n++] = f;
+    };
+    switch (kind) {
+    case kFmtList8Ccs:
+        add(VK_FORMAT_R8_UNORM); add(VK_FORMAT_R8_SNORM); add(VK_FORMAT_R8_UINT); add(VK_FORMAT_R8_SINT);
+        return n;
+    case kFmtList16Ccs:
+        add(VK_FORMAT_R16_SFLOAT); add(VK_FORMAT_R16_UNORM); add(VK_FORMAT_R16_SNORM);
+        add(VK_FORMAT_R16_UINT); add(VK_FORMAT_R16_SINT);
+        add(VK_FORMAT_R8G8_UNORM); add(VK_FORMAT_R8G8_SNORM); add(VK_FORMAT_R8G8_UINT); add(VK_FORMAT_R8G8_SINT);
+        return n;
+    case kFmtList32Ccs:
+        add(VK_FORMAT_R8G8B8A8_UNORM); add(VK_FORMAT_R8G8B8A8_SRGB); add(VK_FORMAT_R8G8B8A8_SNORM);
+        add(VK_FORMAT_R8G8B8A8_UINT); add(VK_FORMAT_R8G8B8A8_SINT);
+        add(VK_FORMAT_B8G8R8A8_UNORM); add(VK_FORMAT_B8G8R8A8_SRGB);
+        add(VK_FORMAT_A2B10G10R10_UNORM_PACK32); add(VK_FORMAT_A2B10G10R10_UINT_PACK32);
+        add(VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+        add(VK_FORMAT_R16G16_SFLOAT); add(VK_FORMAT_R16G16_UNORM); add(VK_FORMAT_R16G16_SNORM);
+        add(VK_FORMAT_R16G16_UINT); add(VK_FORMAT_R16G16_SINT);
+        return n;
+    case kFmtList64Ccs:
+        add(VK_FORMAT_R16G16B16A16_SFLOAT); add(VK_FORMAT_R16G16B16A16_UNORM); add(VK_FORMAT_R16G16B16A16_SNORM);
+        add(VK_FORMAT_R16G16B16A16_UINT); add(VK_FORMAT_R16G16B16A16_SINT);
+        add(VK_FORMAT_R32G32_SFLOAT); add(VK_FORMAT_R32G32_UINT); add(VK_FORMAT_R32G32_SINT);
+        return n;
+    case kFmtList128Ccs:
+        add(VK_FORMAT_R32G32B32A32_SFLOAT); add(VK_FORMAT_R32G32B32A32_UINT); add(VK_FORMAT_R32G32B32A32_SINT);
+        return n;
+    case kFmtListBc64:
+        add(img_fmt);
+        if (img_fmt == VK_FORMAT_BC1_RGB_UNORM_BLOCK) add(VK_FORMAT_BC1_RGB_SRGB_BLOCK);
+        else if (img_fmt == VK_FORMAT_BC1_RGBA_UNORM_BLOCK) add(VK_FORMAT_BC1_RGBA_SRGB_BLOCK);
+        add(VK_FORMAT_R32G32_UINT); add(VK_FORMAT_R32G32_SINT); add(VK_FORMAT_R32G32_SFLOAT);
+        add(VK_FORMAT_R16G16B16A16_SFLOAT); add(VK_FORMAT_R16G16B16A16_UNORM); add(VK_FORMAT_R16G16B16A16_SNORM);
+        add(VK_FORMAT_R16G16B16A16_UINT); add(VK_FORMAT_R16G16B16A16_SINT);
+        return n;
+    default:
+        return 0;
+    }
+}
+bool fmt_list_contains(uint8_t kind, VkFormat img_fmt, VkFormat view_fmt) {
+    if (kind == kFmtListNone) return true;
+    VkFormat buf[16];
+    const uint32_t n = fill_fmt_list(kind, img_fmt, buf);
+    for (uint32_t i = 0; i < n; i++)
+        if (buf[i] == view_fmt) return true;
+    return false;
+}
+uint8_t pick_fmt_list_kind(VkFormat img_fmt, VkImageCreateFlags flags, bool sparse, uint64_t gpu, uint32_t w, uint32_t h) {
+    if (!fmt_list_enabled() || !(flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) || is_depth_format(img_fmt))
+        return kFmtListNone;
+    if (no_fmt_list_keys.count(demote_addr_key(gpu, w, h)))
+        return kFmtListNone;
+    if (is_bc(img_fmt)) {
+        if (img_fmt == VK_FORMAT_BC1_RGB_UNORM_BLOCK || img_fmt == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ||
+            img_fmt == VK_FORMAT_BC4_UNORM_BLOCK || img_fmt == VK_FORMAT_BC4_SNORM_BLOCK)
+            return kFmtListBc64;
+        return kFmtListNone;
+    }
+    if (is_astc(img_fmt)) return kFmtListNone;
+    static constexpr uint8_t kKinds[] = {kFmtList8Ccs, kFmtList16Ccs, kFmtList32Ccs, kFmtList64Ccs, kFmtList128Ccs};
+    for (uint8_t k : kKinds) {
+        if (k == kFmtList32Ccs && sparse) continue;   // sparse 32-bit cannot be copied in-place if demoted
+        if (fmt_list_contains(k, img_fmt, img_fmt)) return k;
+    }
+    return kFmtListNone;
 }
 /// An image leaving the pool leaves the class index
 void pool_unindex(std::list<Pooled>::iterator it) {
@@ -3033,19 +3131,28 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             *output_probe = {x.image, x.allocation, ci};
         return nullptr;   // (no commands, tracking, or texture cache entry for this image)
     }
+    // (longshot, RX_VK_COMPACT) an image that is not a render target's: from the textures' own pool, the one compacted
+    const bool in_textures = compact_on() && !x.sparse && !(as_target && !is_bc(x.format) && !is_astc(x.format));
+    if (!x.sparse) take_output_trial_image(t, ci, x.image, x.allocation);
+    const bool from_output_trial = x.image != VK_NULL_HANDLE;
+    VkFormat fmt_list_buf[16];
+    VkImageFormatListCreateInfo fli{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    const uint8_t flk = from_output_trial ? kFmtListNone : pick_fmt_list_kind(x.format, ci.flags, x.sparse, t->gpu, x.width, x.height);
+    if (flk != kFmtListNone) {
+        fli.viewFormatCount = fill_fmt_list(flk, x.format, fmt_list_buf);
+        fli.pViewFormats = fmt_list_buf;
+        ci.pNext = &fli;
+    }
+    x.fmt_list_kind = flk;
     // (a render target's image, not compressed: from the pool when one of this create info waits there, above)
     const uint64_t pool_key = as_target && !x.sparse && pool_cap() && !is_bc(x.format) && !is_astc(x.format) &&
                                       (x.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
-                                  ? pool_key_of(ci)
+                                  ? pool_key_of(ci, flk)
                                   : 0;
     x.pool_key = pool_key;
     const uint64_t reused_before = st_pool_reused, resized_before = st_pool_resized;
     x.create_flags = ci.flags;
     ImageNeed need{&ci};   // (a render target's requirements, asked once: the take by size and the size class read them)
-    // (longshot, RX_VK_COMPACT) an image that is not a render target's: from the textures' own pool, the one compacted
-    const bool in_textures = compact_on() && !x.sparse && !(as_target && !is_bc(x.format) && !is_astc(x.format));
-    if (!x.sparse) take_output_trial_image(t, ci, x.image, x.allocation);
-    const bool from_output_trial = x.image != VK_NULL_HANDLE;
     if (x.image) {
         // A detached trial image has the same creation parameters and still needs normal layout and cache registration.
     } else if (x.sparse) {
@@ -4007,12 +4114,88 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     return tex;
 }
 
+void texture_set_demote_cmd_fn(TextureDemoteCmdFn fn) {
+    demote_cmd_fn = fn;
+}
+
+namespace {
+bool demote_format_list(Texture* tex, VkFormat wanted, ViewUse use) {
+    if (!tex || tex->fmt_list_kind == kFmtListNone || tex->sparse) return false;
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.flags = tex->create_flags;
+    ci.imageType = tex->type;
+    ci.format = tex->format;
+    ci.extent = {tex->width, tex->height, tex->depth};
+    ci.mipLevels = tex->levels;
+    ci.arrayLayers = tex->layers;
+    ci.samples = tex->samples;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = tex->usage;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage new_img = VK_NULL_HANDLE;
+    VmaAllocation new_alloc = nullptr;
+    if (!create_image(ci, new_img, new_alloc, false, false)) {
+        logf("vk: fmt_list demote #%u %#llx %ux%u vk %d -> view vk %d FAILED create_image",
+             tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, (int)tex->format, (int)wanted);
+        return false;
+    }
+    VkCommandBuffer cmd = demote_cmd_fn ? demote_cmd_fn() : VK_NULL_HANDLE;
+    if (!cmd) cmd = upload_cmd();
+    full_barrier(cmd, "barrier (fmt_list demote pre)");
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = new_img;
+    b.subresourceRange = {tex->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+    std::vector<VkImageCopy> regions;
+    regions.reserve(tex->levels);
+    for (uint32_t l = 0; l < tex->levels; l++) {
+        VkImageCopy r{};
+        r.srcSubresource = r.dstSubresource = {tex->aspect, l, 0, tex->layers};
+        r.extent = {std::max(1u, tex->width >> l), std::max(1u, tex->height >> l), std::max(1u, tex->depth >> l)};
+        regions.push_back(r);
+    }
+    vkCmdCopyImage(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, new_img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)regions.size(),
+                   regions.data());
+    full_barrier(cmd, "barrier (fmt_list demote post)");
+    Dead d{};
+    d.value = std::max(tex->last_value, rec_value);
+    d.image = tex->image;
+    d.allocation = tex->allocation;
+    for (auto& kv : tex->views)
+        if (kv.second) d.views.push_back(kv.second);
+    dead.push_back(std::move(d));
+    tex->views.clear();
+    tex->image = new_img;
+    tex->allocation = new_alloc;
+    tex->fmt_list_kind = kFmtListNone;
+    tex->pool_key = tex->pool_key ? pool_key_of(ci, kFmtListNone) : 0;
+    tex->last_value = std::max(tex->last_value, rec_value);
+    no_fmt_list_keys.insert(demote_addr_key(tex->gpu, tex->width, tex->height));
+    gone_note(tex->id);
+    static int logged;
+    if (logged++ < 64)
+        logf("vk: fmt_list demote #%u %#llx %ux%u vk %d -> view vk %d (use %d)",
+             tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, (int)tex->format, (int)wanted, (int)use);
+    return true;
+}
+} // namespace
+
 VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkImageViewType type, ViewUse use,
                          VkFormat* format_out, VkFormat force_format) {
     if (!tex) return VK_NULL_HANDLE;
     const int nf = view_nvn_format(t, v);
     const VkFormat f = view_format_of(tex->format, tex->astc, tex->bc, nf, use, force_format);
     if (f == VK_FORMAT_UNDEFINED) return VK_NULL_HANDLE;
+    if (tex->fmt_list_kind != kFmtListNone && !fmt_list_contains(tex->fmt_list_kind, tex->format, f))
+        demote_format_list(tex, f, use);
     const bool depth = is_depth_format(tex->format);
 
     const uint32_t vl = view_level(v);
@@ -5392,6 +5575,13 @@ void compact_step(uint64_t completed) {
             ci.tiling = VK_IMAGE_TILING_OPTIMAL;
             ci.usage = t->usage;
             ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkFormat fl_buf[16];
+            VkImageFormatListCreateInfo fli{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+            if (t->fmt_list_kind != kFmtListNone) {
+                fli.viewFormatCount = fill_fmt_list(t->fmt_list_kind, t->format, fl_buf);
+                fli.pViewFormats = fl_buf;
+                ci.pNext = &fli;
+            }
             ok = vkCreateImage(dev.device, &ci, nullptr, &image) == VK_SUCCESS;
             if (ok && !image_compact_bind(i, image)) {
                 vkDestroyImage(dev.device, image, nullptr);

@@ -91,6 +91,7 @@ struct Texture {
     uint32_t key_layout = 0, key_cls = 0;   // (the key's storage layout and format class)
     bool vw_listed = false;   // (in the list of GPU-written textures of virtual pools: texture_flush_to_guest)
     uint64_t pool_key = 0;    // (a render target's image: its create info's key in the pool it goes to when the texture does)
+    uint8_t fmt_list_kind = 0; // (RX_VK_FMT_LIST: explicit VkImageFormatListCreateInfo kind, 0 = none / unrestricted)
     std::unordered_map<uint64_t, VkImageView> views;
     uint64_t view_failed_frame = 0;   // (transient allocation failure: retry uncached views next frame, keep cached ones usable)
     struct BlockAttachment {
@@ -131,6 +132,10 @@ bool texture_touch_quick(Texture* tex, bool for_sampling);
 uint32_t texture_epoch();
 /// Changes whenever a texture is destroyed (pointers to textures kept elsewhere go stale)
 uint64_t texture_destroy_generation();
+/// Optional hook so texture_view() can end an active render pass and obtain the active recording command buffer
+/// before demoting a CCS_E format-list image in-place.
+using TextureDemoteCmdFn = VkCommandBuffer (*)();
+void texture_set_demote_cmd_fn(TextureDemoteCmdFn fn);
 /// (RX_VK_EXACT_STALE) Whether what was resolved to the texture of creation number `id` at generation `since`
 /// still stands at generation `now` (texture_destroy_generation()): no generation between the two is that texture's going
 /// or one that makes every resolved view stale. False for id 0 (nothing was resolved) and past what the log holds.

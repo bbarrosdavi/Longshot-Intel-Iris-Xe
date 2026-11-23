@@ -1423,7 +1423,21 @@ void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size
     if (cap_free_async_on() && !cap_shutting_down.load()) return destroy_buffer_later(buffer, alloc);
     destroy_buffer(buffer, alloc);
 }
+// (opt/iris-xe) 4-entry MRU cache of recent cap_bufs entries under pools_mu: avoids std::map lookup on ~78% of UBO/handle reads
+struct CapMru { uint64_t gen = 0; CapBuf* cb = nullptr; };
+CapMru cap_mru[4]{};
+uint32_t cap_mru_next = 0;
+inline void cap_mru_clear() { for (auto& m : cap_mru) m = {}; }
+inline CapBuf* cap_buf_find_locked(uint64_t gen) {
+    for (int i = 0; i < 4; i++)
+        if (cap_mru[i].gen == gen && cap_mru[i].cb) return cap_mru[i].cb;
+    auto b = cap_bufs.find(gen);
+    if (b == cap_bufs.end()) return nullptr;
+    cap_mru[cap_mru_next++ & 3] = {gen, &b->second};
+    return &b->second;
+}
 void cap_buf_retire(std::map<uint64_t, CapBuf>::iterator it) {
+    cap_mru_clear();
     cap_bytes -= it->second.size;
     cap_buf_free(it->second.buffer, it->second.alloc, it->second.map, it->second.size);
     cap_bufs.erase(it);
@@ -1783,10 +1797,10 @@ struct SubmittedPage {   // (a page no capture holds, as of pgen and view: the r
 // another, and with one page kept nearly every read missed and took pools_mu (program_for's answer handles). A page a
 // capture holds is not kept: its words are copied from the capture under pools_mu at each read, not the whole 4 KB page
 // into a copy of the thread's own (that copy was a third of the replay's thread in Kokiri Forest on NVIDIA Linux)
-constexpr int kSubmittedPages = 32;
+constexpr int kSubmittedPages = 256;
 thread_local SubmittedPage submitted_pages[kSubmittedPages];
-inline SubmittedPage& submitted_page_for(uint64_t page) {   // (a page and its neighbours, and pages 32 apart, in different slots)
-    return submitted_pages[(page + (page >> 5) * 13) & (kSubmittedPages - 1)];
+inline SubmittedPage& submitted_page_for(uint64_t page) {   // (a page and its neighbours, and pages 256 apart, in different slots)
+    return submitted_pages[(page + (page >> 8) * 13) & (kSubmittedPages - 1)];
 }
 
 void late_fix_cpu_read(uint32_t page, VkBuffer buffer, uint8_t* slot);   // (pools_mu held: the late pages' fix, below)
@@ -1824,12 +1838,12 @@ int64_t submitted_read_locked(uint64_t guest, void* dst, uint64_t n) {
     for (uint64_t page = guest >> kPageShift; page < (guest + n + 4095) >> kPageShift; page++) {
         const CapEntry e = cap_entry(page);
         if (!e.gen || e.gen != page_gen(page)) continue;
-        auto b = cap_bufs.find(e.gen);
-        if (b == cap_bufs.end() || !b->second.map) continue;
-        late_fix_cpu_read((uint32_t)page, b->second.buffer, (uint8_t*)b->second.map + (uint64_t)e.slot * 4096);
-        if (late_defer_any()) late_defer_cpu_read((uint32_t)page, e.gen, e.slot, b->second.alloc, (uint8_t*)b->second.map);
+        CapBuf* cb = cap_buf_find_locked(e.gen);
+        if (!cb || !cb->map) continue;
+        late_fix_cpu_read((uint32_t)page, cb->buffer, (uint8_t*)cb->map + (uint64_t)e.slot * 4096);
+        if (late_defer_any()) late_defer_cpu_read((uint32_t)page, e.gen, e.slot, cb->alloc, (uint8_t*)cb->map);
         const uint64_t a = std::max(page << kPageShift, guest), z = std::min((page + 1) << kPageShift, guest + n);
-        std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
+        std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)cb->map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
         from++;
     }
     if (page0 == page1 && from == 0) {   // (in no capture: guest memory stands for its next words too)

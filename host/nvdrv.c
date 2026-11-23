@@ -179,37 +179,59 @@ static int cmp_range(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 int hos_gpu_guest_ranges(uint64_t (*out)[2], int max) {
+    static uint64_t (*raw)[2];
     static uint64_t (*merged)[2];
-    static int nmerged, capmerged;
+    static int nmerged, capmerged, last_max;
     LOCK();
-    if (maps_changed) {
+    if (maps_changed || (max > 0 && max < nmerged) || (max != last_max && nmerged >= last_max)) {
         maps_changed = 0;
+        last_max = max;
         const int nall = nmaps + ntracked;   /* (the GPU mappings and the native NVN pools) */
         if (capmerged < nall) {
             capmerged = nall + 64;
+            raw = (uint64_t (*)[2])realloc(raw, (size_t)capmerged * sizeof *raw);
             merged = (uint64_t (*)[2])realloc(merged, (size_t)capmerged * sizeof *merged);
         }
         for (int i = 0; i < nmaps; i++) {
-            merged[i][0] = maps[i].guest & ~0xFFFULL;
-            merged[i][1] = (maps[i].guest + maps[i].size + 0xFFF) & ~0xFFFULL;
+            raw[i][0] = maps[i].guest & ~0xFFFULL;
+            raw[i][1] = (maps[i].guest + maps[i].size + 0xFFF) & ~0xFFFULL;
         }
-        for (int i = 0; i < ntracked; i++) merged[nmaps + i][0] = tracked[i].lo, merged[nmaps + i][1] = tracked[i].hi;
-        qsort(merged, (size_t)nall, sizeof *merged, cmp_range);
-        nmerged = 0;
+        for (int i = 0; i < ntracked; i++) raw[nmaps + i][0] = tracked[i].lo, raw[nmaps + i][1] = tracked[i].hi;
+        if (nall > 1) qsort(raw, (size_t)nall, sizeof *raw, cmp_range);
+#if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
+        /* Soft write watch (a64_dirty[]): no per-range syscall cost; merging 16 MB gaps forced scanning
+           4096 bytes (64 cache lines) of cold a64_dirty[] per hole on every submit. Start at 256 KB
+           (1 cache line of a64_dirty[], overridable via HOS_RANGE_GAP_KB) and double only if needed to fit max. */
+        static int gap_init = 0;
+        static uint64_t base_gap = 256ULL << 10;
+        if (!gap_init) {
+            gap_init = 1;
+            const char *e = getenv("HOS_RANGE_GAP_KB");
+            if (e) base_gap = (uint64_t)strtoull(e, NULL, 10) << 10;
+        }
+        uint64_t gap = base_gap;
+#else
         /* ranges less than 16 MB apart are one: a GetWriteWatch call costs about what 16 MB of range does, and
            TOTK maps ~4000 pieces */
-        for (int i = 0; i < nall; i++) {
-            if (nmerged && merged[i][0] <= merged[nmerged - 1][1] + (16ULL << 20)) {
-                if (merged[i][1] > merged[nmerged - 1][1]) merged[nmerged - 1][1] = merged[i][1];
-            } else {
-                merged[nmerged][0] = merged[i][0];
-                merged[nmerged][1] = merged[i][1];
-                nmerged++;
+        uint64_t gap = 16ULL << 20;
+#endif
+        for (;;) {
+            nmerged = 0;
+            for (int i = 0; i < nall; i++) {
+                if (nmerged && raw[i][0] <= merged[nmerged - 1][1] + gap) {
+                    if (raw[i][1] > merged[nmerged - 1][1]) merged[nmerged - 1][1] = raw[i][1];
+                } else {
+                    merged[nmerged][0] = raw[i][0];
+                    merged[nmerged][1] = raw[i][1];
+                    nmerged++;
+                }
             }
+            if (max <= 0 || nmerged <= max || gap >= (1ULL << 30)) break;
+            gap = gap ? gap * 2 : (256ULL << 10);
         }
     }
-    int n = nmerged < max ? nmerged : max;
-    memcpy(out, merged, (size_t)n * sizeof *merged);
+    int n = max > 0 ? (nmerged < max ? nmerged : max) : 0;
+    if (n > 0) memcpy(out, merged, (size_t)n * sizeof *merged);
     UNLOCK();
     return n;
 }
