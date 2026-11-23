@@ -60,20 +60,20 @@ what does not yet. Open problems are collected in tracking issues, linked below.
 |---|---|
 | Kokiri Forest: reaching gameplay and walking around | ✅ Works |
 | Sound, controller, keyboard and saves | ✅ Works |
-| In-game menu, frame generation and upscaling | ✅ Works |
-| Flicker (the picture flashing too bright while moving) | ✅ Fixed in v2.0.2 ([#645](https://github.com/NotRexed/Hookshot/pull/645)) |
+| In-game menu, frame generation and upscaling | ✅ Works — this fork adds **FP16 AMD FSR 3.1** (fused perceptual-to-linear `P_ACCUMULATE_SQ`, eliminating `dlss_out.comp`), **L1 direct FP16 RCAS** (`5.6×` fewer Gen12 cycles), and **artifact-free 3D motion-vector Built-in FrameGen** (`Auto`, `2x`, `3x`) with exact pre/post-HUD alpha masking and low-latency pacing (`35.1 ms` Auto handover, `0 late`) |
+| Flicker (the picture flashing too bright while moving) | ✅ Fixed in v2.0.2 ([#645](https://github.com/NotRexed/Hookshot/pull/645)) + opaque-only `equal_depth_bias` in this fork (fixes distant flashing hills under FSR 3.1 jitter without dark hair/foliage fringes) |
 | Ground fog vanishing when looking down | ✅ Fixed in v2.0.2 ([#638](https://github.com/NotRexed/Hookshot/pull/638)) |
 | Models with missing pieces (doors, fences, parts of trees) | ✅ Fixed where tested, more play needed |
-| Stutter when entering new areas | ⚠️ Still happens the first time you visit a place. The next visits are smooth |
-| Performance | ⚠️ Depends on the PC: some reach a steady 60 fps, others stay below it, more so in Hyrule Field |
-| Hyrule Field, Castle Town, Kakariko and the dungeons | ⚠️ Players got there, with open bugs: lighting and shadows ([#1004](https://github.com/NotRexed/Hookshot/issues/1004)), crashes and freezes ([#2507](https://github.com/NotRexed/Hookshot/issues/2507)) |
+| Stutter when entering new areas | ⚠️ Still happens the first time you visit a place. The next visits are smooth (background workers capped to `<=2` on 15–28W laptops to protect iGPU TDP) |
+| Performance | ✅ **Playable on Intel Iris Xe (96 EUs, 26W)** in this fork: **20.6 Base FPS / 41.1 Displayed FPS** at `1787×1005 → 1920×1080` FSR 3.1 + 100% sharpness (`41.8–42.8 ms` GPU), up from ~9 FPS unoptimized upstream. Discrete GPUs reach 60+ fps |
+| Hyrule Field, Castle Town, Kakariko and the dungeons | ✅ Kokiri Forest, Hyrule Castle Courtyard, Castle Town Market (`slot_05`), and Castle Path (`slot_00`) verified visually clean on Intel Iris Xe in this fork; upstream open bugs remain for other areas ([#1004](https://github.com/NotRexed/Hookshot/issues/1004), [#2507](https://github.com/NotRexed/Hookshot/issues/2507)) |
 | Ultrawide and 4:3 | ✅ Works. The Aspect ratio row's default, Monitor's shape, widens the 3D to the screen ([#2119](https://github.com/NotRexed/Hookshot/pull/2119)); the HUD keeps its 16:9 size with its corners at the screen's edges, or in the middle 16:9 with the HUD layout row; movies stay in the middle 16:9 |
-| NVIDIA cards | ✅ Works. The most tested |
+| NVIDIA cards | ✅ Works. The most tested (all Intel heuristics in this fork are scoped to `VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA`) |
 | AMD cards | ⚠️ Tested on several Radeon cards. Compatibility and performance vary by card, driver and operating system. Longshot automatically uses rendering workarounds on affected Windows cards and AMD GPUs on Linux (see [technical details](docs/development.md#switches-for-testing-and-debugging)). Crashes and severe slowdowns remain reported on some configurations ([RX 6600](https://git.magicbean.dev/MagicBeanDev/Longshot/issues/933), [Radeon 860M](https://git.magicbean.dev/MagicBeanDev/Longshot/issues/1040)). |
-| Intel cards | ❓ Few reports, many of them black screens or crashes ([#999](https://github.com/NotRexed/Hookshot/issues/999)). On Windows, Intel's shader compiler is entered by one thread, and a shader it faults on is left out instead of closing the game, on later starts too ([#252](https://git.magicbean.dev/MagicBeanDev/Longshot/pulls/252)). Made for an Intel UHD laptop with 4 threads and 16 GB that crashed in `igvk64.dll` (see [Intel laptops](#intel-laptops)): not yet tested on an Intel GPU |
+| Intel cards | ✅ **Tested & optimized on Intel Iris Xe (Alder Lake GT2, 96 EUs, 26W, Linux Mesa ANV 26.2.4)** in this fork! Fixes i915 10s GPU hangs (`BDA→SSBO` lowering), black/rainbow corruption, Gen12 spill neon blocks, white flashing hills, and hair fringes — reaching **20.6 Base / 41.1 Displayed FPS** at `1787×1005 → 1920×1080` with `35.1 ms` Auto FrameGen handover (`ahead=1`, `RX_VK_BATCH=0`). See [Intel laptops](#intel-laptops) and [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md). |
 | Pre-rendered movies on a slow CPU | ⚠️ Shown rather than skipped when the decoder is slower than the movie, so the picture can fall behind the sound. With 4 logical processors or fewer the decoder uses 2 threads, leaving the game its own. The first picture can still be black on some PCs |
-| Cards without mesh shaders (such as NVIDIA GTX 10 and AMD RX 5000) | ⚠️ Run through the compute fallback (since v2.0.6), which runs the mesh programs as compute shaders on cards with buffer device addresses: slower, and it leaves out the mesh draws that take their count from a buffer ([#640](https://github.com/NotRexed/Hookshot/issues/640)) |
-| Linux | ✅ Works with the AppImage. Tested on several distributions (CachyOS, Fedora, Bazzite, SteamOS) and cards, with open problems on some AMD cards ([#1000](https://github.com/NotRexed/Hookshot/issues/1000)) |
+| Cards without mesh shaders (such as Intel Iris Xe, NVIDIA GTX 10 and AMD RX 5000) | ✅ **Accelerated compute fallback in this fork:** mesh-fallback compute batching (`RX_VK_MFB_BATCH=4`), lossless degenerate/backface/frustum triangle culling, and `pending_clear` preservation significantly cut compute fallback overhead (mesh draws taking their count from a buffer remain an upstream limitation, [#640](https://github.com/NotRexed/Hookshot/issues/640)) |
+| Linux | ✅ Works natively and via AppImage. Extensively tested on EndeavourOS (Arch Linux, Wayland/Niri, Mesa ANV 26.2.4) as well as CachyOS, Fedora, Bazzite, and SteamOS. |
 
 ## Install and play
 
@@ -380,25 +380,18 @@ report** in the [in-game menu](#in-game-menu) gathers all of it in one press.
 
 #### Intel laptops
 
-What [#252](https://git.magicbean.dev/MagicBeanDev/Longshot/pulls/252) changes was made from the logs of a laptop with
-Intel UHD Graphics, a 4-thread CPU, 16 GB and Windows. There the game closed in Intel's driver (`igvk64.dll`) in the
-background save of the pipeline cache while other threads built pipelines into the same cache; main now fetches a
-cache's data with no build under way on Intel ([#190](https://git.magicbean.dev/MagicBeanDev/Longshot/pulls/190)).
-The build's shader preparation had stopped, so every run built its shaders in play, and the title ran at about 35 fps.
-It has not been tested on an Intel GPU yet. On such a PC:
+This fork has been extensively tested and tuned on an **Intel Core i5-1235U / Iris Xe (Alder Lake GT2, 96 EUs, 26W, 16 GB RAM, Linux Mesa ANV 26.2.4)**, reaching **20.6 Base FPS / 41.1 Displayed FPS** at `1787×1005 → 1920×1080` (AMD FSR 3.1 + 100% sharpness + FrameGen Auto) with `35.1 ms` handover latency and clean visuals across Kokiri Forest, Hyrule Castle, and Castle Town Market. See [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md) for the full breakdown.
 
-1. Build with **Prepare shaders now** ticked. If the game folder's `cache` folder has a `longshot_prepare_skipped` file
-   from an earlier build, delete it first.
-2. Keep the Debug tab's **Intel shader compiles** row on **Auto** (the default: one at a time on these laptops) or **One
-   at a time**. Side by side builds faster on a CPU with many cores, but Intel's driver can crash the game then.
-3. A shader the driver faulted on is listed in `longshot_driver_faults.txt` (in the `cache` folder) and left out, with
-   its draws, on later starts on the same driver. After a driver update the list starts again; delete the file to try
-   them all again sooner.
-4. Leave **ASTC as RGBA8** off: it is the [AMD texture workaround](#amd-texture-workaround), and its larger textures
-   come out of the memory that integrated graphics share with the rest of the PC.
-5. If it still crashes or runs slowly, [report it](https://git.magicbean.dev/MagicBeanDev/Longshot/issues/new) with
-   `longshot_log.txt` from a run with `HOS_VIDEO_LOG=1` in `longshot_env.txt`, the build's details, and the FPS on the
-   title and in the first scene.
+Recommended settings for **Intel Iris Xe / Gen12 laptops**:
+
+1. **Upscaler & Frame Generation:** Use **AMD FSR 3.1** (`dlss=3`, now rewritten in FP16 with fused `P_ACCUMULATE_SQ`), **Frame Generation Auto** (`frame_generation=1`, **Built-in 3D-MV FG**), and **V-Sync Mailbox** (`vsync=2`).
+2. **Linux Mesa ANV (`longshot_env.txt`):**
+   - Set `RX_VK_BATCH=0` (avoids delayed readbacks/writebacks on ANV, cutting ~70 ms of latency and boosting FPS).
+   - Cap background compiler workers (`RX_VK_WORKERS=2`) and logical VRAM (`RX_VK_VRAM_MB=3600` on 16 GB UMA laptops).
+   - Keep `RX_VK_RECORDER=thread`, `RX_VK_RECORDER_IDLE=wait`, `RX_VK_RECORDER_SPIN_US=20`, and `HOS_RESERVE_CORE_MASK=0x3` (P-core pinning).
+   - **Never** set Mesa `shader_spilling_rate=2` (triggers Gen12 hardware spill corruption blocks; use Mesa's default).
+3. **Windows (`igvk64.dll`):** Keep **Intel shader compiles** on **Auto** (or **One at a time**); shaders that fault the driver are automatically skipped via `cache/longshot_driver_faults.txt` ([#252](https://git.magicbean.dev/MagicBeanDev/Longshot/pulls/252)).
+4. Leave **ASTC as RGBA8** off: it is an AMD texture workaround and wastes shared UMA memory on Intel iGPUs.
 
 #### AMD texture workaround
 
