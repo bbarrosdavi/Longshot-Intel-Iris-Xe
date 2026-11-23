@@ -9,17 +9,19 @@ This PR contributes a comprehensive, empirically validated set of GPU, shader, F
 |---|---:|---:|---:|---:|---|
 | **Unoptimized Upstream (`nightly-469-9af4808f`)** | `~9` | `~9` | `>110 ms` | N/A | Unplayable: black/rainbow surface corruption + i915 10s GPU hangs |
 | **First Functional Baseline (Batch 5–10)** | `~13` | `~13–24` | `~75 ms` | `>160 ms` | Bootable, but blocky + Gen12 spill glow/white blow-out + hair fringes + `~7 ms` optical-flow FG |
-| **Clean-Visual Checkpoint (`suprassumo`, Batch 14)** | `14.0` | `28.0` (2x) | `53.9 ms` | `156.9 ms` (`BATCH=1`) | Clean visuals at `1787×1005 → 1920×1080` FSR 3.1 + 100% sharpness, high input lag |
-| **Final (`supertop`, Batch 15 — FG Auto)** | **`20.56`** (**2.3×** vs upstream / **+58%** vs func. baseline) | **`41.1`** | **`41.8–42.8 ms`** | **`35.1 ms`** (`0 late`) | Clean across all areas + `-50 ms` GPU queue depth (`ahead=1`) |
-| **Final (`supertop`, Batch 15 — FG 2x)** | **`20.1`** | **`40.2`** | **`42.2 ms`** | **`65.5 ms`** (`0 late`) | Clean across all areas, `0 <12 ms` bursts |
+| **Batch 14 (Visual Stability Checkpoint)** | `14.0` | `28.0` (2x) | `53.9 ms` | `156.9 ms` (`BATCH=1`) | Clean visuals at `1787×1005 → 1920×1080` FSR 3.1 + 100% sharpness, high input lag |
+| **Batch 15 Final — FG Auto** | **`20.56`** (**2.3×** vs upstream / **+58%** vs func. baseline) | **`41.1`** | **`41.8–42.8 ms`** | **`35.1 ms`** (`0 late`) | Clean across all areas + `-50 ms` GPU queue depth (`ahead=1`) |
+| **Batch 15 Final — FG 2x** | **`20.1`** | **`40.2`** | **`42.2 ms`** | **`65.5 ms`** (`0 late`) | Clean across all areas, `0 <12 ms` bursts |
 
 ### Visual Comparison
 
-| Unoptimized Upstream (`~9 FPS`, black/rainbow corruption) | Final `supertop` (Kokiri Forest — 100% clean) |
+| Before — Unoptimized Upstream (`~9 FPS`) | After — Optimized Build (Kokiri Forest) |
 |:---:|:---:|
 | ![Unoptimized upstream 9 FPS](docs/images/iris-xe/01_baseline_unoptimized_kokiri_9fps.jpg) | ![Optimized Kokiri Forest](docs/images/iris-xe/04_optimized_kokiri_clean.jpg) |
-| **First Functional Baseline (`~13 FPS`, blocky)** | **Final `supertop` (Castle Town Market — 100% clean)** |
-| ![First functional baseline 13 FPS](docs/images/iris-xe/02_functional_baseline_deku_13fps.jpg) | ![Optimized Market](docs/images/iris-xe/05_optimized_market_clean.jpg) |
+
+| Before — First Functional Baseline (`~13 FPS`) | After — Optimized Build (Hyrule Castle Path) |
+|:---:|:---:|
+| ![First functional baseline 13 FPS](docs/images/iris-xe/02_functional_baseline_deku_13fps.jpg) | ![Optimized Castle Wagon](docs/images/iris-xe/06_optimized_castle_wagon_clean.jpg) |
 
 Full technical write-up and per-pass breakdown: [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md).
 

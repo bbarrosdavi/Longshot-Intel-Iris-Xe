@@ -34,17 +34,17 @@ Longshot is a continuation of [Hookshot](https://github.com/NotRexed/Hookshot). 
 <br>
 
 > [!NOTE]
-> **Intel Iris Xe / Gen12 Optimization Fork (`opt/iris-xe`):** This fork makes **Longshot** fully playable, artifact-free, and responsive on **Intel Iris Xe / Gen12 integrated GPUs (Linux Mesa ANV)** — taking it from **~9 FPS with severe black/rainbow corruption & i915 GPU hangs** (unoptimized upstream) and **~13 FPS** (first functional baseline with Gen12 glow/spill artifacts) to **20.56 Base FPS / 41.1 Displayed FPS** at `1787×1005 → 1920×1080` (AMD FSR 3.1, 100% sharpness, `35.1 ms` Auto FrameGen handover, `0 late`).
+> **Intel Iris Xe / Gen12 Optimization Fork (`opt/iris-xe`):** This fork makes **Longshot** playable, visually clean, and responsive on **Intel Iris Xe / Gen12 integrated GPUs (Linux Mesa ANV)** — taking it from **~9 FPS with severe black/rainbow corruption & i915 GPU hangs** (unoptimized upstream) and **~13 FPS** (first functional baseline with Gen12 glow/spill artifacts) to **20.56 Base FPS / 41.1 Displayed FPS** at `1787×1005 → 1920×1080` (AMD FSR 3.1, 100% sharpness, `35.1 ms` Auto FrameGen handover, `0 late`).
 >
 > 📄 Full benchmarks & engineering write-up: [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md) · Upstream PR summary: [`PR_INTEL_IRIS_XE.md`](PR_INTEL_IRIS_XE.md)
 >
-> | Unoptimized Upstream (`~9 FPS`, black/rainbow corruption) | First Functional Baseline (`~13 FPS`, blocky + Gen12 bugs) |
+> | Before — Unoptimized Upstream (`~9 FPS`, black/rainbow corruption) | After — Optimized Build (`opt/iris-xe`, Kokiri Forest) |
 > |:---:|:---:|
-> | ![Unoptimized upstream 9 FPS](docs/images/iris-xe/01_baseline_unoptimized_kokiri_9fps.jpg) | ![First functional baseline 13 FPS](docs/images/iris-xe/02_functional_baseline_deku_13fps.jpg) |
-> | **Mid-Dev Gen12 Spill/Bloom Bug (`shader_spilling_rate=2`)** | **Final `supertop` (`opt/iris-xe`, Kokiri Forest — clean)** |
-> | ![Gen12 spill bloom bug](docs/images/iris-xe/03_gen12_spill_bloom_bug_castle.jpg) | ![Optimized Kokiri Forest](docs/images/iris-xe/04_optimized_kokiri_clean.jpg) |
-> | **Final `supertop` (Castle Town Market — zero corruption)** | **Final `supertop` (Hyrule Castle Path — razor-sharp FSR 3.1)** |
-> | ![Optimized Market](docs/images/iris-xe/05_optimized_market_clean.jpg) | ![Optimized Castle Wagon](docs/images/iris-xe/06_optimized_castle_wagon_clean.jpg) |
+> | ![Before: Unoptimized upstream 9 FPS](docs/images/iris-xe/01_baseline_unoptimized_kokiri_9fps.jpg) | ![After: Optimized Kokiri Forest](docs/images/iris-xe/04_optimized_kokiri_clean.jpg) |
+>
+> | Before — First Functional Baseline (`~13 FPS`, blocky) | After — Optimized Build (`opt/iris-xe`, Hyrule Castle Path) |
+> |:---:|:---:|
+> | ![Before: First functional baseline 13 FPS](docs/images/iris-xe/02_functional_baseline_deku_13fps.jpg) | ![After: Optimized Hyrule Castle Path](docs/images/iris-xe/06_optimized_castle_wagon_clean.jpg) |
 
 > [!IMPORTANT]
 > This repository **does not contain the game, keys or an executable**, and it does not explain how to get them. You
