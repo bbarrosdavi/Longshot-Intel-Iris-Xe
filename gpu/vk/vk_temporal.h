@@ -151,6 +151,8 @@ struct TemporalFrame {
     /// (longshot) depth holds 1 - d (the engine's fsr_depth, where the projection puts the near plane at 0: FSR 3.1). Anything
     /// else that reads this frame's depth (frame generation, other passes) must look here, not assume the plain depth
     bool depth_reversed = false;
+    /// (Batch 15) Direct squared output into game's B10G11R11 target (skips dlss_out.comp and s.output RGBA16F roundtrip)
+    bool square_output = false;
 };
 /// An engine: plain functions, each called with the chain's lock held, on the recording thread
 struct TemporalEngine {

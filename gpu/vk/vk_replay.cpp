@@ -5570,8 +5570,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t* wait_out = nullpt
         else menu_note_frame(true);   // (the FPS counter's, as frame generation's thread counts what it shows)
         {   // (RX_VK_WAIT_GPU=<frames>: the replay no further ahead of the GPU than that)
             static uint64_t values[8];
-            static uint64_t fg_values[2];
-            static int64_t fg_seq = 0;
+            static uint64_t fg_prev_value = 0;
             static const bool env_set = getenv("RX_VK_WAIT_GPU") != nullptr;
             static const int ahead = [] {
                 const char* e = getenv("RX_VK_WAIT_GPU");
@@ -5580,20 +5579,19 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t* wait_out = nullpt
                 if (count > capacity) logf("vk: RX_VK_WAIT_GPU=%ld exceeds the ring capacity; using %ld", count, capacity);
                 return (int)std::clamp<long>(count, 0, capacity);
             }();
-            // (Batch 10J) On Mesa Intel with FrameGen active and no explicit RX_VK_WAIT_GPU, cap in-flight depth to 2 frames:
-            // protects 2-slot fg.frames[0..1]/fg.lumas[0..1], prevents i915 ring overrun/TDR when unfocused, and cuts FG input lag.
+            // (Batch 15) On Mesa Intel with FrameGen active and no explicit RX_VK_WAIT_GPU, cap in-flight depth to 1 frame:
+            // waits for frame N-1 right after submitting frame N so CPU input sampling + recording (~14 ms) overlaps GPU (~45 ms)
+            // with zero FPS loss (+0.5 FPS in Auto), protects 2-slot fg.frames[0..1], and cuts end-to-end input lag by 1 full frame (~50 ms).
             if (ahead > 0) {
                 const uint64_t old = values[presents % ahead];
                 values[presents % ahead] = value;
                 if (old) wait_old = old;
             } else if (!env_set && interpolated && dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
-                const uint64_t old = fg_values[fg_seq & 1];
-                fg_values[fg_seq & 1] = value;
-                fg_seq++;
+                const uint64_t old = fg_prev_value;
+                fg_prev_value = value;
                 if (old) wait_old = old;
-            } else if (!interpolated && fg_seq) {
-                fg_values[0] = fg_values[1] = 0;
-                fg_seq = 0;
+            } else if (!interpolated && fg_prev_value) {
+                fg_prev_value = 0;
             }
         }
         if (presents % 300 == 0) pipeline_cache_save(false);

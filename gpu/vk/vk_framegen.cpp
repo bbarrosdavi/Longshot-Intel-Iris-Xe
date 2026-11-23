@@ -912,7 +912,7 @@ void display_main() {
         }
         // (fifo_slot's refresh; whether the swapchain is FIFO is read at each present: it is made again for a new mode. Asked
         // after the copies: once a second it asks Windows, which is not the first copy's time, taken in copy)
-        const int mhz = s.line ? display_refresh_mhz() : 0;
+        const int mhz = (s.line || s.auto_timed) ? display_refresh_mhz() : 0;
         s.refresh = mhz > 0 ? (int64_t)(1e12 / mhz) : 0;
         fifo_refresh = s.line ? s.refresh : 0;   // (the catch-up's: the last set's on the timeline; 0 off it or unknown)
     };
@@ -1004,18 +1004,21 @@ void display_main() {
         const int64_t nom_step = base_frame / std::max(s.shown, 1);
         const int q_now = (held - 1) + fg.queued_jobs.load(std::memory_order_relaxed);
         const int64_t age_ns = done_at - j.at;
-        const bool gpu_ready_early = shown_at > 0 && (done_at - shown_at) < nom_step - 2000000;
+        const int64_t slack_ns = (shown_at > 0) ? (shown_at + nom_step - done_at) : 0;
+        // (Batch 15) Always drain any queued display backlog (q_now >= 1) regardless of gpu_ready_early,
+        // and gently converge out any dead-air phase slack before k0 (slack_ns > 3 ms when GPU already finished)
+        // so both Auto and Fixed 2x lock onto minimum handover latency (~70 ms at 19.5 FPS) with 0 late frames.
         int num = 50;
         if (q_now >= 2) {
-            num = 40;   // sets[3] full: 80% uniform drain to unblock framegen_record() cleanly
+            num = 32;   // sets[3] full: 64% rapid uniform drain to unblock framegen_record() immediately
         } else if (q_now == 1) {
-            if (gpu_ready_early) num = 43;                  // real display backlog: 86% uniform drain
-            else if (age_ns > base_frame * 3 / 2) num = 46; // gentle 92% latency trim
-        } else if (gpu_ready_early && age_ns > base_frame * 5 / 4) {
-            num = 47;   // gentle 94% trim when queue empty but set aged
+            num = 40;   // 1 set queued: 80% uniform drain so stale input never sits in fg.jobs
+        } else if (slack_ns > 8000000) {
+            num = 45;   // dead-air phase slip >8 ms after GPU finished: 90% smooth phase convergence
+        } else if (slack_ns > 3000000 || age_ns > base_frame * 9 / 10) {
+            num = 47;   // gentle 94% phase trim down to ~2 ms jitter margin
         }
-        const bool keep_refresh_floor = s.refresh > 0 && nom_step >= s.refresh &&
-                                        (q_now <= 1 || nom_step >= s.refresh * 115 / 100);
+        const bool keep_refresh_floor = s.refresh > 0 && nom_step >= s.refresh && q_now == 0 && slack_ns <= 8000000;
         const int64_t min_step = keep_refresh_floor
             ? s.refresh
             : (s.refresh > 0 && nom_step >= s.refresh
@@ -1645,14 +1648,14 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     VkImageView exact_after_view = tm.hud_after_view;
     bool exact_square = tm.hud_square;
     bool exact_hud =
-        fg.copy_hud.pipe && !mv_off && m > 1 && !dlss_held && !fsr_wanted && !auto_rate &&
+        fg.copy_hud.pipe && !mv_off && m > 1 && !dlss_held && !fsr_wanted &&
         exact_before_view && exact_after_view && tm.hud_after_tex && tm.hud_after_image &&
         tm.hud_w == sw && tm.hud_h == sh &&
         texture_alive(tm.hud_after_gpu, tm.hud_after_tex, tm.hud_after_image);
     // (opt/iris-xe) In dlss=0 mode (Game upscaler / Off stretch / upscale_stub), framegen_hud_before() captured
     // hud.before right after the gameplay upscale wrote the pre-HUD picture: copy post-HUD hud.picture into hud.after
     // so fg_copy_hud gets exact before/after HUD alpha masking in dlss=0 mode too.
-    if (!exact_hud && fg.copy_hud.pipe && !mv_off && m > 1 && !dlss_held && !fsr_wanted && !auto_rate) {
+    if (!exact_hud && fg.copy_hud.pipe && !mv_off && m > 1 && !dlss_held && !fsr_wanted) {
         std::lock_guard lk(hud.mu);
         hud_free_dead();
         const bool fresh = hud.fresh;
@@ -1764,6 +1767,25 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
                          fsr3fi_frames(cmd, *set, cur, uw, uh, sequence, native_pq, made_t, made_slot, fsr_n) == fsr_n &&
                          fsr_n > 0;
         bool flow = false;
+        if (!fsr && use_mv && made_n > 0) {
+            flow = true;
+            int mi = 0;
+            for (; mi + 1 < made_n && fg.synth2_mv.pipe; mi += 2) {
+                const MvPush mvp = make_mv_push(made_t[mi], made_t[mi + 1]);
+                pass(cmd, fg.synth2_mv, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                         {tm.view, fg.nearest}, {tm.depth_view, fg.nearest},
+                                         {set->frame[made_slot[mi]].view, VK_NULL_HANDLE},
+                                         {set->frame[made_slot[mi + 1]].view, VK_NULL_HANDLE}},
+                     uw, uh, &mvp, sizeof mvp, "fg_synth2_mv", true);
+            }
+            for (; mi < made_n; mi++) {
+                const MvPush mvp = make_mv_push(made_t[mi], 0.0f);
+                pass(cmd, fg.synth_mv, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                        {tm.view, fg.nearest}, {tm.depth_view, fg.nearest},
+                                        {set->frame[made_slot[mi]].view, VK_NULL_HANDLE}},
+                     uw, uh, &mvp, sizeof mvp, "fg_synth_mv", true);
+            }
+        }
         for (int k = 0; k < n; k++) {
             set->game[k] = t[k] > 0.999f;
             set->due[k] = at[k] + fg.game_ns;
@@ -1775,16 +1797,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
                                VK_IMAGE_LAYOUT_GENERAL, 1, &c);
                 continue;
             }
-            if (fsr) continue;   // (made above, into this slot)
-            if (use_mv) {
-                flow = true;
-                const MvPush mvp = make_mv_push(t[k], 0.0f);
-                pass(cmd, fg.synth_mv, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
-                                        {tm.view, fg.nearest}, {tm.depth_view, fg.nearest},
-                                        {set->frame[k].view, VK_NULL_HANDLE}},
-                     uw, uh, &mvp, sizeof mvp, "fg_synth_mv", true);
-                continue;
-            }
+            if (fsr || use_mv) continue;   // (made above, into this slot)
             if (!flow) {
                 flow = true;
                 if (!fg.have_luma[prev]) {

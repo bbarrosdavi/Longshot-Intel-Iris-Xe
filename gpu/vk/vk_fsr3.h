@@ -42,11 +42,13 @@ struct Inputs {
     fsr3_math::Camera camera;     ///< device_to_view_depth (fsr3_math.h)
     float frame_time_ms = 16.667f;
     bool reset = false;
-    /// (Batch 11A) Optional external RGBA16F upscale-size output view: when set, accumulate writes directly here,
+    /// (Batch 11A) Optional external RGBA16F/B10G11R11 upscale-size output view: when set, accumulate writes directly here,
     /// skipping g.output allocation and the post-upscale vkCmdCopyImage.
     VkImageView output = VK_NULL_HANDLE;
     /// (Batch 11A) Caller already synchronized all input image writes to COMPUTE_SHADER_BIT | TRANSFER_BIT.
     bool inputs_synced = false;
+    /// (Batch 15) Square perceptual output (c*c) directly in P_ACCUMULATE via kSquareOutput SpecId 0, eliminating dlss_out.comp.
+    bool square_output = false;
 };
 
 /// Whether this device can run the passes: push descriptors enough for the widest pass, storage images in every format the
@@ -74,6 +76,8 @@ void release();
 /// The image an evaluation resolves into: RGBA16F at the upscale size, or null before the first
 [[nodiscard]] VkImage output_image();
 [[nodiscard]] VkImageView output_view();
+/// (Batch 15) The internal perceptual RGBA16F history view written by the most recent accumulate pass (for exact HUD diff when dlss_out is fused).
+[[nodiscard]] VkImageView last_upscaled_view();
 
 } // namespace fsr3
 

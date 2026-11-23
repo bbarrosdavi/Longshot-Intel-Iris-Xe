@@ -58,6 +58,7 @@ struct PassInfo {
     const Kind* bindings;
     size_t binding_count;
     const char* spv_name;   ///< the array's, for builtin_spv (RX_VK_SHADER_DIR)
+    bool spec_const0 = false;   ///< Specialization constant ID 0 = VK_TRUE
 };
 
 constexpr Kind PREPARE_INPUTS[]{T, T, T, I, I, I, I, I, U};
@@ -68,7 +69,8 @@ constexpr Kind PREPARE_REACTIVITY[]{T, T, T, T, T, T, T, T, T, I, I, I, U};
 constexpr Kind LUMA_INSTABILITY[]{T, T, T, T, T, T, T, I, I, U};
 constexpr Kind ACCUMULATE[]{T, T, T, T, T, T, T, T, T, I, I, I, U};
 
-#define PASS(n, spv, b) PassInfo{n, spv, sizeof spv, b, sizeof b / sizeof b[0], #spv}
+#define PASS(n, spv, b) PassInfo{n, spv, sizeof spv, b, sizeof b / sizeof b[0], #spv, false}
+#define PASS_SPEC(n, spv, b) PassInfo{n, spv, sizeof spv, b, sizeof b / sizeof b[0], #spv, true}
 
 /// The passes, in the order PassId numbers them. The two _nowave pyramids are alternatives to the two before them, for
 /// devices without the subgroup operations the single-pass downsampler wants. FSR's own sharpening (accumulate_sharpen and
@@ -82,10 +84,13 @@ const PassInfo PASSES[]{
          SHADING_CHANGE_PYRAMID),
     PASS("shading_change", FSR3_SHADING_CHANGE_COMP_SPV, SHADING_CHANGE),
     PASS("prepare_reactivity", FSR3_PREPARE_REACTIVITY_COMP_SPV, PREPARE_REACTIVITY),
+    PASS_SPEC("prepare_reactivity_mask", FSR3_PREPARE_REACTIVITY_COMP_SPV, PREPARE_REACTIVITY),
     PASS("luma_instability", FSR3_LUMA_INSTABILITY_COMP_SPV, LUMA_INSTABILITY),
     PASS("accumulate", FSR3_ACCUMULATE_COMP_SPV, ACCUMULATE),
+    PASS_SPEC("accumulate_sq", FSR3_ACCUMULATE_COMP_SPV, ACCUMULATE),
 };
 #undef PASS
+#undef PASS_SPEC
 
 enum PassId : size_t {
     P_PREPARE_INPUTS,
@@ -95,8 +100,10 @@ enum PassId : size_t {
     P_SHADING_CHANGE_PYRAMID_NOWAVE,
     P_SHADING_CHANGE,
     P_PREPARE_REACTIVITY,
+    P_PREPARE_REACTIVITY_MASK,
     P_LUMA_INSTABILITY,
     P_ACCUMULATE,
+    P_ACCUMULATE_SQ,
     kPassCount
 };
 static_assert(sizeof PASSES / sizeof PASSES[0] == kPassCount, "PassId must name every pass");
@@ -298,9 +305,12 @@ bool make_pipeline(Pipeline& p, const PassInfo& info) {
         IntelDriverGate gate;   // (released before shared_compute_pipeline, which takes the same lock)
         if (extern_guarded_shader_module(&mi, &m) != VK_SUCCESS) return false;
     }
+    const VkBool32 spec_val = VK_TRUE;
+    const VkSpecializationMapEntry spec_entry{0, 0, sizeof spec_val};
+    const VkSpecializationInfo spec_info{1, &spec_entry, sizeof spec_val, &spec_val};
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
-                nullptr};
+                info.spec_const0 ? &spec_info : nullptr};
     ci.layout = p.layout;
     // (longshot, a stutter: through the pipeline cache kept across runs. Made with none, FSR 3.1's dozen passes were compiled
     // again at every start, inside the first upscaled frame: a 2.7 s first frame of play against 1.0 s without FSR, 2026-11-10)
@@ -716,7 +726,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
          mip(3), mip(4), mip(5), cb_fsr, cb_spd},
         spd_x, spd_y);
     run(P_SHADING_CHANGE, {tex(g.spd_mips), tex(g.shading_change), cb_fsr}, groups(rw / 2, 8), groups(rh / 2, 8));
-    run(P_PREPARE_REACTIVITY,
+    run(in.reactive ? P_PREPARE_REACTIVITY_MASK : P_PREPARE_REACTIVITY,
         {tex(g.previous_nearest_depth), tex(g.dilated_motion_vectors), tex(g.dilated_depth),
          in.reactive ? Resource{in.reactive} : tex(g.default_reactive),
          tex(g.default_reactive), tex(g.accumulation[p]), tex(g.shading_change), current_luma, exposure,
@@ -726,7 +736,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         {exposure, tex(g.dilated_reactive_masks), tex(g.dilated_motion_vectors), tex(g.frame_info), tex(g.luma_history[p]),
          tex(g.farthest_depth_mip1), current_luma, tex(g.luma_history[q]), tex(g.farthest_depth), cb_fsr},
         groups(rw, 8), groups(rh, 8));
-    run(P_ACCUMULATE,
+    run(in.square_output ? P_ACCUMULATE_SQ : P_ACCUMULATE,
         {exposure, tex(g.dilated_reactive_masks), tex(g.dilated_motion_vectors), tex(g.internal_upscaled[p]),
          tex(g.lanczos_lut), tex(g.farthest_depth_mip1), current_luma, tex(g.farthest_depth), color,
          tex(g.internal_upscaled[q]), in.output ? Resource{in.output} : tex(g.output), tex(g.new_locks), cb_fsr},
@@ -737,6 +747,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
 
 VkImage output_image() { return g.output.image; }
 VkImageView output_view() { return g.output.view; }
+VkImageView last_upscaled_view() { return g.internal_upscaled[g.parity].view; }
 
 } // namespace mkwvk::fsr3
 
@@ -867,11 +878,14 @@ bool chain_evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
         logf("vk: fsr3 on the chain: the scene's projection is not one FSR takes");
         return false;
     }
-    if (!f.color.view || !f.depth.view || !f.motion.view || !f.output.view || f.output.format != VK_FORMAT_R16G16B16A16_SFLOAT)
+    const bool out_ok = f.output.format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                        (f.square_output && f.output.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    if (!f.color.view || !f.depth.view || !f.motion.view || !f.output.view || !out_ok)
         return false;
     fsr3::Inputs ai;
     ai.color = f.color.view, ai.depth = f.depth.view, ai.motion = f.motion.view;
     ai.output = f.output.view;
+    ai.square_output = f.square_output;
     ai.inputs_synced = true;
     ai.render_width = f.render_w, ai.render_height = f.render_h;
     ai.upscale_width = f.output.width, ai.upscale_height = f.output.height;

@@ -6898,6 +6898,8 @@ VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShad
                 rep = kCustomSpv_48590e0b; rep_n = std::size(kCustomSpv_48590e0b);
             } else if (prog_key == 0xe40dc98fca54ad01ull && em == 4u) {
                 rep = kCustomSpv_e40dc98f; rep_n = std::size(kCustomSpv_e40dc98f);
+            } else if (prog_key == 0x26fe0c70ab9fc547ull && em == 5u) {
+                rep = kCustomSpv_26fe0c70; rep_n = std::size(kCustomSpv_26fe0c70);
             }
             if (rep) {
                 logf("vk: custom SPIR-V override applied to %016llx (em=%u, %zu -> %zu words)",

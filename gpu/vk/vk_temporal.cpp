@@ -1538,7 +1538,10 @@ bool temporal_last_motion(TemporalMotion& out) {
     out = {};
     if (!s.last_mv.frame || now - s.last_mv.frame > 1) return false;
     // Populate exact HUD views even on a reset/first frame so fg_copy_hud marks fg.frames[prev].a immediately.
-    if (s.output.view && s.last_mv.hud_before_view == s.output.view && s.last_mv.hud_after_view) {
+    const VkImageView fsr_before = fsr3::last_upscaled_view();
+    const bool before_ok = (s.output.view && s.last_mv.hud_before_view == s.output.view) ||
+                           (fsr_before && s.last_mv.hud_before_view == fsr_before);
+    if (before_ok && s.last_mv.hud_after_view) {
         out.hud_before_view = s.last_mv.hud_before_view;
         out.hud_after_view = s.last_mv.hud_after_view;
         out.hud_after_image = s.last_mv.hud_after_image;
@@ -1774,8 +1777,12 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
+    const bool direct_fsr_sq = mode == ur::FSR3 && !hdr && !rgba && !native && out_level == 0 && dw == ow && dh == oh &&
+                               out_view && out->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     TemporalFrame f;
-    f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
+    f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown();
+    f.output = direct_fsr_sq ? TemporalImage{out->image, out_view, out->format, ow, oh} : s.output.shown();
+    f.square_output = direct_fsr_sq;
     f.render_w = rw, f.render_h = rh;
     // (the jitter in render pixels, x right and y down)
     dlss_math::jitter_to_pixels(cam.jitter, rw, rh, f.jitter);
@@ -1798,9 +1805,9 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         engine.failed = true;
         return false;   // (the network writes its output over whatever the evaluation did)
     }
-    // (Batch 11A) FSR 3.1's final P_ACCUMULATE pass already issues COMPUTE_WRITE -> COMPUTE_READ|WRITE in record_pass.
-    if (mode != ur::FSR3) full_barrier(cmd);
-    {
+    // (Batch 15) When direct_fsr_sq is active, P_ACCUMULATE_SQ already squared directly into out_view and issued its barrier.
+    if (!direct_fsr_sq) {
+        if (mode != ur::FSR3) full_barrier(cmd);
         const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
         const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
@@ -1828,11 +1835,12 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     s.last_mv.depth_reversed = fsr_flip;
     s.last_mv.reset = !motion || reset;
     s.last_mv.frame = now;
+    const VkImageView hud_before = direct_fsr_sq ? fsr3::last_upscaled_view() : s.output.view;
     if (!native && out_level == 0 && dw == ow && dh == oh && out->image &&
         out->samples == VK_SAMPLE_COUNT_1_BIT && out->type == VK_IMAGE_TYPE_2D &&
-        (out->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && s.output.view) {
+        (out->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && hud_before) {
         if (const VkImageView aview = color_view(out)) {
-            s.last_mv.hud_before_view = s.output.view;
+            s.last_mv.hud_before_view = hud_before;
             s.last_mv.hud_after_view = aview;
             s.last_mv.hud_after_image = out->image;
             s.last_mv.hud_after_tex = out;
