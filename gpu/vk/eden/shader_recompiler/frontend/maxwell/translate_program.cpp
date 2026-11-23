@@ -4,13 +4,13 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <bitset>
 #include <cstdlib>
 #include <memory>
 #include <optional>
-#include <unordered_set>
 #include <vector>
 #include <queue>
 
@@ -30,6 +30,7 @@ extern thread_local u32 g_nvn2_compute_ssbo_base;
 extern thread_local u32 g_nvn2_compute_ssbo_count;
 extern thread_local u32 g_nvn2_compute_layout_end;
 extern thread_local bool g_nvn2_miss_log_this;
+extern std::atomic<u32> g_table_check_unchecked;
 }
 
 namespace Shader::Maxwell {
@@ -197,8 +198,17 @@ void AddNVNStorageBuffers(IR::Program& program) {
     static const bool miss_log{std::getenv("RX_VK_MISS_LOG") != nullptr && std::atoi(std::getenv("RX_VK_MISS_LOG")) != 0};
     // (compute only: the driver crashed compiling a mesh program with it; and only the program vk_shader.cpp names when
     // RX_VK_MISS_LOG_PROG is set: Optimization::g_nvn2_miss_log_this)
-    if (miss_log && (program.stage == Stage::Compute || program.stage == Stage::Mesh || program.stage == Stage::Task) &&
-        Optimization::g_nvn2_miss_log_this && descs.size() < Info::MAX_SSBOS) {
+    // (longshot, RX_VK_GP_TABLE=2: the vertex, fragment, compute, task and mesh stages' loads checked against the page table record
+    // there too. The mesh fallback's task and mesh stages get the buffer as with the miss log, and leave it unused)
+    static const bool table_check{std::getenv("RX_VK_GP_TABLE") != nullptr && std::atoi(std::getenv("RX_VK_GP_TABLE")) == 2};
+    const bool graphics{program.stage == Stage::VertexB || program.stage == Stage::Fragment || program.stage == Stage::Compute ||
+                        program.stage == Stage::Task || program.stage == Stage::Mesh};
+    if (table_check && graphics && program.info.uses_global_memory && descs.size() >= Info::MAX_SSBOS)
+        Optimization::g_table_check_unchecked.fetch_add(1, std::memory_order_relaxed);   // (no room for the check's buffer)
+    if (((miss_log && (program.stage == Stage::Compute || program.stage == Stage::Mesh || program.stage == Stage::Task) &&
+          Optimization::g_nvn2_miss_log_this) ||
+         (table_check && graphics && program.info.uses_global_memory)) &&
+        descs.size() < Info::MAX_SSBOS) {
         descs.push_back({
             .cbuf_index = driver_cbuf,
             .cbuf_offset = 0xff0U,
@@ -432,105 +442,6 @@ void TightenOutputVertices(IR::Program& program) {
         program.output_vertices = (std::min)(program.output_vertices, num_emits);
     }
 }
-
-// (longshot-iris) Elide warp-wide BroadcastFirst (R2UR) and idempotent SubgroupReduce
-// (UMin/SMin/UMax/SMax/Or) when the operand is provably identical across every lane of a
-// 32-thread warp (immediates, cbuf loads, WorkgroupId, warp-aligned LocalInvocationId Y/Z,
-// and pure value ops thereof). Eliminating no-op R2UR lets compute shaders such as 27ee9883
-// (8x8x8) and ee7764a6 (8x4x4) unpin from SIMD32 and compile spill-free at SIMD8 on Intel Gen12.
-void EliminateUniformWarpOps(IR::Program& program) {
-    using Op = IR::Opcode;
-    const bool z_warp_uniform =
-        program.stage == Stage::Compute &&
-        program.workgroup_size[0] * program.workgroup_size[1] >= 32U &&
-        ((program.workgroup_size[0] * program.workgroup_size[1]) % 32U) == 0U;
-    const bool y_warp_uniform =
-        program.stage == Stage::Compute &&
-        program.workgroup_size[1] == 1U;
-
-    std::unordered_set<const IR::Inst*> uniform_insts;
-    auto is_uniform_val = [&](IR::Value v) -> bool {
-        if (const IR::Inst* inst = v.TryInstRecursive()) {
-            return uniform_insts.contains(inst);
-        }
-        const IR::Type t = v.Type();
-        return t != IR::Type::Void && t != IR::Type::Reg && t != IR::Type::Pred;
-    };
-    auto args_uniform = [&](const IR::Inst& inst) -> bool {
-        const size_t n = inst.NumArgs();
-        for (size_t i = 0; i < n; ++i) {
-            if (!is_uniform_val(inst.Arg(i))) {
-                return false;
-            }
-        }
-        return true;
-    };
-    auto is_pure_uniform_op = [](Op op) -> bool {
-        return op == Op::Identity || op == Op::ConditionRef ||
-               (op >= Op::UndefU1 && op <= Op::UndefU64) ||
-               (op >= Op::GetCbufU8 && op <= Op::GetCbufU32x2) ||
-               (op >= Op::CompositeConstructU32x2 && op <= Op::BitCastF64U64) ||
-               (op >= Op::GetZeroFromOp && op <= Op::GetOverflowFromOp) ||
-               (op >= Op::FPAbs16 && op <= Op::UGreaterThanEqual) ||
-               (op >= Op::LogicalOr && op <= Op::LogicalNot) ||
-               (op >= Op::ConvertS16F16 && op <= Op::ConvertS32S16);
-    };
-
-    for (size_t sweep = 0; sweep < 8; ++sweep) {
-        bool changed = false;
-        for (IR::Block* const block : program.blocks) {
-            for (IR::Inst& inst : block->Instructions()) {
-                if (uniform_insts.contains(&inst)) {
-                    continue;
-                }
-                const Op op = inst.GetOpcode();
-                bool ok = false;
-                if (op == Op::WorkgroupId) {
-                    ok = true;
-                } else if (op == Op::CompositeExtractU32x3 && inst.Arg(1).IsImmediate()) {
-                    const IR::Inst* src = inst.Arg(0).TryInstRecursive();
-                    if (src && src->GetOpcode() == Op::LocalInvocationId) {
-                        const u32 comp = inst.Arg(1).U32();
-                        ok = (comp == 2U && z_warp_uniform) || (comp == 1U && y_warp_uniform);
-                    } else {
-                        ok = args_uniform(inst);
-                    }
-                } else if (op == Op::SubgroupBroadcastFirstU32 || op == Op::SubgroupReduceU32) {
-                    ok = true;
-                } else if (is_pure_uniform_op(op)) {
-                    ok = args_uniform(inst);
-                }
-                if (ok) {
-                    uniform_insts.insert(&inst);
-                    changed = true;
-                }
-            }
-        }
-        if (!changed) {
-            break;
-        }
-    }
-
-    for (IR::Block* const block : program.blocks) {
-        for (IR::Inst& inst : block->Instructions()) {
-            const Op op = inst.GetOpcode();
-            if (op == Op::SubgroupBroadcastFirstU32) {
-                const IR::Value src = inst.Arg(0);
-                if (is_uniform_val(src)) {
-                    inst.ReplaceUsesWith(src);
-                }
-            } else if (op == Op::SubgroupReduceU32 && inst.Arg(1).IsImmediate()) {
-                const u32 mode = inst.Arg(1).U32();
-                // UMin(1), SMin(2), UMax(3), SMax(4), Or(5) are idempotent on identical lane values.
-                if (mode >= 1U && mode <= 5U && is_uniform_val(inst.Arg(0))) {
-                    inst.ReplaceUsesWith(inst.Arg(0));
-                }
-            } else if (op == Op::VoteAny && inst.Arg(0).IsImmediate() && inst.Arg(0).U1()) {
-                inst.ReplaceUsesWith(IR::Value{true});
-            }
-        }
-    }
-}
 } // Anonymous namespace
 
 IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
@@ -630,7 +541,6 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     if (Settings::values.resolution_info.active) {
         Optimization::RescalingPass(program);
     }
-    EliminateUniformWarpOps(program);
     Optimization::DeadCodeEliminationPass(program);
     TightenOutputVertices(program);
     if (Settings::values.renderer_debug) {

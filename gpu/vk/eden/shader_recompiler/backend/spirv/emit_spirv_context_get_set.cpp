@@ -502,11 +502,9 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
     const AttributeType type{ctx.runtime_info.color_output_types[index]};
     if (type == AttributeType::Float) {
         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
-        if (frag_nan_guard) {   // (amd-fix, mma_layout.h) NaN/Inf -> 0, the rest clamped to +-65000 (within R11G11B10F/FP16 range)
-            const Id bits{ctx.OpBitcast(ctx.U32[1], value)};
-            const Id non_finite{ctx.OpIEqual(ctx.U1, ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.Const(0x7f800000u)), ctx.Const(0x7f800000u))};
-            const Id clamped{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, ctx.Const(-65000.0f)), ctx.Const(65000.0f))};
-            value = ctx.OpSelect(ctx.F32[1], non_finite, ctx.f32_zero_value, clamped);
+        if (frag_nan_guard) {   // (amd-fix, mma_layout.h) NaN -> 0, the rest clamped to +-1e30
+            const Id clamped{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, ctx.Const(-1e30f)), ctx.Const(1e30f))};
+            value = ctx.OpSelect(ctx.F32[1], IsNan(ctx, value, 32), ctx.Const(0.0f), clamped);
         }
         ctx.OpStore(pointer, value);
     } else if (type == AttributeType::UnsignedInt) {

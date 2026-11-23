@@ -402,8 +402,6 @@ public:
                                   const IR::U32& seg_mask);
     [[nodiscard]] U32 ShuffleButterfly(const IR::U32& value, const IR::U32& index,
                                        const IR::U32& clamp, const IR::U32& seg_mask);
-    [[nodiscard]] U32 SubgroupBroadcastFirstU32(const IR::U32& value);
-    [[nodiscard]] U32 SubgroupReduceU32(const IR::U32& value, const IR::U32& mode);
     [[nodiscard]] U32 QuadBroadcast(const IR::U32& value, const IR::U32& lane);
     // (longshot) the subgroup's 16x8x16 f16 matrix multiply: a U32x4, b and c U32x2 fragments
     [[nodiscard]] Value MatrixMulAddF16(const Value& a, const Value& b, const Value& c);

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.astro/
+# Artwork copied from the repository's assets/ when Astro starts (src/repo-docs/assets.ts).
+public/assets/
+public/branding/
+.wrangler/
+# Guide screenshots copied unchanged from docs/user/images/guide/.
+public/docs/user/images/guide/

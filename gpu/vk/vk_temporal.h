@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 #include "vk_internal.h"
 
@@ -63,12 +64,28 @@ struct SkinnedDraw {
 };
 void temporal_note_skinned_draw(const SkinnedDraw& k);
 
-/// (longshot, #1370) The hidden-mesh rule's switches (vk_draw.cpp hidden_depth_draw, gpu/vk/hidden_mesh.h). Bit 0: the depth
+/// (longshot) The hidden-mesh rule's switches (vk_draw.cpp hidden_depth_draw, gpu/vk/hidden_mesh.h). Bit 0: the depth
 /// draws of hidden meshes are left out (unless RX_VK_DLSS_FADED=0); bit 1: the detailed log (RX_VK_DLSS_FADED_LOG=1). 0:
-/// nothing runs, as with the parallel replay (RX_VK_PARALLEL=2 and more). Read once; the first call logs what it is
+/// nothing runs. Read once; the first call logs what it is
 int temporal_hidden_mesh_mode();
-/// (longshot, #1370) Whether `depth` is the depth target of the scene the chain has taken in this frame (its camera's)
+/// (longshot) Whether `depth` is the depth target of the scene the chain has taken in this frame (its camera's)
 bool temporal_scene_depth_is(const Texture* depth);
+VkImageView temporal_reshade_depth(uint32_t width, uint32_t height);
+
+/// (longshot) NVIDIA DLAA before the game's bloom and tone map (pre_bloom.h has where and why): with DLAA and the
+/// Upscaler's DLAA before the bloom row on only (RX_VK_DLSS_PRE_BLOOM over it); off, DLAA stays at the gameplay upscale.
+/// A draw of program key that samples what its descriptors list (sampled: vk_draw.cpp gfx_sampled) and draws into colors
+/// (n of them): the frame's passes for the learning,
+/// and at the learned one DLAA on the scene's linear colour, its picture written back into the scene before that draw reads it
+/// (outside a pass: the open one is ended first). The gameplay upscale then copies its input (temporal_upscale). Without DLAA
+/// or for a draw that neither reads nor writes the scene it costs two atomic loads and a look through the lists. True: it
+/// recorded commands of its own (the pass ended, DLAA's passes and its actor motion's draws, whether DLAA then drew or not):
+/// the pipeline, viewport, vertex streams and descriptors bound are not the draw's any more (vk_draw.cpp: bound().reset())
+bool temporal_pre_bloom(VkCommandBuffer cmd, uint64_t key, const std::vector<const Texture*>& sampled, Texture* const* colors,
+                        int n);
+/// (longshot) The engine takes the scene's linear colour before the tone map (temporal_pre_bloom wanted for this run and
+/// mode): DLSS makes its feature for HDR colour then, with its own exposure (vk_dlss.cpp prepare)
+bool temporal_hdr_input();
 
 /// A gameplay upscale's dispatch (program `key`; vk_draw.cpp's temporal_stand_in finds them: the 4/3 network fd029a317a9a4b94
 /// at the game's usual 3/4, the same-size pass 9dc98871eb7fc101 at full size, and one network of its own for each other
@@ -84,34 +101,25 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
 /// engine's own state, the chain's images and deferred frees are let go, so their video memory comes back. Nothing to do
 /// costs one atomic load
 void temporal_idle();
+/// (longshot, smoothness) RX_VK_DLSS_PREWARM (on by default; 0: off): DLSS's feature made before the game's first 3D frame. Its creation (NGX's
+/// CreateFeature, 70-120 ms of the replay thread in play, 33-50 ms headless) and the chain's first evaluate and pipelines were
+/// all in the first gameplay frame after a load. temporal_prewarm makes them in a light frame (the title, the file select, a
+/// loading screen: fewer draws than texture_ahead::kLightDraws) once NGX has started, for the size the game presents at
+/// (temporal_note_present) and the Upscaler row's DLSS or DLAA, with one evaluate (reset) on the chain's cleared images.
+/// The first gameplay frame then finds it made. A key that misses is made again there, as before, and logged with its why.
+/// Also (vk_dlss.cpp prepare): DLSS at a full-size frame takes the scaled mode that holds it, not a DLAA-mode feature
+bool temporal_prewarm_on();
+/// At each recording's start on the replay thread (cmd: its first command buffer). With RX_VK_DLSS_PREWARM=0 it only asks
+/// the upscalers at the first one in a run with no window (HOS_HEADLESS: no start-up screen asks them, and NGX's ~450 ms start
+/// fell into the first gameplay frame of every test run; RX_VK_PROBE_HEADLESS=0: not asked)
+void temporal_prewarm(VkCommandBuffer cmd);
+/// The draws of the last frame (vk_replay.cpp status_tick) and the size of the picture the game presented (do_present)
+void temporal_note_frame(int64_t draws);
+void temporal_note_present(uint32_t width, uint32_t height);
 /// (longshot) The game asked for its gameplay upscale (temporal_upscale) in this frame or the two before: it draws a 3D
 /// scene now, whether or not an engine then drew it (failed, refused, not this frame). Not in its own menus, movies and
 /// loading screens. Without the lock (an atomic frame number)
 bool temporal_scene_now();
-/// (Batch 12A/12B) Exact 3D camera + skinned-actor motion vectors, scene depth, and before/after HUD picture views
-/// computed this frame by the temporal chain (RG16F motion, render pixels toward the frame before, x right and y down,
-/// no jitter), for built-in FrameGen synthesis and exact HUD protection.
-struct TemporalMotion {
-    VkImageView view = VK_NULL_HANDLE;
-    VkImageView depth_view = VK_NULL_HANDLE;
-    VkImageView hud_before_view = VK_NULL_HANDLE;   // s.output (before HUD)
-    VkImageView hud_after_view = VK_NULL_HANDLE;    // game's upscale output texture (after HUD)
-    VkImage hud_after_image = VK_NULL_HANDLE;
-    const Texture* hud_after_tex = nullptr;
-    uint64_t hud_after_gpu = 0;
-    uint64_t hud_after_gen = 0;
-    uint32_t render_w = 0, render_h = 0;
-    uint32_t tex_w = 0, tex_h = 0;
-    uint32_t hud_w = 0, hud_h = 0;
-    bool depth_reversed = false;
-    bool hud_square = false;
-    bool reset = false;
-    uint64_t frame = 0;
-};
-bool temporal_last_motion(TemporalMotion& out);
-/// (Batch 13) Fallback 3D camera+actor motion prep before framegen_record() when no upscaler dispatch ran this frame
-/// (e.g. dlss=0 Native/TAAU with built-in FrameGen on): runs lean fg_mv_prep.comp + actor_motion from the scene depth.
-void temporal_prepare_fg_motion(VkCommandBuffer cmd, uint32_t out_w, uint32_t out_h);
 void temporal_reset_failure();
 
 /// For the renderer's status line (vk_replay.cpp status_tick): while an engine draws, its details since the last call into b
@@ -133,6 +141,7 @@ struct TemporalImage {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
+    VkImageUsageFlags usage = 0;
 };
 /// One frame's evaluation. color: the scene as the network samples it (tonemapped, square-root encoded: LDR, RGBA16F; linear
 /// light past 1 with the game's native HDR for an engine whose hdr() says it takes that, its output then linear as well);
@@ -151,8 +160,6 @@ struct TemporalFrame {
     /// (longshot) depth holds 1 - d (the engine's fsr_depth, where the projection puts the near plane at 0: FSR 3.1). Anything
     /// else that reads this frame's depth (frame generation, other passes) must look here, not assume the plain depth
     bool depth_reversed = false;
-    /// (Batch 15) Direct squared output into game's B10G11R11 target (skips dlss_out.comp and s.output RGBA16F roundtrip)
-    bool square_output = false;
 };
 /// An engine: plain functions, each called with the chain's lock held, on the recording thread
 struct TemporalEngine {
@@ -183,6 +190,8 @@ struct TemporalEngine {
     /// (longshot) An evaluation that fails is for that frame only (the network draws it, and the next frame starts a new
     /// history), not for good: FSR 3.1, whose constants come from the frame's stream
     bool retry = false;
+    /// Whether the most recent failed evaluation can be retried on the next frame.
+    bool (*retry_evaluation)() = nullptr;
 };
 /// Runs f a few frames on, to free what work in flight may still use. Called by the engines with the chain's lock held
 void temporal_later(std::function<void()> f);

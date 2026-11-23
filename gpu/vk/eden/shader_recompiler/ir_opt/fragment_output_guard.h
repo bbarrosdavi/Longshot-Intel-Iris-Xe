@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// (longshot) The NaN guard on float colour outputs (RX_VK_NAN_GUARD=0: off; vk_shader.cpp, nx2/bake_ds, gpu/shaderbatch.cpp).
+// (longshot) The NaN guard on float colour outputs (RX_VK_NAN_GUARD=0: off; vk_shader.cpp).
 // It shared a header with the OoT fog and exposure workaround, which is gone.
 
 #pragma once
@@ -30,10 +30,8 @@ inline size_t GuardFragmentOutputs(IR::Program& program, u32 float_targets) {
     for (const auto& [block, inst] : writes) {
         IR::IREmitter ir{*block, block->Instructions().iterator_to(*inst)};
         const IR::F32 value{inst->Arg(2)};
-        const IR::U32 bits{ir.BitCast<IR::U32>(value)};
-        const IR::U1 non_finite{ir.IEqual(ir.BitwiseAnd(bits, ir.Imm32(0x7f800000u)), ir.Imm32(0x7f800000u))};
-        const IR::F32 limited{ir.FPClamp(value, ir.Imm32(-65000.0f), ir.Imm32(65000.0f))};
-        const IR::F32 safe{ir.Select(non_finite, ir.Imm32(0.0f), limited)};
+        const IR::F32 limited{ir.FPClamp(value, ir.Imm32(-1e30f), ir.Imm32(1e30f))};
+        const IR::F32 safe{ir.Select(ir.FPIsNan(value), ir.Imm32(0.0f), limited)};
         inst->SetArg(2, safe);
     }
     return writes.size();

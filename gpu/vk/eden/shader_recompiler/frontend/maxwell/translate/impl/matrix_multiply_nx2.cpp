@@ -29,23 +29,4 @@ void TranslatorVisitor::HMMA_nx2(u64 insn) {
     X(dest + 1, d1);
 }
 
-void TranslatorVisitor::REDUX_nx2(u64 insn) {
-    union {
-        u64 raw;
-        BitField<0, 8, IR::Reg> dest;
-        BitField<8, 8, IR::Reg> src;
-        BitField<20, 4, u32> mode;
-    } const redux{insn};
-    X(redux.dest, ir.SubgroupReduceU32(X(redux.src), ir.Imm32(redux.mode)));
-}
-
-void TranslatorVisitor::R2UR_nx2(u64 insn) {
-    union {
-        u64 raw;
-        BitField<0, 8, IR::Reg> dest;
-        BitField<8, 8, IR::Reg> src;
-    } const r2ur{insn};
-    X(r2ur.dest, ir.SubgroupBroadcastFirstU32(X(r2ur.src)));
-}
-
 } // namespace Shader::Maxwell

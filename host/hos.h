@@ -73,7 +73,7 @@ int hos_game_is_mkw(void);
 #define HOS_GAME_TITLE "Longshot"
 uint64_t hos_used_memory(uint64_t base);   /* (hos_mem.c) base + heap + the game's mapped pages: the used memory it is told */
 int hos_commit(uint64_t addr, uint64_t size);          /* (mkw_glue.c) guest pages made usable by host APIs: 1, or 0 if refused */
-/* (mkw_glue.c, issue 333) host memory the game cannot go on without: never NULL (but for 0 bytes). At the commit limit a failed
+/* (mkw_glue.c) host memory the game cannot go on without: never NULL (but for 0 bytes). At the commit limit a failed
    allocation is tried again for up to 5 s, as a guest commit is; then the out-of-memory line and notice, and the game stops.
    what names it in the log. hos_out_of_memory: that line and notice, once a run (wait: shown here, or waited for, before the
    caller stops the game) */
@@ -81,7 +81,7 @@ void *hos_xmalloc(size_t size, const char *what);
 void *hos_xcalloc(size_t count, size_t size, const char *what);
 void *hos_xrealloc(void *old, size_t size, const char *what);
 void hos_out_of_memory(int wait);
-/* (mkw_glue.c, issue 1280) the end of hos_alloc_failed's wait: the line, the notice and the stop (n 0: the size not known, as for
+/* (mkw_glue.c) the end of hos_alloc_failed's wait: the line, the notice and the stop (n 0: the size not known, as for
    the renderer's C++ allocations, MkwVkHost out_of_memory). Does not return */
 void hos_alloc_gave_up(size_t n, const char *what);
 int hos_mem_region(uint64_t addr, uint64_t size);      /* (hos_mem.c) the control bridge: 0 if not wholly in mapped guest memory */
@@ -106,10 +106,29 @@ extern uint64_t hos_space_end;   /* web: the guest window ends where the host's 
 static inline void *hos_guest_range(uint64_t a, uint64_t n) {
     return a < (uint64_t)HOS_SPACE_END && n <= (uint64_t)HOS_SPACE_END - a ? GP(a) : (void *)0;
 }
+/* (longshot) Host code's bulk writes of guest memory: n bytes at guest address a filled with a value, or copied from
+   host memory. The write, then the mark of its pages (HOS_WRITTEN), in that order: the renderer's capture takes a mark
+   and then copies the page, so a mark set before the bytes could be taken with the old bytes, and nothing would say
+   the page changed again. Any thread may call them at any time: the mark is a lock-free store, as the lifted code's
+   own after each of its stores, and one made while a capture is being taken stays set for the next capture. Why they
+   exist: memory the renderer had imported was zeroed at a free with no mark, and the renderer's copies of it (mirror,
+   capture, write-back shadow) kept the old bytes. tests/test_host_guest_writes.py stops a new memset or memcpy into
+   guest memory that is neither one of these nor followed by a mark, unless it is on its list with the reason.
+   The caller has checked the range (hos_guest_range). */
+static inline void hos_guest_fill(uint64_t a, int value, uint64_t n) {
+    void *const p = GP(a);
+    memset(p, value, (size_t)n);
+    HOS_WRITTEN(p, (size_t)n);
+}
+static inline void hos_guest_copy(uint64_t a, const void *src, uint64_t n) {
+    void *const p = GP(a);
+    memcpy(p, src, (size_t)n);
+    HOS_WRITTEN(p, (size_t)n);
+}
 #define HOS_TICK_HZ 31250000ULL   /* (mkw-recomp: the Switch 2 counter; the SDK checks it at init) */
 
 /* ---- logging: HOS_TRACE=1 logs every HLE call that uses HOS_TRACE_CALL. hos_log is info; hos_log_at gives a line another level,
-   written after the thread's tag ("[hos host] [trace] vk: ..."), for the launcher's log to show or leave out (docs/development.md) */
+   written after the thread's tag ("[hos host] [trace] vk: ..."), for the launcher's log to show or leave out (docs/dev/developing.md, "Read the log") */
 enum { HOS_LOG_ERROR, HOS_LOG_WARN, HOS_LOG_INFO, HOS_LOG_DEBUG, HOS_LOG_TRACE };
 extern int hos_trace;
 void hos_log(const char *fmt, ...);
@@ -122,6 +141,23 @@ int hos_slow_frames_every_ms(void);
 void hos_slow_frame_present(void);
 void hos_slow_sample(int64_t sweep_ns, const char *text);
 void hos_slow_sweep_done(void);
+/* (longshot) an A/B within one run (host/hos_ab.c, HOS_AB=<switch>=<value>[,<seconds>[,<warm-up seconds>]]): the side now,
+   -1 when no A/B runs or in its warm-up, else 0 (the switch's normal value) or 1 (the A/B's value): one relaxed load, cheap
+   enough for a per-call path. A switch's reader takes the A/B as v = hos_ab_value(<its name, a literal>, v_normal): v_normal
+   unless the A/B names that switch and side 1 runs. Both sides pay the same for the call (a load, then a look at a small
+   table of the names seen, by address), so the measured difference is the switch's. hos_ab_frame: the side of a frame from
+   from_ns to to_ns (hos_now_ns), + 2 in a transition (a flip in the frame, or less than 0.3 s before its end), -1 outside */
+extern int hos_ab_side_now;
+static inline int hos_ab_side(void) { return __atomic_load_n(&hos_ab_side_now, __ATOMIC_RELAXED); }
+int hos_ab_value_at(const char *name, int normal, int side);
+static inline int hos_ab_value(const char *name, int normal) {
+    const int side = hos_ab_side();
+    return side < 0 ? normal : hos_ab_value_at(name, normal, side);
+}
+int hos_ab_frame(int64_t from_ns, int64_t to_ns);
+void hos_ab_start(void);     /* (hos_main.c, before the game's threads) */
+void hos_ab_present(void);   /* (rx_nvn_present: the host's per-side sums) */
+void hos_ab_end(void);       /* (hos_close_finish: their line in the log) */
 /* (longshot) the profiling mode (host/profiling.c, HOS_PROFILE=1): its folder (NULL: off), its switches set (after
    longshot_env.txt), its threads started (hos_prof_start), a timed event into its events.txt, and a sampler's line written
    (packed with HOS_SAMPLE_PACKED) */
@@ -141,6 +177,9 @@ uint64_t hos_region_alloc(uint64_t size, uint64_t align);  /* address space abov
 void hos_region_free(uint64_t addr);
 int hos_regions(uint64_t (*out)[2], int cap);   /* the regions: {start, end}, at most cap; how many */
 void hos_mem_init(uint64_t image_end);
+int hos_output_page_change_begin(uint64_t addr, uint64_t size);
+void hos_output_page_change_end(void);
+void hos_output_boot_region(uint64_t *addr, uint64_t *size);
 extern uint64_t hos_heap_size, hos_heap_used, hos_total_memory, hos_program_size;
 
 /* ---- threads (hos_thread.c) */
@@ -174,7 +213,7 @@ int hos_vcore_away(void);
 void hos_vcore_back(void);
 void hos_vcore_checkpoint(void);
 /* HOS_CHAIN=<path> (hos_chain.c, diagnostic): blocks, wake-ups, sleeps and presents of the guest threads for
-   scripts/chain.py's critical path. kind: a wait that blocks begins / ends, a signal that can end one, a sleep begins /
+   scripts/perf.py chain's critical path. kind: a wait that blocks begins / ends, a signal that can end one, a sleep begins /
    ends, a present. lr 0: the current guest context's. */
 enum { HOS_CHAIN_WAIT = 1, HOS_CHAIN_WOKE, HOS_CHAIN_SIGNAL, HOS_CHAIN_SLEEP, HOS_CHAIN_AWAKE, HOS_CHAIN_PRESENT };
 extern volatile int hos_chain_on;

@@ -163,15 +163,8 @@ struct PressureHold {
         }
         if (over > last_over) {
             last_over = over;
-            if (total_bytes > baseline_total) baseline_total = total_bytes;
             const uint64_t cut = baseline_total > over ? baseline_total - over : 0;
             held_budget = std::min(held_budget, std::max(cut, floor_bytes));
-        } else if (total_bytes > baseline_total) {
-            // If pressure latched early (e.g. title screen with <100 MB textures) and the working set grew without
-            // worsening the RAM shortfall, advance baseline_total so held_budget is not stuck at floor_bytes (512 MB).
-            baseline_total = total_bytes;
-            const uint64_t cut = baseline_total > over ? baseline_total - over : 0;
-            held_budget = std::max(held_budget, std::max(cut, floor_bytes));
         }
         return held_budget;
     }

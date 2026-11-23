@@ -10,6 +10,9 @@
 #include <vector>
 
 #include "vk_jobs.h"
+#ifdef TRACY_ENABLE
+#include "../../host/hos_tracy.h"   // (LONGSHOT_TRACY: the profiler's zones; nothing in any other build)
+#endif
 #include "longshot_env.h"
 #include "vk_internal.h"
 #include "vk_draw.h"   // (ub_thread_off)
@@ -25,11 +28,10 @@ struct Entry {
 };
 std::deque<Entry> queue;
 std::atomic<int> pending{0};
-std::atomic<int> serial_pending{0};
 bool started = false;
 
-// (a job that throws: the game ended at once ("approach Malon, crash": an exception escaped a worker, KERNELBASE's RaiseException
-// with no handler, 2026-11-08). Resource jobs publish failure before the exception is logged, so their waiters finish.)
+// (a job that throws: an exception escaping a worker ends the game at once (KERNELBASE's RaiseException with no handler).
+// Resource jobs publish failure before the exception is logged, so their waiters finish.)
 void run_guarded(std::function<void()>& fn) {
     try {
         fn();
@@ -59,6 +61,9 @@ std::function<void()> with_failure(std::function<void()> fn, std::function<void(
 void worker() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     SetThreadDescription(GetCurrentThread(), L"mkw_vk worker");
+#ifdef TRACY_ENABLE
+    HT_THREAD_NAME("mkw_vk worker");
+#endif
     ub_thread_off();
     for (;;) {
         std::function<void()> fn;
@@ -68,6 +73,9 @@ void worker() {
             fn = std::move(queue.front().fn);
             queue.pop_front();
         }
+#ifdef TRACY_ENABLE
+        HT_SCOPE("worker job");   // (shader translation, a pipeline's build)
+#endif
         run_guarded(fn);
         pending--;
         jobs_notify();
@@ -94,8 +102,8 @@ void jobs_push(std::function<void()> fn, bool urgent, const std::atomic<bool>* f
     else queue.push_back({std::move(fn), flag});
     work_cv.notify_one();
 }
-// (issue 496) Intel A750: four of the game's big compute pipelines built at once by Intel's compiler (up to 58 s each) froze
-// the whole PC. One thread builds them one at a time there, below normal priority, beside the shared workers.
+// Intel's Windows driver: four of the game's big compute pipelines built at once by Intel's compiler (up to 58 s each) can
+// freeze the whole PC. One thread builds them one at a time there, below normal priority, beside the shared workers.
 // (longshot) Between two of its builds no compute build is under way: the moment Intel's pipeline cache fetch waits for
 // (pipeline_cache_between_builds). first: the front lane, in order among its own
 void jobs_push_serial(std::function<void()> fn, std::function<void()> on_failure, bool first) {
@@ -107,36 +115,33 @@ void jobs_push_serial(std::function<void()> fn, std::function<void()> on_failure
     std::lock_guard lk(smu);
     if (!sstarted) {
         sstarted = true;
-        unsigned sn = dev.policy.pcache_fetch_lock ? 1u : 3u;
-        if (const char* e = getenv("RX_VK_SERIAL_WORKERS"); e && *e) {
-            const int v = atoi(e);
-            if (v >= 1 && v <= 8) sn = (unsigned)v;
-        }
-        for (unsigned i = 0; i < sn; i++) {
-            std::thread([] {
-                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                SetThreadDescription(GetCurrentThread(), L"mkw_vk serial builds");
-                ub_thread_off();
-                for (;;) {
-                    std::function<void()> fn;
-                    {
-                        std::unique_lock lk(smu);
-                        scv.wait(lk, [] { return !sq.empty() || !sq_first.empty(); });
-                        auto& q = sq_first.empty() ? sq : sq_first;
-                        fn = std::move(q.front());
-                        q.pop_front();
-                    }
-                    run_guarded(fn);
-                    serial_pending--;
-                    jobs_notify();
-                    std::function<void()> between = pipeline_cache_between_builds;
-                    run_guarded(between);
+        std::thread([] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            SetThreadDescription(GetCurrentThread(), L"mkw_vk serial builds");
+#ifdef TRACY_ENABLE
+            HT_THREAD_NAME("mkw_vk serial builds");
+#endif
+            ub_thread_off();
+            for (;;) {
+                std::function<void()> fn;
+                {
+                    std::unique_lock lk(smu);
+                    scv.wait(lk, [] { return !sq.empty() || !sq_first.empty(); });
+                    auto& q = sq_first.empty() ? sq : sq_first;
+                    fn = std::move(q.front());
+                    q.pop_front();
                 }
-            }).detach();
-        }
-        logf("vk: compute pipelines built on %u dedicated worker(s) (the game's dispatches before the mesh fallback's)", sn);
+#ifdef TRACY_ENABLE
+                HT_SCOPE("serial build");
+#endif
+                run_guarded(fn);
+                jobs_notify();
+                std::function<void()> between = pipeline_cache_between_builds;
+                run_guarded(between);
+            }
+        }).detach();
+        logf("vk: compute pipelines are built one at a time (the game's dispatches before the mesh fallback's)");
     }
-    serial_pending++;
     (first ? sq_first : sq).push_back(std::move(fn));
     scv.notify_one();
 }
@@ -189,7 +194,7 @@ bool jobs_wait_for(const std::atomic<bool>& flag, double ms) {
                             [&] { return flag.load(std::memory_order_acquire); });
 }
 int jobs_pending() {
-    return pending.load() + serial_pending.load();
+    return pending.load();
 }
 
 } // namespace mkwvk

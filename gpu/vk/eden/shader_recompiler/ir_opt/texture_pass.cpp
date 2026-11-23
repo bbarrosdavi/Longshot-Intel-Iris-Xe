@@ -687,7 +687,6 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
     case IR::Opcode::Identity:
     case IR::Opcode::ConditionRef:
     case IR::Opcode::ShuffleIndex: // a value made uniform (R2UR): the same in every lane
-    case IR::Opcode::SubgroupBroadcastFirstU32:
     case IR::Opcode::VoteAny:      // of a condition on per-draw words only, the same in every lane
     case IR::Opcode::VoteAll:
         return build(0);
@@ -725,8 +724,7 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
             bool shuffled = false;
             for (int depth = 0; depth < 8 && !probe.IsImmediate(); ++depth) {
                 const IR::Inst* const probe_inst{probe.InstRecursive()};
-                if (probe_inst->GetOpcode() == IR::Opcode::ShuffleIndex ||
-                    probe_inst->GetOpcode() == IR::Opcode::SubgroupBroadcastFirstU32) {
+                if (probe_inst->GetOpcode() == IR::Opcode::ShuffleIndex) {
                     shuffled = true;
                     break;
                 }

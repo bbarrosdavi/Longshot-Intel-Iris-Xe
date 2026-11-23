@@ -1,6 +1,6 @@
 // (longshot) AMD FidelityFX Super Resolution 3.1 (the FSR 3.1.4 upscaler of FidelityFX SDK v1.1.4) in place of OoT's
 // gameplay upscale network, the same place NVIDIA DLSS takes (vk_dlss.h). Built from AMD's open shader sources
-// (third_party/fidelityfx-sdk, compiled into gpu/vk/shaders by scripts/fsr3_shaders.py): every pass is a dispatch of ours,
+// (third_party/fidelityfx-sdk, compiled into gpu/vk/shaders by scripts/shaders.py fsr3): every pass is a dispatch of ours,
 // and nothing of AMD's is linked or loaded at run time, so it is in every build and runs on any GPU with what supported()
 // asks for.
 //
@@ -42,13 +42,7 @@ struct Inputs {
     fsr3_math::Camera camera;     ///< device_to_view_depth (fsr3_math.h)
     float frame_time_ms = 16.667f;
     bool reset = false;
-    /// (Batch 11A) Optional external RGBA16F/B10G11R11 upscale-size output view: when set, accumulate writes directly here,
-    /// skipping g.output allocation and the post-upscale vkCmdCopyImage.
     VkImageView output = VK_NULL_HANDLE;
-    /// (Batch 11A) Caller already synchronized all input image writes to COMPUTE_SHADER_BIT | TRANSFER_BIT.
-    bool inputs_synced = false;
-    /// (Batch 15) Square perceptual output (c*c) directly in P_ACCUMULATE via kSquareOutput SpecId 0, eliminating dlss_out.comp.
-    bool square_output = false;
 };
 
 /// Whether this device can run the passes: push descriptors enough for the widest pass, storage images in every format the
@@ -60,11 +54,10 @@ struct Inputs {
 /// (longshot) The pipelines and the internal images for these sizes, made again when they change (upscale does the same
 /// first): 1 ready as they were, 2 made just now (a new history), 0 an image could not be made (try again later), -1 the
 /// passes cannot run here (for good). vk_fsr3.cpp's engine of the temporal chain calls it from its prepare
-[[nodiscard]] int prepare_sizes(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height,
-                                bool need_output = true);
+[[nodiscard]] int prepare_sizes(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height);
 
-/// Records one evaluation into output_image(), making the pipelines and the internal images at these sizes first (again
-/// when they change). False when something could not be made or the inputs are not usable
+/// Records one evaluation into in.output (or output_image() when null), making the pipelines and the internal images at these
+/// sizes first (again when they change). False when something could not be made or the inputs are not usable
 [[nodiscard]] bool upscale(VkCommandBuffer cmd, const Inputs& in);
 
 /// (longshot) Lets the internal images go (freed once the GPU's uses of them are done); the next prepare_sizes or upscale makes
@@ -76,8 +69,6 @@ void release();
 /// The image an evaluation resolves into: RGBA16F at the upscale size, or null before the first
 [[nodiscard]] VkImage output_image();
 [[nodiscard]] VkImageView output_view();
-/// (Batch 15) The internal perceptual RGBA16F history view written by the most recent accumulate pass (for exact HUD diff when dlss_out is fused).
-[[nodiscard]] VkImageView last_upscaled_view();
 
 } // namespace fsr3
 

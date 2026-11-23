@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <map>
+#include <utility>
+#include <unordered_set>
 #include <array>
 #include <bit>
 #include <climits>
@@ -479,6 +481,45 @@ Id CasLoop(EmitContext& ctx, Operation operation, Id array_pointer, Id element_p
     return func;
 }
 
+// Admit one active invocation per subgroup to the CAS loop at a time. Each invocation
+// still adds its own value and receives its own old value, including on overflow.
+Id SubgroupCasLoop(EmitContext& ctx, Id cas_func, Id array_pointer) {
+    const Id subgroup{ctx.Const(static_cast<u32>(spv::Scope::Subgroup))};
+    const Id func_type{ctx.TypeFunction(ctx.F32[1], ctx.U32[1], ctx.F32[1], array_pointer)};
+    const Id func{ctx.OpFunction(ctx.F32[1], spv::FunctionControlMask::MaskNone, func_type)};
+    const Id index{ctx.OpFunctionParameter(ctx.U32[1])};
+    const Id value{ctx.OpFunctionParameter(ctx.F32[1])};
+    const Id base{ctx.OpFunctionParameter(array_pointer)};
+    ctx.AddLabel();
+    const Id result{ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, ctx.F32[1]),
+                                         spv::StorageClass::Function)};
+    const Id header{ctx.OpLabel()};
+    const Id selected{ctx.OpLabel()};
+    const Id selection_end{ctx.OpLabel()};
+    const Id next{ctx.OpLabel()};
+    const Id merge{ctx.OpLabel()};
+    ctx.OpBranch(header);
+    ctx.AddLabel(header);
+    ctx.OpLoopMerge(merge, next, spv::LoopControlMask::MaskNone);
+    const Id elect_block{ctx.OpLabel()};
+    ctx.OpBranch(elect_block);
+    ctx.AddLabel(elect_block);
+    const Id elected{ctx.OpGroupNonUniformElect(ctx.U1, subgroup)};
+    ctx.OpSelectionMerge(selection_end, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(elected, selected, selection_end);
+    ctx.AddLabel(selected);
+    ctx.OpStore(result, ctx.OpFunctionCall(ctx.F32[1], cas_func, index, value, base));
+    ctx.OpBranch(selection_end);
+    ctx.AddLabel(selection_end);
+    ctx.OpBranch(next);
+    ctx.AddLabel(next);
+    ctx.OpBranchConditional(elected, merge, header);
+    ctx.AddLabel(merge);
+    ctx.OpReturnValue(ctx.OpLoad(ctx.F32[1], result));
+    ctx.OpFunctionEnd();
+    return func;
+}
+
 template <typename Desc>
 std::string NameOf(Stage stage, const Desc& desc, std::string_view prefix) {
     if (desc.count > 1) {
@@ -531,18 +572,18 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     if (runtime_info.mesh_fallback || runtime_info.mesh_fallback_vertex) {
         wants_mesh_fallback = true;   // (before any DefineRescalingInputPushConstant, which is made once)
     }
-    wants_render_area = program.info.uses_render_area;
-    uses_rescaling_uniform = program.info.uses_rescaling_uniform;
     DefineCommonTypes(program.info);
     DefineCommonConstants();
-    if (program.info.uses_global_memory && profile.support_int64 && profile.unified_descriptor_binding) {
-        wants_gm_ranges = true;
-        if (!Sirit::ValidId(U64)) {
-            AddCapability(spv::Capability::Int64);
-            U64 = Name(TypeInt(64, false), "u64");
-        }
-    }
+    PlanSharedWarp(program);   // (longshot: before the inputs, which a stage on the shared warp declares none of the subgroup's)
     DefineInterfaces(program);
+    // (longshot, mma_layout.h graphics_table_loads) a native task or mesh stage's global loads read the guest page table, as the
+    // other stages' do (DefineGlobalMemoryFunctions table_stage): its push block holds the table's address, so the member is
+    // wanted before any block is made (RX_VK_MESH_FIRST's below makes one)
+    if ((stage == Stage::Task || stage == Stage::Mesh) && !runtime_info.mesh_fallback && graphics_table_loads != 0 &&
+        program.info.uses_global_memory && profile.support_int64 && profile.unified_descriptor_binding &&
+        profile.supported_spirv >= 0x00010400) {
+        wants_guest_pages = true;
+    }
     // (RX_VK_MESH_FIRST=1, with RX_VK_MESH_ARGS=1: off, one task program with it hung or ended the game at its first draw)
     if (stage == Stage::Task && !runtime_info.mesh_fallback && env_on("RX_VK_MESH_FIRST") &&
         profile.unified_descriptor_binding && profile.support_int64) {
@@ -590,7 +631,6 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
         DefineRescalingInputPushConstant();
     }
     DefineMesh(program);
-    DefineWorkgroupWarp(program);
     DefineLocalMemory(program);
     DefineSharedMemory(program);
     DefineSharedMemoryFunctions(program);
@@ -603,7 +643,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineImages(program.info, image_binding, bindings.image_scaling_index);
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
-    DefineGlobalMemoryFunctions(program);
+    DefineGlobalMemoryFunctions(program.info);
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
 }
@@ -1078,78 +1118,47 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
 // (longshot) The page table of guest memory for pointers no bound buffer holds: 4 KB pages from this base, a device address each
 constexpr unsigned long long kGuestPagesBase = 0x1000000000ull;
 constexpr unsigned long long kGuestPagesBytes = 8ull << 30;
-// (a second window, its entries after the first's: the pools the game's GPU allocator puts at 0x7fxxxxxxxx, where its storage
-// buffers are. Pointers there read 0 with the first alone)
-constexpr unsigned long long kGuestPagesBase2 = 0x7f00000000ull;
-constexpr unsigned long long kGuestPagesBytes2 = 4ull << 30;
+// (a second window, its entries after the first's: the pools the game's GPU allocator puts below 512 GB, where its storage
+// buffers are. Pointers there read 0 with the first alone. 16 GB from 496 GB: the pool census saw some at 506 GB)
+constexpr unsigned long long kGuestPagesBase2 = 0x7c00000000ull;
+constexpr unsigned long long kGuestPagesBytes2 = 16ull << 30;
+// (and a third, after the second's: NVN's virtual pools from 1 TB (nvn_native.c VBASE), their entries the memory behind each
+// virtual page, written where a storage buffer there is bound (vk_memory.cpp memory_table_cover))
+constexpr unsigned long long kGuestPagesBase3 = 0x10000000000ull;
+constexpr unsigned long long kGuestPagesBytes3 = 4ull << 30;
 
-void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
-    const Info& info{program.info};
+void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     if (!info.uses_global_memory || !profile.support_int64) {
         return;
     }
-    bool need_load_u32{false}, need_load_u64{false}, need_load_u128{false};
-    bool need_write_u32{false}, need_write_u64{false}, need_write_u128{false};
-    bool need_write_cas{false}, need_atomic_cas{false}, need_atomic_f32{false};
-    std::array<bool, 9> need_atomic{};
-    for (const IR::Block* block : program.post_order_blocks) {
-        for (const IR::Inst& inst : block->Instructions()) {
-            switch (inst.GetOpcode()) {
-            case IR::Opcode::LoadGlobalU8:
-            case IR::Opcode::LoadGlobalS8:
-            case IR::Opcode::LoadGlobalU16:
-            case IR::Opcode::LoadGlobalS16:
-            case IR::Opcode::LoadGlobal32: need_load_u32 = true; break;
-            case IR::Opcode::LoadGlobal64: need_load_u64 = true; break;
-            case IR::Opcode::LoadGlobal128: need_load_u128 = true; break;
-            case IR::Opcode::WriteGlobalU8:
-            case IR::Opcode::WriteGlobalS8:
-            case IR::Opcode::WriteGlobalU16:
-            case IR::Opcode::WriteGlobalS16: need_write_cas = true; break;
-            case IR::Opcode::WriteGlobal32: need_write_u32 = true; break;
-            case IR::Opcode::WriteGlobal64: need_write_u64 = true; break;
-            case IR::Opcode::WriteGlobal128: need_write_u128 = true; break;
-            case IR::Opcode::GlobalAtomicIAdd32: need_atomic[0] = true; break;
-            case IR::Opcode::GlobalAtomicSMin32: need_atomic[1] = true; break;
-            case IR::Opcode::GlobalAtomicUMin32: need_atomic[2] = true; break;
-            case IR::Opcode::GlobalAtomicSMax32: need_atomic[3] = true; break;
-            case IR::Opcode::GlobalAtomicUMax32: need_atomic[4] = true; break;
-            case IR::Opcode::GlobalAtomicAnd32: need_atomic[5] = true; break;
-            case IR::Opcode::GlobalAtomicOr32: need_atomic[6] = true; break;
-            case IR::Opcode::GlobalAtomicXor32: need_atomic[7] = true; break;
-            case IR::Opcode::GlobalAtomicExchange32: need_atomic[8] = true; break;
-            case IR::Opcode::GlobalAtomicCompareExchange32: need_atomic_cas = true; break;
-            case IR::Opcode::GlobalAtomicAddF32: need_atomic_f32 = true; break;
-            default: break;
-            }
-        }
-    }
-    const bool any_atomic{std::any_of(need_atomic.begin(), need_atomic.end(), [](bool v) { return v; })};
-    const bool any_load{need_load_u32 || need_load_u64 || need_load_u128};
-    const bool any_write{need_write_u32 || need_write_u64 || need_write_u128 || need_write_cas || any_atomic ||
-                         need_atomic_cas || need_atomic_f32};
-    const char* const gp_test{getenv("RX_VK_GP_TEST")};
+    // (longshot) A pointer that is in no bound buffer. Eden gave such a load 0, and the game's foliage culling follows pointers read from its
+    // storage buffers to all of a forest's data: it read zeros, and left out every tree, fern and blade of grass. The console's GPU just reads
+    // memory: here a page table (vk_memory.cpp) takes the guest address to its pool's device address.
+    const char* const gp_test{getenv("RX_VK_GP_TEST")};   // (1: the addressing model alone, 2: and the table's load, 3 or unset: all of it)
     const int gp_level{gp_test ? atoi(gp_test) : 3};
+    // (the culling; a graphics stage with it hung the renderer at a load)
+    // (not the task and mesh stages: tried for the foliage, which it did not bring back)
+    // (EvilOOT: vertex and fragment stages too, as the fallback only: an access no bound buffer holds read 0 there (Kokiri's
+    // pond came out grey, not green). The pointer pass leaves graphics stages as they were, so what was found before still is,
+    // and the menus' text stays. Not where the stage has the render area's push block: a stage has one push block)
     const bool graphics_stage{stage == Stage::VertexB || stage == Stage::Fragment};
-    const bool follow_pointers{stage == Stage::Compute ||
-                               (runtime_info.mesh_fallback && (stage == Stage::Task || stage == Stage::Mesh)) ||
-                               (graphics_stage && !info.uses_render_area)};
-    if (follow_pointers && (any_load || any_write)) {
+    const bool follow_pointers{stage == Stage::Compute || (graphics_stage && !info.uses_render_area)};
+    // (longshot) a native task or mesh stage with the page table's member wanted (the constructor): addresses, and the push block
+    // that holds the table's, for its loads through the table (table_stage below). Its searches are left as they were: no
+    // follow_pointers fallback for its stores
+    const bool native_mesh_table{(stage == Stage::Task || stage == Stage::Mesh) && !mesh_fallback && wants_guest_pages};
+    Id ptr_u64{};
+    if (follow_pointers || native_mesh_table) {
         wants_guest_pages = true;
-    }
-    if (!Sirit::ValidId(U64)) {
-        AddCapability(spv::Capability::Int64);
-        U64 = Name(TypeInt(64, false), "u64");
-    }
-    if ((any_load || any_write) && profile.unified_descriptor_binding && rescaling_push_constants.value == 0) {
-        DefineRescalingInputPushConstant();
-    }
-    if (any_load || any_write) {
+        if (profile.unified_descriptor_binding && rescaling_push_constants.value == 0) DefineRescalingInputPushConstant();   // (the table's address is in it)
         AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
         AddExtension("SPV_KHR_physical_storage_buffer");
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
+        ptr_u64 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U64);
     }
-    std::map<u32, std::pair<Id, Id>> psb_types;
+    // (a load through an address as glslang makes one: a pointer to a laid-out block, its member read. A pointer to a bare scalar crashed
+    // NVIDIA's shader compiler)
+    std::map<u32, std::pair<Id, Id>> psb_types;   // (by the type's id)
     const auto psb_load = [&](Id type, Id address, u32 align) {
         auto it = psb_types.find(type.value);
         if (it == psb_types.end()) {
@@ -1162,7 +1171,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id member{OpAccessChain(it->second.second, OpConvertUToPtr(it->second.first, address), Const(0U))};
         return OpLoad(type, member, spv::MemoryAccessMask::Aligned, align);
     };
-    const auto psb_member = [&](Id type, Id address) {
+    const auto psb_member = [&](Id type, Id address) {   // (a pointer to a value at an address, for stores and atomics)
         auto it = psb_types.find(type.value);
         if (it == psb_types.end()) {
             const Id block{TypeStruct(type)};
@@ -1173,10 +1182,79 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         }
         return OpAccessChain(it->second.second, OpConvertUToPtr(it->second.first, address), Const(0U));
     };
+    // (the page table's lookup of addr: hit(target) is called in the block where the page is mapped, its device address in target,
+    // and must end that block (a return). Falls through after it)
+    // (RX_VK_FOLLOW_STORES=1: writes and atomics through the table too; off by default, see the storage buffer pass)
     static const bool follow_stores{env_on("RX_VK_FOLLOW_STORES")};
-    constexpr u32 kGuestZeroSlotIndex = static_cast<u32>(((8ull << 30) + (4ull << 30)) >> 12);   // 0x300000U
-    constexpr unsigned long long kGuestZeroPageOffset = (static_cast<unsigned long long>(kGuestZeroSlotIndex) + 8ull) * 8ull;
+    // (longshot, mma_layout.h graphics_table_loads) a vertex, fragment or compute stage that has the table, the task and mesh
+    // stages, native and the mesh fallback's: its loads through it alone (1), or the search kept and checked against it (2, not
+    // the fallback's task and mesh stages: the miss log's buffer is not theirs). Not where the render area's push block leaves
+    // no table (follow_pointers). A native task or mesh stage inlines its load helpers (#994, define_load): with the search,
+    // every bound storage buffer's range tested at every load
+    const bool table_stage{graphics_stage || stage == Stage::Compute || stage == Stage::Task || stage == Stage::Mesh};
+    const bool graphics_table{graphics_table_loads != 0 && table_stage && wants_guest_pages &&
+                              rescaling_push_constants.value != 0 && profile.supported_spirv >= 0x00010400};
+    const bool table_alone{graphics_table && graphics_table_loads == 1};
+    const bool table_check{graphics_table && graphics_table_loads == 2 &&
+                           !(mesh_fallback && (stage == Stage::Task || stage == Stage::Mesh))};
+    // (longshot) size: the access's bytes. An access that runs past its 4 KB page is left to the miss path: the table maps pages one
+    // by one, the next page may be another allocation's or none, and a 16-byte read at a page's end faulted the device (the culling
+    // passes 53caac5f, b6122162 at a save's load)
+    // (longshot) where an address's entry is in the table: inside one of its windows (page_table_census.h kPageWindows), its page
+    // numbered after the windows before it
+    const auto table_window = [&](Id addr) {
+        const Id offset_a{OpISub(U64, addr, Constant(U64, u64{kGuestPagesBase}))};
+        const Id offset_b{OpISub(U64, addr, Constant(U64, u64{kGuestPagesBase2}))};
+        const Id offset_c{OpISub(U64, addr, Constant(U64, u64{kGuestPagesBase3}))};
+        const Id in_a{OpULessThan(U1, offset_a, Constant(U64, u64{kGuestPagesBytes}))};
+        const Id in_b{OpULessThan(U1, offset_b, Constant(U64, u64{kGuestPagesBytes2}))};
+        const Id in_c{OpULessThan(U1, offset_c, Constant(U64, u64{kGuestPagesBytes3}))};
+        const Id page_c{OpIAdd(U64, OpShiftRightLogical(U64, offset_c, Const(12U)),
+                               Constant(U64, u64{(kGuestPagesBytes + kGuestPagesBytes2) >> 12}))};
+        const Id page_b{OpIAdd(U64, OpShiftRightLogical(U64, offset_b, Const(12U)), Constant(U64, u64{kGuestPagesBytes >> 12}))};
+        const Id page_index{OpSelect(U64, in_a, OpShiftRightLogical(U64, offset_a, Const(12U)), OpSelect(U64, in_b, page_b, page_c))};
+        return std::pair{OpLogicalOr(U1, in_a, OpLogicalOr(U1, in_b, in_c)), page_index};
+    };
+    const auto guest_lookup = [&](Id addr, u32 size, auto&& hit) {
+        if (!follow_pointers || gp_level < 2) return;
+        const Id table{wants_guest_pages && rescaling_push_constants.value != 0
+                           ? OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
+                                                       Const(guest_pages_member_index)))
+                           : Constant(U64, u64{0})};   // (pushed: the table's device address, 0 for none)
+        const auto [in_window, page_index] = table_window(addr);
+        const Id fits{OpULessThanEqual(U1, OpBitwiseAnd(U64, addr, Constant(U64, u64{0xfff})), Constant(U64, u64{0x1000 - size}))};
+        const Id inside{OpLogicalAnd(U1, OpLogicalAnd(U1, in_window, OpINotEqual(U1, table, Constant(U64, u64{0}))), fits)};
+        const Id then_label{OpLabel()};
+        const Id else_label{OpLabel()};
+        OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(inside, then_label, else_label);
+        AddLabel(then_label);
+        const Id slot{OpIAdd(U64, table, OpShiftLeftLogical(U64, page_index, Const(3U)))};
+        const Id page{psb_load(U64, slot, 8U)};
+        const Id mapped{OpINotEqual(U1, page, Constant(U64, u64{0}))};   // (before the merge: it must stand right before its branch)
+        const Id hit_label{OpLabel()};
+        const Id miss_label{OpLabel()};
+        OpSelectionMerge(miss_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(mapped, hit_label, miss_label);
+        AddLabel(hit_label);
+        hit(OpIAdd(U64, page, OpBitwiseAnd(U64, addr, Constant(U64, u64{0xfff}))));
+        AddLabel(miss_label);
+        OpBranch(else_label);
+        AddLabel(else_label);
+    };
+    using DefPtr = Id StorageDefinitions::*;
     const Id zero{u32_zero_value};
+    // (EvilOOT) the structure pointer type of a storage buffer of that member's elements, for OpArrayLength
+    const auto struct_pointer_of{[&](DefPtr m) -> Id {
+        if (m == &StorageDefinitions::U32) return storage_types.U32.array;
+        if (m == &StorageDefinitions::F32) return storage_types.F32.array;   // (longshot: the native float add's, as U32's)
+        if (m == &StorageDefinitions::U32x2) return storage_types.U32x2.array;
+        if (m == &StorageDefinitions::U32x4) return storage_types.U32x4.array;
+        return Id{};
+    }};
+    // (EvilOOT, RX_VK_MISS_LOG) the miss log's descriptor (translate_program.cpp: c0+0xff0), -1 none. It is a single storage
+    // buffer like the real ones, so the searches skip it; an address none of them holds is recorded in it: word 0 counts
+    // the misses, then the first 63 addresses (low, high)
     size_t miss_index{SIZE_MAX};
     for (size_t i = 0; i < info.storage_buffers_descriptors.size(); ++i) {
         const auto& d{info.storage_buffers_descriptors[i]};
@@ -1185,65 +1263,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         }
     }
     if (miss_index != SIZE_MAX && Sirit::ValidId(ssbos[miss_index].U32)) {
-        probe_log = ssbos[miss_index].U32;
+        probe_log = ssbos[miss_index].U32;   // (RX_VK_BLOCK_PROBE, emit_spirv.cpp Traverse)
     }
-    const bool can_direct_guest{follow_pointers && gp_level >= 2 && wants_guest_pages &&
-                                rescaling_push_constants.value != 0 && miss_index == SIZE_MAX};
-    const bool direct_stores{follow_stores || (direct_guest_stores && can_direct_guest)};
-    const auto guest_lookup = [&](Id addr, u32 size, auto&& hit) {
-        if (!follow_pointers || gp_level < 2 || !wants_guest_pages || rescaling_push_constants.value == 0) return;
-        const Id table{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
-                                                 Const(guest_pages_member_index)))};
-        const Id addr_lo{OpUConvert(U32[1], addr)};
-        const Id addr_hi{OpUConvert(U32[1], OpShiftRightLogical(U64, addr, Const(32U)))};
-        const Id in_a{OpIEqual(U1, OpBitwiseAnd(U32[1], addr_hi, Const(0xfffffffeU)), Const(0x10U))};
-        const Id in_b{OpIEqual(U1, addr_hi, Const(0x7fU))};
-        const Id pgoff_raw{OpBitwiseAnd(U32[1], addr_lo, Const(0xfffU))};
-        const Id fits{OpULessThanEqual(U1, pgoff_raw, Const(0x1000U - size))};
-        if (direct_guest_stores && can_direct_guest) {
-            const Id valid{OpLogicalAnd(U1, OpLogicalOr(U1, in_a, in_b), fits)};
-            const Id pgoff_pg{OpShiftRightLogical(U32[1], addr_lo, Const(12U))};
-            const Id idx_a{OpBitwiseOr(U32[1], OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], addr_hi, Const(1U)), Const(20U)), pgoff_pg)};
-            const Id idx_b{OpBitwiseOr(U32[1], Const(0x200000U), pgoff_pg)};
-            const Id raw_idx32{OpSelect(U32[1], in_a, idx_a, idx_b)};
-            const Id idx32{OpSelect(U32[1], valid, raw_idx32, Const(kGuestZeroSlotIndex))};
-            const Id slot{OpIAdd(U64, table, OpUConvert(U64, OpShiftLeftLogical(U32[1], idx32, Const(3U))))};
-            const Id page{psb_load(U64, slot, 8U)};
-            const Id zero_page{OpIAdd(U64, table, Constant(U64, u64{kGuestZeroPageOffset}))};
-            const Id mapped{OpINotEqual(U1, page, zero_page)};
-            const Id hit_label{OpLabel()};
-            const Id done_label{OpLabel()};
-            OpSelectionMerge(done_label, spv::SelectionControlMask::MaskNone);
-            OpBranchConditional(mapped, hit_label, done_label);
-            AddLabel(hit_label);
-            hit(OpIAdd(U64, page, OpUConvert(U64, pgoff_raw)));
-            AddLabel(done_label);
-            return;
-        }
-        const Id valid{OpLogicalAnd(U1, OpLogicalAnd(U1, OpINotEqual(U1, table, Constant(U64, u64{0})), OpLogicalOr(U1, in_a, in_b)), fits)};
-        const Id check_label{OpLabel()};
-        const Id done_label{OpLabel()};
-        OpSelectionMerge(done_label, spv::SelectionControlMask::MaskNone);
-        OpBranchConditional(valid, check_label, done_label);
-        AddLabel(check_label);
-        const Id pgoff_pg{OpShiftRightLogical(U32[1], addr_lo, Const(12U))};
-        const Id idx_a{OpBitwiseOr(U32[1], OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], addr_hi, Const(1U)), Const(20U)), pgoff_pg)};
-        const Id idx_b{OpBitwiseOr(U32[1], Const(0x200000U), pgoff_pg)};
-        const Id idx32{OpSelect(U32[1], in_a, idx_a, idx_b)};
-        const Id slot{OpIAdd(U64, table, OpUConvert(U64, OpShiftLeftLogical(U32[1], idx32, Const(3U))))};
-        const Id page{psb_load(U64, slot, 8U)};
-        const Id zero_page{OpIAdd(U64, table, Constant(U64, u64{kGuestZeroPageOffset}))};
-        const Id mapped{OpINotEqual(U1, page, zero_page)};
-        const Id hit_label{OpLabel()};
-        const Id miss_label{OpLabel()};
-        OpSelectionMerge(miss_label, spv::SelectionControlMask::MaskNone);
-        OpBranchConditional(mapped, hit_label, miss_label);
-        AddLabel(hit_label);
-        hit(OpIAdd(U64, page, OpUConvert(U64, pgoff_raw)));
-        AddLabel(miss_label);
-        OpBranch(done_label);
-        AddLabel(done_label);
-    };
     const auto record_miss{[&](Id addr) {
         if (miss_index == SIZE_MAX || !Sirit::ValidId(ssbos[miss_index].U32)) {
             return;
@@ -1252,6 +1273,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id counter{OpAccessChain(storage_types.U32.element, log, zero, zero)};
         const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
         const Id slot{OpAtomicIAdd(U32[1], counter, scope, zero, Const(1U))};
+        // (the condition before the merge: OpSelectionMerge must come right before its branch; the driver crashed on it)
         const Id room{OpULessThan(U1, slot, Const(63U))};
         const Id then_label{OpLabel()};
         const Id end_label{OpLabel()};
@@ -1265,249 +1287,364 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         OpBranch(end_label);
         AddLabel(end_label);
     }};
-    if (!any_load && !any_write) {
-        return;
-    }
-    const bool use_gm_ranges{profile.unified_descriptor_binding && wants_gm_ranges &&
-                             rescaling_push_constants.value != 0};
-    const bool need_read_range{use_gm_ranges && any_load && (!follow_pointers || gp_level < 2 || !wants_guest_pages)};
-    const bool need_gm_range{need_read_range || (use_gm_ranges && any_write && !direct_stores)};
-
-    Id gm_hdr_ptr{}, gm_hdr_u32p{}, gm_rng_ptr{}, gm_rng_u64p{};
-    if (need_gm_range) {
-        const Id hdr_struct{TypeStruct(U32[1], U32[1])};
-        Decorate(hdr_struct, spv::Decoration::Block);
-        MemberDecorate(hdr_struct, 0, spv::Decoration::Offset, 0U);
-        MemberDecorate(hdr_struct, 1, spv::Decoration::Offset, 4U);
-        gm_hdr_ptr = TypePointer(spv::StorageClass::PhysicalStorageBuffer, hdr_struct);
-        gm_hdr_u32p = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[1]);
-
-        const Id rng_struct{TypeStruct(U64, U64, U64)};
-        Decorate(rng_struct, spv::Decoration::Block);
-        MemberDecorate(rng_struct, 0, spv::Decoration::Offset, 0U);
-        MemberDecorate(rng_struct, 1, spv::Decoration::Offset, 8U);
-        MemberDecorate(rng_struct, 2, spv::Decoration::Offset, 16U);
-        gm_rng_ptr = TypePointer(spv::StorageClass::PhysicalStorageBuffer, rng_struct);
-        gm_rng_u64p = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U64);
-    }
-    const auto define_resolver{[&]() -> Id {
-        const Id fn_type{TypeFunction(U64, U64, U64)};
-        const Id fn{OpFunction(U64, spv::FunctionControlMask::MaskNone, fn_type)};
-        const Id addr{OpFunctionParameter(U64)};
-        const Id bytes{OpFunctionParameter(U64)};
-        AddLabel();
-        const Id i_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]), spv::StorageClass::Function)};
-        const Id res_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U64), spv::StorageClass::Function)};
-        OpStore(i_var, u32_zero_value);
-        OpStore(res_var, Constant(U64, u64{0}));
-
-        const Id tbl{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64),
-                                               rescaling_push_constants, Const(gm_ranges_member_index)))};
-        const Id has_tbl{OpINotEqual(U1, tbl, Constant(U64, u64{0}))};
-        const Id ok_label{OpLabel()};
-        const Id done_label{OpLabel()};
-        OpSelectionMerge(done_label, spv::SelectionControlMask::MaskNone);
-        OpBranchConditional(has_tbl, ok_label, done_label);
-
-        AddLabel(ok_label);
-        const Id hdr_p{OpConvertUToPtr(gm_hdr_ptr, tbl)};
-        const Id cnt_m{OpAccessChain(gm_hdr_u32p, hdr_p, Const(0U))};
-        const Id cnt{OpLoad(U32[1], cnt_m, spv::MemoryAccessMask::Aligned, 4U)};
-        const Id hdr_label{OpLabel()};
-        const Id body_label{OpLabel()};
-        const Id hit_label{OpLabel()};
-        const Id next_label{OpLabel()};
-        const Id cont_label{OpLabel()};
-        const Id exit_label{OpLabel()};
-        OpBranch(hdr_label);
-
-        AddLabel(hdr_label);
-        const Id idx{OpLoad(U32[1], i_var)};
-        const Id cond{OpULessThan(U1, idx, cnt)};
-        OpLoopMerge(exit_label, cont_label, spv::LoopControlMask::DontUnroll);
-        OpBranchConditional(cond, body_label, exit_label);
-
-        AddLabel(body_label);
-        const Id off{OpShiftLeftLogical(U64, OpUConvert(U64, idx), Const(5U))};
-        const Id ep{OpIAdd(U64, OpIAdd(U64, tbl, Constant(U64, u64{16})), off)};
-        const Id rp{OpConvertUToPtr(gm_rng_ptr, ep)};
-        const Id lo{OpLoad(U64, OpAccessChain(gm_rng_u64p, rp, Const(0U)), spv::MemoryAccessMask::Aligned, 8U)};
-        const Id rsz{OpLoad(U64, OpAccessChain(gm_rng_u64p, rp, Const(1U)), spv::MemoryAccessMask::Aligned, 8U)};
-        const Id sub{OpISub(U64, addr, lo)};
-        const Id fits{OpUGreaterThanEqual(U1, rsz, bytes)};
-        const Id in_range{OpULessThanEqual(U1, sub, OpISub(U64, rsz, bytes))};
-        const Id match{OpLogicalAnd(U1, fits, in_range)};
-        OpSelectionMerge(next_label, spv::SelectionControlMask::MaskNone);
-        OpBranchConditional(match, hit_label, next_label);
-
-        AddLabel(hit_label);
-        const Id dv{OpLoad(U64, OpAccessChain(gm_rng_u64p, rp, Const(2U)), spv::MemoryAccessMask::Aligned, 8U)};
-        OpStore(res_var, OpIAdd(U64, dv, sub));
-        OpBranch(exit_label);
-
-        AddLabel(next_label);
-        OpBranch(cont_label);
-
-        AddLabel(cont_label);
-        OpStore(i_var, OpIAdd(U32[1], OpLoad(U32[1], i_var), Const(1U)));
-        OpBranch(hdr_label);
-
-        AddLabel(exit_label);
-        OpBranch(done_label);
-
-        AddLabel(done_label);
-        OpReturnValue(OpLoad(U64, res_var));
-        OpFunctionEnd();
-        return fn;
-    }};
-    const Id resolve_gm_range_func{need_gm_range ? define_resolver() : Id{}};
-
-    const auto range_lookup{[&](Id resolver_func, Id addr, u32 size, auto&& hit) {
-        if (!Sirit::ValidId(resolver_func)) {
-            return;
+    const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
+                               auto&& callback, bool add_label = true) {
+        if (add_label) AddLabel();
+        // (longshot, global_table_loop: the tables' entries in a loop, its counter here, where the function's variables must be.
+        // The CAS loops' callers open the block themselves: theirs stay written out)
+        const Id table_counter{global_table_loop && add_label && !ssbo_tables.empty()
+                                   ? AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]), spv::StorageClass::Function)
+                                   : Id{}};
+        if (Sirit::ValidId(table_counter)) AddCapability(spv::Capability::StorageBufferArrayDynamicIndexing);   // (the tables by k)
+        const size_t num_buffers{info.storage_buffers_descriptors.size()};
+        // (from Fritchii) Info::native_global_bounds: the candidate pointers the storage buffer pass bound for accesses it
+        // left global (any single descriptor not in the driver bank) carry no NVN size word: the address goes to the
+        // candidate whose base is the nearest at or below it, within what is bound (the binding's length, vk_draw.cpp
+        // binds them bare). An address none of them holds goes on to the searches below.
+        std::vector<bool> candidate(num_buffers);
+        if (info.native_global_bounds && Sirit::ValidId(struct_pointer_of(ssbo_member))) {
+            const u64 align_mask{~(profile.min_ssbo_alignment - 1U)};
+            std::vector<Id> bases(num_buffers);
+            Id best_index{Const(~0U)};
+            Id best_distance{Constant(U64, ~u64{0})};
+            for (size_t index = 0; index < num_buffers; ++index) {
+                const auto& ssbo{info.storage_buffers_descriptors[index]};
+                if (index == miss_index || ssbo.count != 1 || ssbo.cbuf_index == 0 || ssbo.cbuf_offset % 8 != 0 ||
+                    !Sirit::ValidId(ssbos[index].*ssbo_member) || !Sirit::ValidId(cbufs[ssbo.cbuf_index].U32x2)) {
+                    continue;
+                }
+                candidate[index] = true;
+                const Id words_pointer{OpAccessChain(uniform_types.U32x2, cbufs[ssbo.cbuf_index].U32x2, zero,
+                                                     Const(ssbo.cbuf_offset / 8))};
+                bases[index] = OpBitwiseAnd(U64, OpBitcast(U64, OpLoad(U32[2], words_pointer)), Constant(U64, align_mask));
+                const Id elements{OpArrayLength(U32[1], ssbos[index].*ssbo_member, 0U)};
+                const Id bound_end{
+                    OpIAdd(U64, bases[index], OpUConvert(U64, OpShiftLeftLogical(U32[1], elements, Const(shift))))};
+                const Id distance{OpISub(U64, addr, bases[index])};
+                const Id inside{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, bases[index]), OpULessThan(U1, addr, bound_end))};
+                const Id better{OpLogicalAnd(U1, inside, OpULessThan(U1, distance, best_distance))};
+                best_distance = OpSelect(U64, better, distance, best_distance);
+                best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
+            }
+            for (size_t index = 0; index < num_buffers; ++index) {
+                if (!candidate[index]) {
+                    continue;
+                }
+                const Id cond{OpIEqual(U1, best_index, Const(static_cast<u32>(index)))};
+                const Id then_label{OpLabel()};
+                const Id else_label{OpLabel()};
+                OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
+                OpBranchConditional(cond, then_label, else_label);
+                AddLabel(then_label);
+                const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, bases[index]))};
+                const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+                callback(OpAccessChain(element_pointer, ssbos[index].*ssbo_member, zero, ssbo_index));
+                AddLabel(else_label);
+            }
         }
-        const Id target{OpFunctionCall(U64, resolver_func, addr, Constant(U64, u64{size}))};
-        const Id mapped{OpINotEqual(U1, target, Constant(U64, u64{0}))};
-        const Id hit_label{OpLabel()};
-        const Id miss_label{OpLabel()};
-        OpSelectionMerge(miss_label, spv::SelectionControlMask::MaskNone);
-        OpBranchConditional(mapped, hit_label, miss_label);
-        AddLabel(hit_label);
-        hit(target);
-        AddLabel(miss_label);
-    }};
+        for (size_t index = 0; index < num_buffers; ++index) {
+            if (index == miss_index || candidate[index]) {
+                continue;
+            }
+            // (EvilOOT) every single storage buffer the program has is searched by its address range. The old test,
+            // nvn_buffer_used[index], took a descriptor's place in the list for an NVN slot number: with the tracked
+            // buffers first, the slots' own descriptors past them were skipped and their reads gave 0. A match is exact,
+            // so searching a buffer the access never falls in costs a comparison and nothing else.
+            // (longshot) nor a simulated-turf private one (ir_opt/sim_turf_pool_pass.h): no constant-bank word describes it, and the
+            // accesses that go to it name it
+            if (info.storage_buffers_descriptors[index].count > 1 || IsSimTurfStorage(info.storage_buffers_descriptors[index])) {
+                continue;
+            }
+            const auto& ssbo{info.storage_buffers_descriptors[index]};
+            const Id ssbo_addr_cbuf_offset{Const(ssbo.cbuf_offset / 8)};
+            const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
+            const Id ssbo_addr_pointer{OpAccessChain(
+                uniform_types.U32x2, cbufs[ssbo.cbuf_index].U32x2, zero, ssbo_addr_cbuf_offset)};
+            const Id ssbo_size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
+                                                     zero, ssbo_size_cbuf_offset)};
 
-    const auto define_load{[&](Id type, u32 shift) {
+            const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
+            const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer))};
+            const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
+            const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
+            Id ssbo_end{OpIAdd(U64, unaligned_addr, ssbo_size)};
+            // (EvilOOT) no further than what is bound: a buffer the back end could not bind is a null descriptor (length 0), and an
+            // address in its range read 0 through it instead of going on to the page table (OoT's ambient light probes: 0, the
+            // foliage and signs black)
+            if (Sirit::ValidId(struct_pointer_of(ssbo_member)) && Sirit::ValidId(ssbos[index].*ssbo_member)) {
+                const Id elements{OpArrayLength(U32[1], ssbos[index].*ssbo_member, 0U)};
+                const Id bound_end{OpIAdd(U64, ssbo_addr, OpUConvert(U64, OpShiftLeftLogical(U32[1], elements, Const(shift))))};
+                ssbo_end = OpSelect(U64, OpULessThan(U1, bound_end, ssbo_end), bound_end, ssbo_end);
+            }
+            const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
+                                       OpULessThan(U1, addr, ssbo_end))};
+            const Id then_label{OpLabel()};
+            const Id else_label{OpLabel()};
+            OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
+            OpBranchConditional(cond, then_label, else_label);
+            AddLabel(then_label);
+            const Id ssbo_id{ssbos[index].*ssbo_member};
+            const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
+            const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+            const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
+            callback(ssbo_pointer);
+            AddLabel(else_label);
+        }
+        for (const GlobalTableVars& table : ssbo_tables) {   // (longshot: Info::global_tables)
+            const Id table_id{table.vars.*ssbo_member};
+            if (!Sirit::ValidId(table_id) || !Sirit::ValidId(cbufs[table.cbuf_index].U32x2)) {
+                continue;
+            }
+            if (Sirit::ValidId(table_counter)) {
+                // (mma_layout.h global_table_loop) the same test as the written-out one below, entry k of the loop's counter, the
+                // driver asked not to unroll it. k is the same in every invocation that runs it: dynamic indexing, not non-uniform.
+                // The written-out form below is left as it was: other GPUs' SPIR-V, and their drivers' caches of it, do not change
+                const Id header{OpLabel()};
+                const Id check{OpLabel()};
+                const Id body{OpLabel()};
+                const Id next{OpLabel()};
+                const Id done{OpLabel()};
+                OpStore(table_counter, zero);
+                OpBranch(header);
+                AddLabel(header);
+                OpLoopMerge(done, next, spv::LoopControlMask::DontUnroll);
+                OpBranch(check);
+                AddLabel(check);
+                const Id k{OpLoad(U32[1], table_counter)};
+                OpBranchConditional(OpULessThan(U1, k, Const(table.count)), body, done);
+                AddLabel(body);
+                // (entry k at cbuf_offset + 16k: its address in the U32x2 word cbuf_offset / 8 + 2k, its size in the next)
+                const Id word{OpIAdd(U32[1], Const(table.cbuf_offset / 8), OpShiftLeftLogical(U32[1], k, Const(1U)))};
+                const Id entry_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, zero, word)};
+                const Id size_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, zero,
+                                                    OpIAdd(U32[1], word, Const(1U)))};
+                const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
+                const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], entry_pointer))};
+                const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
+                const Id size_word{OpCompositeExtract(U32[1], OpLoad(U32[2], size_pointer), 0U)};
+                Id ssbo_end{OpIAdd(U64, unaligned_addr, OpUConvert(U64, size_word))};
+                if (const Id struct_pointer{struct_pointer_of(ssbo_member)}; Sirit::ValidId(struct_pointer)) {
+                    const Id elements{OpArrayLength(U32[1], OpAccessChain(struct_pointer, table_id, k), 0U)};
+                    const Id bound_end{
+                        OpIAdd(U64, ssbo_addr, OpUConvert(U64, OpShiftLeftLogical(U32[1], elements, Const(shift))))};
+                    const Id capped{OpSelect(U64, OpULessThan(U1, bound_end, ssbo_end), bound_end, ssbo_end)};
+                    ssbo_end = OpSelect(U64, OpIEqual(U1, size_word, zero), bound_end, capped);
+                }
+                const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr), OpULessThan(U1, addr, ssbo_end))};
+                const Id then_label{OpLabel()};
+                const Id else_label{OpLabel()};
+                OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
+                OpBranchConditional(cond, then_label, else_label);
+                AddLabel(then_label);
+                const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
+                const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+                callback(OpAccessChain(element_pointer, table_id, k, zero, ssbo_index));   // (ends in a return)
+                AddLabel(else_label);
+                OpBranch(next);
+                AddLabel(next);
+                OpStore(table_counter, OpIAdd(U32[1], k, Const(1U)));
+                OpBranch(header);
+                AddLabel(done);
+                continue;
+            }
+            for (u32 k = 0; k < table.count; ++k) {
+                const u32 at{table.cbuf_offset + k * 16};
+                const Id entry_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, zero,
+                                                     Const(at / 8))};
+                const Id size_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, zero,
+                                                    Const(at / 8 + 1))};
+                const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
+                const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], entry_pointer))};
+                const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
+                const Id size_word{OpCompositeExtract(U32[1], OpLoad(U32[2], size_pointer), 0U)};
+                Id ssbo_end{OpIAdd(U64, unaligned_addr, OpUConvert(U64, size_word))};
+                // (EvilOOT) an entry without a size (OoT's culling setup keeps bare pointers, the size word 0: the back end
+                // binds those up to 1 MB of their pool, vk_draw.cpp): the binding's own length is the end
+                if (const Id struct_pointer{struct_pointer_of(ssbo_member)}; Sirit::ValidId(struct_pointer)) {
+                    const Id elements{OpArrayLength(U32[1], OpAccessChain(struct_pointer, table_id, Const(k)), 0U)};
+                    const Id bound_end{
+                        OpIAdd(U64, ssbo_addr, OpUConvert(U64, OpShiftLeftLogical(U32[1], elements, Const(shift))))};
+                    // (EvilOOT: and an entry with a size no further than what is bound either: an entry the back end could
+                    // not bind (a whole pool past its imports) is a null descriptor, and its range read 0 instead of the page table)
+                    const Id capped{OpSelect(U64, OpULessThan(U1, bound_end, ssbo_end), bound_end, ssbo_end)};
+                    ssbo_end = OpSelect(U64, OpIEqual(U1, size_word, zero), bound_end, capped);
+                }
+                const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr), OpULessThan(U1, addr, ssbo_end))};
+                const Id then_label{OpLabel()};
+                const Id else_label{OpLabel()};
+                OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
+                OpBranchConditional(cond, then_label, else_label);
+                AddLabel(then_label);
+                const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
+                const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+                callback(OpAccessChain(element_pointer, table_id, Const(k), zero, ssbo_index));
+                AddLabel(else_label);
+            }
+        }
+        if (!table_check) record_miss(addr);   // (EvilOOT, RX_VK_MISS_LOG: here no buffer held the address. Checking, the buffer
+                                                // records the loads the table answers otherwise instead)
+    }};
+    // (longshot, mma_layout.h mesh_fallback_pages) the mesh fallback's task and mesh stages: a load is the guest page table's word,
+    // 0 where it maps nothing, as the console's GPU reads memory. No branch and no search: a storage buffer bound below 1 TB is in a
+    // pool the table maps (vk_memory.cpp guest_pages_set), so the search found the same words (739acd67's 243 million loads,
+    // compared), and where it found none it answered 0 though the console reads the memory. A virtual pool's (from 1 TB,
+    // nvn_native.c VBASE) is not in the table: a load from one reads 0 here (none at Hyrule Castle). The stage is held to 32 lanes and at the register
+    // file's limit: what a load keeps alive is spilled, and a branch around it cost as much again (Iris Xe, Mesa 26.2). No test
+    // that the access stays in its page: the guest's loads are aligned to their size (16 bytes at most), so none crosses one.
+    // Stores and atomics keep the search
+    const bool fallback_pages{mesh_fallback_pages && mesh_fallback && (stage == Stage::Task || stage == Stage::Mesh) &&
+                              wants_guest_pages && rescaling_push_constants.value != 0 &&
+                              profile.supported_spirv >= 0x00010400};   // (a vector's OpSelect on one condition: SPIR-V 1.4)
+    const auto page_load = [&](Id type, Id addr) {
+        const Id table{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
+                                                 Const(guest_pages_member_index)))};
+        const Id u64_zero{Constant(U64, u64{0})};
+        const auto [in_window, page_index] = table_window(addr);
+        const Id inside{OpLogicalAnd(U1, in_window, OpINotEqual(U1, table, u64_zero))};
+        // (outside the table's windows the table's own first word is read, and the answer is 0 all the same)
+        const Id slot{OpSelect(U64, inside, OpIAdd(U64, table, OpShiftLeftLogical(U64, page_index, Const(3U))), table)};
+        const Id page{psb_load(U64, slot, 8U)};
+        const Id mapped{OpLogicalAnd(U1, inside, OpINotEqual(U1, page, u64_zero))};
+        const Id target{OpSelect(U64, mapped, OpIAdd(U64, page, OpBitwiseAnd(U64, addr, Constant(U64, u64{0xfff}))), table)};
+        return OpSelect(type, mapped, psb_load(type, target, 4U), ConstantNull(type));
+    };
+    // (longshot) the helpers below are DontInline: inlined at each of a culling program's hundreds of global accesses, with EvilOOT's
+    // fuller buffer search, NVIDIA's compiler took 41 s on 53caac5f and the driver reset. Lichii PR 408 found the same (161 s for 68 programs)
+    const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(type, U64)};
+        // (#994, the floating trees) the task and mesh stages' load helpers are inlined (EDEN_NX2_GM_INLINE=0: not; an EDEN_
+        // switch, so in the program cache's stamp). Not inlined, NVIDIA's compiler (RTX 3070, Windows) gave OoT's tree task
+        // 3cb76827 a wrong address for its third load: n = load(file + 4), code = load(cells[e]), then
+        // load(file + (n + 9 + e) * 4) went to file + (code + 9 + e) * 4, the second call's result in place of the first's,
+        // though the SPIR-V names the first. That load, the cell's end in the placement file's prefix sums, read 0 outside
+        // every buffer, and min(end - start, 256) made every visible cell 256 trees, the next cells' trees drawn in its place:
+        // the wall of trees in the sky. The culling's compute programs, with hundreds of global loads, keep the helper
+        // (NVIDIA took 41 s on one inlined, above)
         static const bool gm_inline{!getenv("EDEN_NX2_GM_INLINE") || getenv("EDEN_NX2_GM_INLINE")[0] != '0'};
         const bool inline_here{gm_inline && (stage == Stage::Task || stage == Stage::Mesh ||
                                             (shift == 4 && runtime_info.inline_global_128_loads))};
         const Id func_id{OpFunction(type, inline_here ? spv::FunctionControlMask::Inline : spv::FunctionControlMask::DontInline,
                                     function_type)};
         const Id addr{OpFunctionParameter(U64)};
-        AddLabel();
-        if (follow_pointers && gp_level >= 2 && wants_guest_pages && rescaling_push_constants.value != 0 &&
-            !need_read_range && miss_index == SIZE_MAX) {
-            const u32 size{1U << shift};
-            const Id table{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64),
-                                                     rescaling_push_constants, Const(guest_pages_member_index)))};
-            const Id addr_lo{OpUConvert(U32[1], addr)};
-            const Id addr_hi{OpUConvert(U32[1], OpShiftRightLogical(U64, addr, Const(32U)))};
-            const Id in_a{OpIEqual(U1, OpBitwiseAnd(U32[1], addr_hi, Const(0xfffffffeU)), Const(0x10U))};
-            const Id in_b{OpIEqual(U1, addr_hi, Const(0x7fU))};
-            const Id pgoff_raw{OpBitwiseAnd(U32[1], addr_lo, Const(0xfffU))};
-            const Id fits{OpULessThanEqual(U1, pgoff_raw, Const(0x1000U - size))};
-            const Id valid{OpLogicalAnd(U1, OpLogicalOr(U1, in_a, in_b), fits)};
-            const Id pgoff_pg{OpShiftRightLogical(U32[1], addr_lo, Const(12U))};
-            const Id idx_a{OpBitwiseOr(U32[1], OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], addr_hi, Const(1U)), Const(20U)), pgoff_pg)};
-            const Id idx_b{OpBitwiseOr(U32[1], Const(0x200000U), pgoff_pg)};
-            const Id raw_idx32{OpSelect(U32[1], in_a, idx_a, idx_b)};
-            const Id idx32{OpSelect(U32[1], valid, raw_idx32, Const(kGuestZeroSlotIndex))};
-            const Id pgoff32{OpSelect(U32[1], valid, pgoff_raw, Const(0U))};
-            const Id slot{OpIAdd(U64, table, OpUConvert(U64, OpShiftLeftLogical(U32[1], idx32, Const(3U))))};
-            const Id page{psb_load(U64, slot, 8U)};
-            const Id target{OpIAdd(U64, page, OpUConvert(U64, pgoff32))};
-            if (gp_level >= 3) {
-                OpReturnValue(psb_load(type, target, 4U));
-            } else {
-                OpReturnValue(ConstantNull(type));
-            }
-        } else {
-            guest_lookup(addr, 1U << shift, [&](Id target) {
-                if (gp_level >= 3) OpReturnValue(psb_load(type, target, 4U));
-                else OpReturnValue(ConstantNull(type));
-            });
-            range_lookup(resolve_gm_range_func, addr, 1U << shift, [&](Id target) {
-                OpReturnValue(psb_load(type, target, 4U));
-            });
-            record_miss(addr);
-            OpReturnValue(ConstantNull(type));
+        if (fallback_pages || table_alone) {
+            AddLabel();
+            OpReturnValue(page_load(type, addr));
+            OpFunctionEnd();
+            return func_id;
         }
+        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
+            const Id value{OpLoad(type, ssbo_pointer)};
+            if (table_check) {   // (the bound buffer's words against the table's, every component)
+                const Id from_table{page_load(type, addr)};
+                Id differ{};
+                const u32 components{shift == 2 ? 1U : shift == 3 ? 2U : 4U};
+                for (u32 i = 0; i < components; ++i) {
+                    const Id a{components == 1 ? value : OpCompositeExtract(U32[1], value, i)};
+                    const Id b{components == 1 ? from_table : OpCompositeExtract(U32[1], from_table, i)};
+                    const Id x{OpBitwiseXor(U32[1], a, b)};
+                    differ = i == 0 ? x : OpBitwiseOr(U32[1], differ, x);
+                }
+                // (the condition before the merge: OpSelectionMerge must come right before its branch, or RADV crashes)
+                const Id differs{OpINotEqual(U1, differ, zero)};
+                const Id then_label{OpLabel()};
+                const Id end_label{OpLabel()};
+                OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
+                OpBranchConditional(differs, then_label, end_label);
+                AddLabel(then_label);
+                record_miss(addr);
+                OpBranch(end_label);
+                AddLabel(end_label);
+            }
+            OpReturnValue(value);
+        });
+        guest_lookup(addr, 1U << shift, [&](Id target) {
+            if (gp_level >= 3) OpReturnValue(psb_load(type, target, 4U));
+            else OpReturnValue(ConstantNull(type));
+        });
+        OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
         return func_id;
     }};
-    const auto define_write{[&](Id type, u32 shift) {
+    const auto define_write{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(void_id, U64, type)};
         const Id func_id{OpFunction(void_id, spv::FunctionControlMask::DontInline, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id data{OpFunctionParameter(type)};
-        AddLabel();
-        if (!direct_stores) {
-            range_lookup(resolve_gm_range_func, addr, 1U << shift, [&](Id target) {
-                OpStore(psb_member(type, target), data, spv::MemoryAccessMask::Aligned, 4U);
-                OpReturn();
-            });
-        }
-        guest_lookup(addr, 1U << shift, [&](Id target) {
+        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
+            OpStore(ssbo_pointer, data);
+            OpReturn();
+        });
+        if (follow_stores) guest_lookup(addr, 1U << shift, [&](Id target) {   // (longshot: through the page table, as the loads: the culling's outputs)
             if (gp_level >= 3) OpStore(psb_member(type, target), data, spv::MemoryAccessMask::Aligned, 4U);
             OpReturn();
         });
-        record_miss(addr);
         OpReturn();
         OpFunctionEnd();
         return func_id;
     }};
-    if (need_load_u32)  load_global_func_u32    = define_load(U32[1], 2U);
-    if (need_write_u32) write_global_func_u32   = define_write(U32[1], 2U);
-    if (need_load_u64)  load_global_func_u32x2  = define_load(U32[2], 3U);
-    if (need_write_u64) write_global_func_u32x2 = define_write(U32[2], 3U);
-    if (need_load_u128) load_global_func_u32x4  = define_load(U32[4], 4U);
-    if (need_write_u128) write_global_func_u32x4 = define_write(U32[4], 4U);
-
+    const auto define{
+        [&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id type, size_t size) {
+            const Id element_type{type_def.element};
+            const u32 shift{static_cast<u32>(std::countr_zero(size))};
+            const Id load_func{define_load(ssbo_member, element_type, type, shift)};
+            const Id write_func{define_write(ssbo_member, element_type, type, shift)};
+            return std::make_pair(load_func, write_func);
+        }};
+    std::tie(load_global_func_u32, write_global_func_u32) =
+        define(&StorageDefinitions::U32, storage_types.U32, U32[1], sizeof(u32));
+    std::tie(load_global_func_u32x2, write_global_func_u32x2) =
+        define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
+    std::tie(load_global_func_u32x4, write_global_func_u32x4) =
+        define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
+    // (longshot) the 32-bit atomics' fallbacks, as the loads': the old value, 0 where no buffer holds the address
     using Atomic = Id (Sirit::Module::*)(Id, Id, Id, Id, Id);
     static constexpr std::array<Atomic, 9> atomics{
         &Sirit::Module::OpAtomicIAdd, &Sirit::Module::OpAtomicSMin, &Sirit::Module::OpAtomicUMin,
         &Sirit::Module::OpAtomicSMax, &Sirit::Module::OpAtomicUMax, &Sirit::Module::OpAtomicAnd,
         &Sirit::Module::OpAtomicOr,   &Sirit::Module::OpAtomicXor,  &Sirit::Module::OpAtomicExchange};
-    for (size_t i = 0; i < atomics.size(); ++i) {
-        if (!need_atomic[i]) continue;
-        const Id function_type{TypeFunction(U32[1], U64, U32[1])};
-        const Id func_id{OpFunction(U32[1], spv::FunctionControlMask::DontInline, function_type)};
-        const Id addr{OpFunctionParameter(U64)};
-        const Id value{OpFunctionParameter(U32[1])};
-        AddLabel();
-        const auto emit_at{[&](Id target) {
-            const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-            OpReturnValue((this->*atomics[i])(U32[1], psb_member(U32[1], target), scope, u32_zero_value, value));
-        }};
-        if (!direct_stores) {
-            range_lookup(resolve_gm_range_func, addr, 4U, emit_at);
+    if (info.stores_global_memory) {
+        for (size_t i = 0; i < atomics.size(); ++i) {
+            const Id function_type{TypeFunction(U32[1], U64, U32[1])};
+            const Id func_id{OpFunction(U32[1], spv::FunctionControlMask::DontInline, function_type)};
+            const Id addr{OpFunctionParameter(U64)};
+            const Id value{OpFunctionParameter(U32[1])};
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, [&](Id ssbo_pointer) {
+                const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+                OpReturnValue((this->*atomics[i])(U32[1], ssbo_pointer, scope, u32_zero_value, value));
+            });
+            if (follow_stores) guest_lookup(addr, 4U, [&](Id target) {   // (longshot: the culling's counters, through the page table)
+                const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+                if (gp_level >= 3) OpReturnValue((this->*atomics[i])(U32[1], psb_member(U32[1], target), scope, u32_zero_value, value));
+                else OpReturnValue(u32_zero_value);
+            });
+            OpReturnValue(u32_zero_value);
+            OpFunctionEnd();
+            atomic_global_func_u32[i] = func_id;
         }
-        guest_lookup(addr, 4U, [&](Id target) {
-            if (gp_level >= 3) emit_at(target);
-            else OpReturnValue(u32_zero_value);
-        });
-        record_miss(addr);
-        OpReturnValue(u32_zero_value);
-        OpFunctionEnd();
-        atomic_global_func_u32[i] = func_id;
-    }
-    if (need_atomic_cas) {
+        // (longshot) ATOMG.CAS's: the comparator, then the value stored where the word equals it
         const Id function_type{TypeFunction(U32[1], U64, U32[1], U32[1])};
         const Id func_id{OpFunction(U32[1], spv::FunctionControlMask::DontInline, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id comparator{OpFunctionParameter(U32[1])};
         const Id value{OpFunctionParameter(U32[1])};
-        AddLabel();
         const auto cas{[&](Id pointer) {
             const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
             return OpAtomicCompareExchange(U32[1], pointer, scope, u32_zero_value, u32_zero_value, value, comparator);
         }};
-        if (!direct_stores) {
-            range_lookup(resolve_gm_range_func, addr, 4U, [&](Id target) {
-                OpReturnValue(cas(psb_member(U32[1], target)));
-            });
-        }
-        guest_lookup(addr, 4U, [&](Id target) {
+        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                    [&](Id ssbo_pointer) { OpReturnValue(cas(ssbo_pointer)); });
+        if (follow_stores) guest_lookup(addr, 4U, [&](Id target) {
             if (gp_level >= 3) OpReturnValue(cas(psb_member(U32[1], target)));
             else OpReturnValue(u32_zero_value);
         });
-        record_miss(addr);
         OpReturnValue(u32_zero_value);
         OpFunctionEnd();
         atomic_global_cas_func_u32 = func_id;
     }
-    if (need_write_cas) {
+    // (longshot) 8- and 16-bit global stores: the aligned 32-bit word is changed in place with a compare-exchange loop, as
+    // the storage buffers' narrow stores are (emit_spirv_memory.cpp). A plain load/store pair loses the other invocations'
+    // halves of the word; the console's byte-enabled store does not.
+    if (info.stores_global_memory) {
         const Id func_type{TypeFunction(void_id, U64, U32[1], U32[1], U32[1])};
         const Id func{OpFunction(void_id, spv::FunctionControlMask::MaskNone, func_type)};
         const Id addr{OpFunctionParameter(U64)};
@@ -1515,6 +1652,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id bit_offset{OpFunctionParameter(U32[1])};
         const Id bit_count{OpFunctionParameter(U32[1])};
         AddLabel();
+        // (one variable in the entry block: OpVariable with Function storage must lead the function)
         const Id expected_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
                                                spv::StorageClass::Function)};
         const Id tries_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
@@ -1545,22 +1683,23 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             AddLabel(continue_label);
             OpBranch(begin_label);
         }};
-        const Id aligned{OpBitwiseAnd(U64, addr, Constant(U64, ~u64{3}))};
-        if (!direct_stores) {
-            range_lookup(resolve_gm_range_func, aligned, 4U, [&](Id target) {
+        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                    [&](Id ssbo_pointer) { cas_loop(ssbo_pointer); }, false);
+        guest_lookup(addr, 4U, [&](Id target) {
+            if (gp_level >= 3) {
                 cas_loop(psb_member(U32[1], target));
-            });
-        }
-        guest_lookup(aligned, 4U, [&](Id target) {
-            if (gp_level >= 3) cas_loop(psb_member(U32[1], target));
-            else OpReturn();
+            } else {
+                OpReturn();
+            }
         });
-        record_miss(addr);
         OpReturn();
         OpFunctionEnd();
         write_global_cas_loop_func = func;
     }
-    if (need_atomic_f32) {
+    // (longshot) RED/ATOM.E.ADD.F32 at an address no buffer was tracked to: the 32-bit atomics' fallback, with the float
+    // sum made in a compare-exchange loop as the storage buffers' f32_add_cas does, or the GPU's own float add where
+    // the storage buffers' adds are (native_f32_add: the f32 views, searched as the u32 ones)
+    if (info.stores_global_memory) {
         const Id func_type{TypeFunction(F32[1], U64, F32[1])};
         const Id func{OpFunction(F32[1], spv::FunctionControlMask::DontInline, func_type)};
         const Id addr{OpFunctionParameter(U64)};
@@ -1572,7 +1711,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                                                                     spv::StorageClass::Function)};
         const auto cas_loop{[&](Id pointer) {
             OpStore(expected_var, OpLoad(U32[1], pointer, spv::MemoryAccessMask::Aligned, 4U));
-            OpStore(tries_var, u32_zero_value);
+            OpStore(tries_var, u32_zero_value);   // (a ceiling of attempts, as every compare-exchange loop has: #548)
             const Id scope_device{Const(static_cast<u32>(spv::Scope::Device))};
             const Id ordering_relaxed{u32_zero_value};
             const Id begin_label{OpLabel()};
@@ -1599,18 +1738,17 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const auto native_add{[&](Id pointer) {
             OpReturnValue(OpAtomicFAddEXT(F32[1], pointer, Const(static_cast<u32>(spv::Scope::Device)), u32_zero_value, value));
         }};
-        const auto emit_fadd{[&](Id target) {
-            if (native_f32_add) native_add(psb_member(F32[1], target));
-            else cas_loop(psb_member(U32[1], target));
-        }};
-        if (!direct_stores) {
-            range_lookup(resolve_gm_range_func, addr, 4U, emit_fadd);
+        if (native_f32_add) {
+            define_body(&StorageDefinitions::F32, addr, storage_types.F32.element, 2, native_add, false);
+        } else {
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                        [&](Id ssbo_pointer) { cas_loop(ssbo_pointer); }, false);
         }
-        guest_lookup(addr, 4U, [&](Id target) {
+        if (follow_stores) guest_lookup(addr, 4U, [&](Id target) {
             if (gp_level < 3) OpReturnValue(ConstantNull(F32[1]));
-            else emit_fadd(target);
+            else if (native_f32_add) native_add(psb_member(F32[1], target));
+            else cas_loop(psb_member(U32[1], target));
         });
-        record_miss(addr);
         OpReturnValue(ConstantNull(F32[1]));
         OpFunctionEnd();
         atomic_global_add_f32_func = func;
@@ -1632,19 +1770,13 @@ void EmitContext::DefineRescalingInputPushConstant() {
     if (Sirit::ValidId(rescaling_push_constants)) {
         return;   // (the page table's call and the fallback's: one block)
     }
-    boost::container::static_vector<Id, 16> members{};
+    boost::container::static_vector<Id, 12> members{};
     u32 member_index{0};
-    const bool ra_member{wants_render_area && !uses_rescaling_uniform};
 
-    if (ra_member) {
-        members.push_back(F32[4]);
-        render_are_member_index = member_index++;
-    } else {
-        rescaling_textures_type = TypeArray(U32[1], Const(4u));
-        Decorate(rescaling_textures_type, spv::Decoration::ArrayStride, 4u);
-        members.push_back(rescaling_textures_type);
-        rescaling_textures_member_index = member_index++;
-    }
+    rescaling_textures_type = TypeArray(U32[1], Const(4u));
+    Decorate(rescaling_textures_type, spv::Decoration::ArrayStride, 4u);
+    members.push_back(rescaling_textures_type);
+    rescaling_textures_member_index = member_index++;
 
     rescaling_images_type = TypeArray(U32[1], Const(NUM_IMAGE_SCALING_WORDS));
     Decorate(rescaling_images_type, spv::Decoration::ArrayStride, 4u);
@@ -1654,12 +1786,6 @@ void EmitContext::DefineRescalingInputPushConstant() {
     if (stage != Stage::Compute) {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
-    }
-    if (wants_mesh_fallback && stage == Stage::Mesh) {
-        mesh_fallback_cull_words_type = TypeArray(U32[1], Const(MESH_FALLBACK_CULL_PUSH_WORDS));
-        Decorate(mesh_fallback_cull_words_type, spv::Decoration::ArrayStride, 4u);
-        members.push_back(mesh_fallback_cull_words_type);
-        mesh_fallback_cull_member_index = member_index++;
     }
     if (wants_guest_pages) {
         members.push_back(U64);
@@ -1679,22 +1805,13 @@ void EmitContext::DefineRescalingInputPushConstant() {
             mesh_fallback_indirect_input_member_index = member_index++;
         }
     }
-    if (wants_gm_ranges) {
-        members.push_back(U64);
-        gm_ranges_member_index = member_index++;
-    }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "ResolutionInfo");
 
-    if (ra_member) {
-        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset, 0);
-        MemberName(push_constant_struct, render_are_member_index, "render_area");
-    } else {
-        MemberDecorate(push_constant_struct, rescaling_textures_member_index, spv::Decoration::Offset,
-                       static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
-        MemberName(push_constant_struct, rescaling_textures_member_index, "rescaling_textures");
-    }
+    MemberDecorate(push_constant_struct, rescaling_textures_member_index, spv::Decoration::Offset,
+                   static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
+    MemberName(push_constant_struct, rescaling_textures_member_index, "rescaling_textures");
 
     MemberDecorate(push_constant_struct, rescaling_images_member_index, spv::Decoration::Offset,
                    static_cast<u32>(offsetof(RescalingLayout, rescaling_images)));
@@ -1705,11 +1822,6 @@ void EmitContext::DefineRescalingInputPushConstant() {
                        spv::Decoration::Offset,
                        static_cast<u32>(offsetof(RescalingLayout, down_factor)));
         MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
-    }
-    if (wants_mesh_fallback && stage == Stage::Mesh) {
-        MemberDecorate(push_constant_struct, mesh_fallback_cull_member_index,
-                       spv::Decoration::Offset, MESH_FALLBACK_CULL_PUSH_OFFSET);
-        MemberName(push_constant_struct, mesh_fallback_cull_member_index, "mfb_cull_info");
     }
     if (wants_guest_pages) {
         MemberDecorate(push_constant_struct, guest_pages_member_index, spv::Decoration::Offset, GUEST_PAGES_PUSH_OFFSET);
@@ -1731,16 +1843,9 @@ void EmitContext::DefineRescalingInputPushConstant() {
                            MESH_FALLBACK_INDIRECT_INPUT_PUSH_OFFSET);
         }
     }
-    if (wants_gm_ranges) {
-        MemberDecorate(push_constant_struct, gm_ranges_member_index, spv::Decoration::Offset, GM_RANGES_PUSH_OFFSET);
-        MemberName(push_constant_struct, gm_ranges_member_index, "gm_ranges");
-    }
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(rescaling_push_constants, "rescaling_push_constants");
-    if (ra_member) {
-        render_area_push_constant = rescaling_push_constants;
-    }
 
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_push_constants);
@@ -1770,7 +1875,7 @@ void EmitContext::DefineRescalingInputUniformConstant() {
 }
 
 void EmitContext::DefineRenderArea(const Info& info) {
-    if (!info.uses_render_area || Sirit::ValidId(render_area_push_constant)) {
+    if (!info.uses_render_area) {
         return;
     }
 
@@ -1985,6 +2090,11 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
     if (info.uses_atomic_f32_add && !native_f32_add) {
         f32_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
                               storage_types.U32.element, F32[1], spv::Scope::Device);
+        if (stage == Stage::Compute && !mesh_fallback && profile.supported_spirv >= 0x00010300 &&
+            profile.SupportsSubgroupStage(stage)) {
+            AddCapability(spv::Capability::GroupNonUniform);
+            f32_add_cas = SubgroupCasLoop(*this, f32_add_cas, storage_types.U32.array);
+        }
     }
     if (info.uses_atomic_f16x2_add) {
         f16x2_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
@@ -2136,7 +2246,13 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if (info.uses_workgroup_id) {
         workgroup_id = DefineInput(*this, U32[3], false, spv::BuiltIn::WorkgroupId);
     }
-    if (info.uses_local_invocation_id || runtime_info.mesh_wg_warp32) {
+    if (stage == Stage::Mesh && !runtime_info.mesh_fallback && profile.need_mesh_num_workgroups) {
+        // (longshot, #1285, as Lichii #1203) RADV before Mesa 26.2.5 (!45092) miscounted the mesh grid-size registers and
+        // emitted an invalid SET_SH_REG packet (reg_count == 0, RING_GFP_TIMEOUT on RDNA 3/4) when a native mesh shader
+        // did not read gl_NumWorkGroups
+        num_workgroups = DefineInput(*this, U32[3], false, spv::BuiltIn::NumWorkgroups);
+    }
+    if (info.uses_local_invocation_id) {
         local_invocation_id = DefineInput(*this, U32[3], false, spv::BuiltIn::LocalInvocationId);
     }
     if (info.uses_invocation_id) {
@@ -2155,7 +2271,9 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if (info.uses_is_helper_invocation) {
         is_helper_invocation = DefineInput(*this, U1, false, spv::BuiltIn::HelperInvocation);
     }
-    if (!runtime_info.mesh_wg_warp32 && info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage)) {
+    // (longshot: a stage on the shared warp reads none of the subgroup's inputs, and declares none; its check keeps them)
+    const bool subgroup_free{warp_shared && !warp_shared_check};
+    if (info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage) && !subgroup_free) {
         subgroup_mask_eq = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupEqMaskKHR);
         subgroup_mask_lt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLtMaskKHR);
         subgroup_mask_le = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLeMaskKHR);
@@ -2169,11 +2287,10 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             Decorate(subgroup_mask_ge, spv::Decoration::Flat);
         }
     }
-    if (!runtime_info.mesh_wg_warp32 &&
-        (info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
+    if ((info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
          (profile.warp_size_potentially_larger_than_guest &&
           (info.uses_subgroup_vote || info.uses_subgroup_mask))) &&
-        profile.SupportsSubgroupStage(stage)) {
+        profile.SupportsSubgroupStage(stage) && !subgroup_free) {
         AddCapability(spv::Capability::GroupNonUniform);
         subgroup_local_invocation_id =
             DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupLocalInvocationId);
@@ -2335,6 +2452,166 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     }
 }
 
+/// (longshot, mma_layout.h mesh_fallback_shared_warp) Whether this fallback stage's warp can live in workgroup memory, and if so
+/// how many words it takes. It can when the workgroup is one warp (32 threads), no ballot, vote or shuffle is in a loop (a
+/// site's words serve one pass), nothing leaves the program inside an if (a lane that entered a region reaches its sites), and
+/// nothing depends on the lanes running in one thread in program order: no quad or matrix operation, no subgroup barrier, no
+/// read of the stage buffer's outputs. The ifs with a site inside become regions (emit_spirv_warp.cpp). Nothing is emitted
+/// here: it runs before the stage's inputs are declared (DefineInputs), which depend on the answer.
+void EmitContext::PlanSharedWarp(const IR::Program& program) {
+    // (one warp a workgroup: the lane is the invocation's x, so a workgroup of more than one row would be two warps on one set of words)
+    if (!runtime_info.mesh_fallback || (stage != Stage::Task && stage != Stage::Mesh) || !mesh_fallback_shared_warp ||
+        program.workgroup_size[0] != 32 || program.workgroup_size[1] != 1 || program.workgroup_size[2] != 1) {
+        return;
+    }
+    std::vector<const IR::Block*> open;
+    std::unordered_set<const IR::Block*> regions;
+    u32 loops{};
+    u32 words{};
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        switch (node.type) {
+        case IR::AbstractSyntaxNode::Type::Block:
+            for (const IR::Inst& inst : std::as_const(*node.data.block).Instructions()) {
+                u32 site{};
+                switch (inst.GetOpcode()) {
+                case IR::Opcode::SubgroupBallot:
+                case IR::Opcode::VoteAll:
+                case IR::Opcode::VoteAny:
+                case IR::Opcode::VoteEqual:
+                    site = WARP_BALLOT_WORDS;
+                    break;
+                case IR::Opcode::ShuffleIndex: {
+                    const IR::Value lane{inst.Arg(1).Resolve()};
+                    const IR::Value segment{inst.Arg(3).Resolve()};
+                    site = lane.IsImmediate() && segment.IsImmediate() && segment.U32() == 0 ? WARP_BROADCAST_WORDS
+                                                                                             : WARP_SHUFFLE_WORDS;
+                    break;
+                }
+                case IR::Opcode::ShuffleUp:
+                case IR::Opcode::ShuffleDown:
+                case IR::Opcode::ShuffleButterfly:
+                    site = WARP_SHUFFLE_WORDS;
+                    break;
+                case IR::Opcode::QuadBroadcast:
+                case IR::Opcode::QuadSwap:
+                case IR::Opcode::FSwizzleAdd:
+                case IR::Opcode::MatrixMulAddF16:
+                case IR::Opcode::SubgroupBarrier:
+                case IR::Opcode::IsbeReadOutput:
+                    return;
+                default:
+                    break;
+                }
+                if (!site) {
+                    continue;
+                }
+                if (loops) {
+                    return;
+                }
+                words += site;
+                regions.insert(open.begin(), open.end());
+            }
+            break;
+        case IR::AbstractSyntaxNode::Type::If:
+            open.push_back(node.data.if_node.body);
+            break;
+        case IR::AbstractSyntaxNode::Type::EndIf:
+            if (open.empty()) {
+                return;
+            }
+            open.pop_back();
+            break;
+        case IR::AbstractSyntaxNode::Type::Loop:
+            ++loops;
+            break;
+        case IR::AbstractSyntaxNode::Type::Repeat:
+            if (!loops) {
+                return;
+            }
+            --loops;
+            break;
+        case IR::AbstractSyntaxNode::Type::Break:
+            break;
+        case IR::AbstractSyntaxNode::Type::Return:
+        case IR::AbstractSyntaxNode::Type::Unreachable:
+            if (!open.empty() || loops) {
+                return;
+            }
+            break;
+        }
+    }
+    if (!open.empty() || loops) {
+        return;
+    }
+    warp_shared = true;
+    warp_shared_check = mesh_fallback_shared_warp_check;
+    warp_region_ifs = std::move(regions);
+    warp_word_count = (std::max)(words + WARP_REGION_WORDS * static_cast<u32>(warp_region_ifs.size()), 1U);
+}
+
+/// (longshot, mma_layout.h mesh_fallback_shared_warp) The shared warp's words and the function that waits on them, for a stage
+/// PlanSharedWarp took
+void EmitContext::DefineSharedWarp() {
+    if (!warp_shared) {
+        return;
+    }
+    warp_word_pointer = TypePointer(spv::StorageClass::Workgroup, U32[1]);
+    // (its length a signed constant: Sirit gives back the type already made for the same words, and u32 arrays of that
+    // length made for a block (ResolutionInfo's u32[4]) carry an ArrayStride, which a Workgroup variable must not have)
+    warp_words = DefineVariable(*this, TypeArray(U32[1], SConst(static_cast<s32>(warp_word_count))), std::nullopt,
+                                spv::StorageClass::Workgroup);
+    Name(warp_words, "warp_words");
+    // (the wait: until every one of `lanes` has its bit in the word. The lanes waited for are the region's, which reach the
+    // site as this one did; bounded all the same, as the pool's wait is, and a wait that gives up is counted past the records
+    // (emit_spirv.h WARP_COUNTER_WAITS: the host logs it, vk_draw.cpp fallback_warp_counters), since the ballot or shuffle
+    // after it may be wrong. A function: a block that calls it keeps its label, which later blocks' phis name)
+    const Id function_type{TypeFunction(void_id, U32[1], U32[1])};
+    warp_wait = OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type);
+    Name(warp_wait, "warp_wait");
+    const Id word{OpFunctionParameter(U32[1])};
+    const Id lanes{OpFunctionParameter(U32[1])};
+    AddLabel();
+    const Id waited{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]), spv::StorageClass::Function)};
+    const Id pointer{OpAccessChain(warp_word_pointer, warp_words, word)};
+    OpStore(waited, u32_zero_value);
+    const Id header{OpLabel()};
+    const Id body{OpLabel()};
+    const Id next{OpLabel()};
+    const Id done{OpLabel()};
+    OpBranch(header);
+    AddLabel(header);
+    OpLoopMerge(done, next, spv::LoopControlMask::DontUnroll);
+    OpBranch(body);
+    AddLabel(body);
+    const Id seen{OpAtomicLoad(U32[1], pointer, Const(static_cast<u32>(spv::Scope::Workgroup)), u32_zero_value)};
+    const Id count{OpLoad(U32[1], waited)};
+    const Id go{OpLogicalOr(U1, OpIEqual(U1, OpBitwiseAnd(U32[1], seen, lanes), lanes),
+                            OpUGreaterThanEqual(U1, count, Const(WARP_WAIT)))};
+    OpBranchConditional(go, done, next);
+    AddLabel(next);
+    OpStore(waited, OpIAdd(U32[1], count, Const(1U)));
+    OpBranch(header);
+    AddLabel(done);
+    const Id gave_up{OpUGreaterThanEqual(U1, OpLoad(U32[1], waited), Const(WARP_WAIT))};
+    const Id counted{OpLabel()};
+    const Id end{OpLabel()};
+    OpSelectionMerge(end, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(gave_up, counted, end);
+    AddLabel(counted);
+    OpAtomicIAdd(U32[1], MeshFallbackWarpCounter(WARP_COUNTER_WAITS), Const(static_cast<u32>(spv::Scope::Device)), u32_zero_value,
+                 Const(1U));
+    OpBranch(end);
+    AddLabel(end);
+    OpReturn();
+    OpFunctionEnd();
+}
+
+Id EmitContext::MeshFallbackWarpCounter(u32 counter) {
+    const Id records{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
+                                               Const(mesh_fallback_records_member_index)))};
+    return MeshFallbackWord(OpIAdd(U64, records, Constant(U64, MeshFallbackRecordsBytes() + counter)));
+}
+
 void EmitContext::DefineMesh(const IR::Program& program) {
     if (stage != Stage::Task && stage != Stage::Mesh) {
         return;
@@ -2346,6 +2623,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     }
     mesh_info = program.mesh;
     mesh_threads = program.workgroup_size[0];
+    DefineSharedWarp();
     // The task's output region, which its mesh workgroups read as their input region.
     const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
     if (mesh_fallback) {
@@ -2353,8 +2631,6 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         // and record buffers live in the pushed fallback buffers, one slot a workgroup. A mesh program with no task
         // reads the workgroup index from its own payload, as NVN's hardware provides it.
         const Id wg_pointer{TypePointer(spv::StorageClass::Workgroup, U32[1])};
-        mesh_fallback_scratch = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
-        Name(mesh_fallback_scratch, "mfb_scratch");
         if (stage == Stage::Task || !runtime_info.mesh_fallback_task) {
             mesh_payload = DefineVariable(*this, payload_type, std::nullopt, spv::StorageClass::Workgroup);
             Name(mesh_payload, "isbe_payload");
@@ -2386,9 +2662,15 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     // triangles over Kokiri's foliage and ground (as nxnative found: "primitive index bytes for every primitive block")
     mesh_map_bytes = 4 + mesh_info.Corners() * Common::DivCeil(mesh_info.max_primitives, 32U) * 32;
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
-    mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
-                                     std::nullopt, spv::StorageClass::Workgroup);
-    Name(mesh_attributes, "isbe_attributes");
+    // (longshot, mma_layout.h mesh_fallback_global_attributes) the region in a slot of the records buffer's pool, where it fits one
+    const u32 slot_bytes{(mesh_attribute_words * 4 + 255) & ~255U};
+    mesh_attributes_global = mesh_fallback && stage == Stage::Mesh && mesh_fallback_global_attributes &&
+                             slot_bytes <= MESH_FALLBACK_POOL_SLOT_BYTES;
+    if (!mesh_attributes_global) {
+        mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
+                                         std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_attributes, "isbe_attributes");
+    }
     mesh_map = DefineVariable(*this, TypeArray(U32[1], Const(mesh_map_bytes)), std::nullopt,
                               spv::StorageClass::Workgroup);
     Name(mesh_map, "isbe_map");
@@ -2396,29 +2678,74 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_primitive_count, "isbe_primitive_count");
 
+    if (mesh_attributes_global) {
+        mesh_attribute_slot_bytes = slot_bytes;
+        mesh_attribute_ticket_shared = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_attribute_ticket_shared, "isbe_attribute_ticket");
+        // (thread 0 takes the next ticket, waits until the slot's holder a pool's length of tickets before has handed it on, and
+        // leaves the ticket in the workgroup word. In a function of its own: the prologue must not branch, its block is a phi
+        // predecessor of later ones. The holder started before, so it runs and hands the slot on; the wait is bounded all the
+        // same, as a hung GPU is worse than a wrong region: MESH_FALLBACK_POOL_WAIT reads. A wait that gives up shares the
+        // slot with its last holder, so it is counted past the records (emit_spirv.h WARP_COUNTER_POOL_WAITS: the host logs
+        // it, vk_draw.cpp fallback_warp_counters))
+        const Id function_type{TypeFunction(void_id, U32[1])};
+        mesh_attribute_claim = OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type);
+        Name(mesh_attribute_claim, "isbe_attribute_claim");
+        const Id local{OpFunctionParameter(U32[1])};
+        AddLabel();
+        const Id waited{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]), spv::StorageClass::Function)};
+        const Id records{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
+                                                   Const(mesh_fallback_records_member_index)))};
+        const Id pool{OpIAdd(U64, records, Constant(U64, u64{MESH_FALLBACK_POOL_OFFSET}))};
+        const auto pool_word = [&](Id word) {
+            return MeshFallbackWord(OpIAdd(U64, pool, OpUConvert(U64, OpShiftLeftLogical(U32[1], word, Const(2U)))));
+        };
+        const Id device{Const(static_cast<u32>(spv::Scope::Device))};
+        const Id first_label{OpLabel()};
+        const Id end_label{OpLabel()};
+        const Id is_first{OpIEqual(U1, local, u32_zero_value)};   // (before the merge: it must stand right before its branch)
+        OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(is_first, first_label, end_label);
+        AddLabel(first_label);
+        const Id ticket{OpAtomicIAdd(U32[1], pool_word(u32_zero_value), device, u32_zero_value, Const(1U))};
+        const Id slot{OpBitwiseAnd(U32[1], ticket, Const(MESH_FALLBACK_POOL_SLOTS - 1))};
+        const Id generation{OpShiftRightLogical(U32[1], ticket, Const(MESH_FALLBACK_POOL_SLOT_SHIFT))};
+        const Id slot_word{pool_word(OpIAdd(U32[1], slot, Const(1U)))};
+        OpStore(waited, u32_zero_value);
+        const Id header{OpLabel()};
+        const Id body{OpLabel()};
+        const Id next{OpLabel()};
+        const Id done{OpLabel()};
+        OpBranch(header);
+        AddLabel(header);
+        OpLoopMerge(done, next, spv::LoopControlMask::DontUnroll);
+        OpBranch(body);
+        AddLabel(body);
+        const Id seen{OpAtomicLoad(U32[1], slot_word, device, u32_zero_value)};
+        const Id count{OpLoad(U32[1], waited)};
+        const Id go{OpLogicalOr(U1, OpIEqual(U1, seen, generation), OpUGreaterThanEqual(U1, count, Const(MESH_FALLBACK_POOL_WAIT)))};
+        OpBranchConditional(go, done, next);
+        AddLabel(next);
+        OpStore(waited, OpIAdd(U32[1], count, Const(1U)));
+        OpBranch(header);
+        AddLabel(done);
+        const Id gave_up{OpUGreaterThanEqual(U1, OpLoad(U32[1], waited), Const(MESH_FALLBACK_POOL_WAIT))};
+        const Id counted{OpLabel()};
+        const Id told{OpLabel()};
+        OpSelectionMerge(told, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(gave_up, counted, told);
+        AddLabel(counted);
+        OpAtomicIAdd(U32[1], MeshFallbackWarpCounter(WARP_COUNTER_POOL_WAITS), device, u32_zero_value, Const(1U));
+        OpBranch(told);
+        AddLabel(told);
+        OpStore(mesh_attribute_ticket_shared, ticket);
+        OpBranch(end_label);
+        AddLabel(end_label);
+        OpReturn();
+        OpFunctionEnd();
+    }
+
     if (mesh_fallback) {
-        if (stage == Stage::Mesh && Shader::Backend::SPIRV::mesh_fallback_cull && mesh_info.Corners() == 3 &&
-            mesh_info.max_vertices <= 256U && mesh_info.max_primitives <= 256U) {
-            bool has_all_pos = true;
-            for (u32 c = 0; c < 4; ++c) {
-                const u32 want = static_cast<u32>(IR::Attribute::PositionX) + c;
-                const auto it = std::ranges::find(mesh_info.vertex_lines, want);
-                if (it == mesh_info.vertex_lines.end()) {
-                    has_all_pos = false;
-                    break;
-                }
-                mesh_fallback_pos_lines[c] = static_cast<u32>(it - mesh_info.vertex_lines.begin());
-            }
-            if (has_all_pos) {
-                mesh_fallback_cull = true;
-                mesh_fallback_live_count =
-                    DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
-                Name(mesh_fallback_live_count, "mfb_live_count");
-                mesh_fallback_tri_slots = DefineVariable(
-                    *this, TypeArray(U32[1], Const(256U)), std::nullopt, spv::StorageClass::Workgroup);
-                Name(mesh_fallback_tri_slots, "mfb_tri_slots");
-            }
-        }
         return;   // (no mesh outputs here: the epilogue writes records)
     }
 
@@ -2626,30 +2953,6 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     default:
         break;
     }
-}
-
-void EmitContext::DefineWorkgroupWarp(const IR::Program& program) {
-    if (!runtime_info.mesh_wg_warp32) {
-        return;
-    }
-    wg_size_x = program.workgroup_size[0];
-    wg_size_y = program.stage == Stage::Compute ? program.workgroup_size[1] : 1U;
-    wg_size_z = program.stage == Stage::Compute ? program.workgroup_size[2] : 1U;
-    const u32 total_threads{wg_size_x * wg_size_y * wg_size_z};
-    mesh_wg_warps = std::max(1U, (total_threads + 31U) / 32U);
-    if (!Sirit::ValidId(mesh_shared_u32)) {
-        mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
-    }
-    // Wrap Workgroup array elements in a fresh OpTypeStruct so Sirit never aliases them with
-    // ArrayStride-decorated push-constant/UBO/shared arrays of matching length.
-    // 2 ping-pong slots x mesh_wg_warps x 4 SIMD8 subgroups for ballot; 2 x mesh_wg_warps x 32 for shuffle.
-    const Id wg_word_t{TypeStruct(U32[1])};
-    mesh_wg_ballot = DefineVariable(*this, TypeArray(wg_word_t, Const(2U * mesh_wg_warps * 4U)),
-                                    std::nullopt, spv::StorageClass::Workgroup);
-    Name(mesh_wg_ballot, "wg_ballot");
-    mesh_wg_shfl = DefineVariable(*this, TypeArray(wg_word_t, Const(2U * mesh_wg_warps * 32U)),
-                                  std::nullopt, spv::StorageClass::Workgroup);
-    Name(mesh_wg_shfl, "wg_shfl");
 }
 
 } // namespace Shader::Backend::SPIRV

@@ -6,9 +6,9 @@
 
 #pragma once
 
-#include <array>
 #include <unordered_map>
-#include <vector>
+#include <unordered_set>
+#include <array>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
@@ -171,38 +171,6 @@ public:
 
     [[nodiscard]] Id Def(const IR::Value& value);
 
-    Id AddLabel(Id label) {
-        const Id res{Sirit::Module::AddLabel(label)};
-        current_block_label = res;
-        wg_shfl_cached_block = {};
-        wg_shfl_cached_value = {};
-        wg_shfl_cached_slot = {};
-        wg_ballot_cached_block = {};
-        wg_ballot_cached_pred = {};
-        wg_ballot_cached_result = {};
-        return res;
-    }
-
-    Id AddLabel() {
-        return AddLabel(OpLabel());
-    }
-
-    Id NullConstant(Id type_id) {
-        if (type_id.value == U1.value) return false_value;
-        if (type_id.value == U32[1].value) return u32_zero_value;
-        if (type_id.value == F32[1].value) return f32_zero_value;
-        const auto [it, inserted] = null_constants.try_emplace(type_id.value, Id{});
-        if (inserted) {
-            it->second = ConstantNull(type_id);
-        }
-        return it->second;
-    }
-
-    Id EndLabelOf(const IR::Block* block, Id fallback) const {
-        const auto it = block_end_labels.find(block);
-        return (it != block_end_labels.end() && Sirit::ValidId(it->second)) ? it->second : fallback;
-    }
-
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
 
@@ -296,6 +264,7 @@ public:
     std::vector<ImageDefinition> images;
 
     Id workgroup_id{};
+    Id num_workgroups{};
     Id local_invocation_id{};
     Id invocation_id{};
     Id patch_vertices_in{};
@@ -303,6 +272,7 @@ public:
     Id is_helper_invocation{};
     Id subgroup_local_invocation_id{};
     Id software_matrix_function{};   // (longshot: emit_spirv_warp.cpp)
+    Id wmma16_function{};   // (longshot: emit_spirv_warp.cpp DefineWmma16MatrixFunction)
     Id subgroup_mask_eq{};
     Id subgroup_mask_lt{};
     Id subgroup_mask_le{};
@@ -339,10 +309,6 @@ public:
     u32 rescaling_downfactor_member_index{};
     u32 guest_pages_member_index{};   // (longshot: GUEST_PAGES_PUSH_OFFSET's member, compute only)
     bool wants_guest_pages{};
-    u32 gm_ranges_member_index{};     // (longshot: GM_RANGES_PUSH_OFFSET's member)
-    bool wants_gm_ranges{};
-    bool wants_render_area{};
-    bool uses_rescaling_uniform{};
     Id probe_log{};   // (EvilOOT, RX_VK_BLOCK_PROBE: the miss log's U32 storage buffer, per-block entry counters at word 128+)
     u32 mesh_first_member_index{};    // (longshot: MESH_FIRST_PUSH_OFFSET's member, task programs)
     bool wants_mesh_first{};
@@ -442,31 +408,35 @@ public:
     /// (longshot) a fallback mesh workgroup's slot (task workgroup * threads + its index), read from the task's map in the
     /// entry block (EmitMeshPrologue); invalid without a task program, where the slot is the workgroup id
     Id mesh_fallback_slot{};
-    Id mesh_fallback_scratch{};       ///< (longshot) 4-byte workgroup u32 for task/mesh fallback epilogue broadcasts
-    Id mesh_fallback_within{};        ///< (longshot) precomputed FallbackSlot % task_threads (entry block)
-    Id mesh_fallback_payload_base{};  ///< (longshot) precomputed u64 base address of this mesh workgroup's task payload (entry block)
     Id mesh_fallback_epilogue_word{};   ///< (longshot) the fallback epilogue's loop index, a function variable of the entry block
     Id mesh_fallback_epilogue_line{};   ///< (longshot) the Soa records' line, WriteFallbackLines' inner loop index, as above
-    Id mesh_wg_ballot{};
-    Id mesh_wg_shfl{};
-    Id wg_ballot_slot{};
-    Id wg_shfl_slot{};
+    /// (longshot, mma_layout.h mesh_fallback_global_attributes) the attribute region in a pool slot, not in workgroup memory: the
+    /// slot's bytes, the function that takes a ticket for it (thread 0, into the workgroup word), and in the entry block the
+    /// ticket and the region's device address (EmitMeshPrologue)
+    bool mesh_attributes_global{};
+    u32 mesh_attribute_slot_bytes{};
+    Id mesh_attribute_ticket_shared{};
+    Id mesh_attribute_claim{};
+    Id mesh_attribute_ticket{};
+    Id mesh_attribute_base{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
-    u32 mesh_wg_warps{1};
-    u32 wg_size_x{1};
-    u32 wg_size_y{1};
-    u32 wg_size_z{1};
-    Id current_block_label{};
-    Id linear_exec_id{};
-    Id wg_shfl_cached_block{};
-    Id wg_shfl_cached_value{};
-    Id wg_shfl_cached_slot{};
-    Id wg_ballot_cached_block{};
-    Id wg_ballot_cached_pred{};
-    Id wg_ballot_cached_result{};
-    std::unordered_map<const IR::Block*, Id> block_end_labels;
-    std::unordered_map<u32, Id> null_constants;
-    std::vector<IR::Inst*> deferred_ir_phis;
+    /// (longshot, mma_layout.h mesh_fallback_shared_warp) the warp in workgroup memory: the words (a region's entered and
+    /// reached lanes, a ballot's lanes and arrivals, a shuffle's values and arrivals), the function that waits for lanes'
+    /// bits in a word, this invocation's lane and bit (entry block), the lanes that run the block being emitted and those of
+    /// the ifs around it, and the ifs (by their body) with a ballot, vote or shuffle inside (PlanSharedWarp)
+    bool warp_shared{};
+    bool warp_shared_check{};
+    Id warp_words{};
+    Id warp_word_pointer{};
+    Id warp_wait{};
+    Id warp_lane{};
+    Id warp_bit{};
+    Id warp_region{};
+    std::vector<Id> warp_regions;
+    std::vector<bool> warp_region_opened;   ///< each open if: whether it opened a region
+    u32 warp_word_count{};
+    u32 warp_word_next{};
+    std::unordered_set<const IR::Block*> warp_region_ifs;
     Id mesh_primitive_indices{};
     MeshInfo mesh_info{};
     u32 mesh_threads{};
@@ -488,12 +458,6 @@ public:
     // (longshot) a GPU without VK_EXT_mesh_shader: Task and Mesh are compute shaders. Their stage buffer outputs go to
     // the payload, map and record buffers, pushed as device addresses; a generated vertex stage reads the records.
     bool mesh_fallback{};
-    bool mesh_fallback_cull{};
-    std::array<u32, 4> mesh_fallback_pos_lines{~0U, ~0U, ~0U, ~0U};
-    Id mesh_fallback_live_count{};
-    Id mesh_fallback_tri_slots{};
-    u32 mesh_fallback_cull_member_index{};
-    Id mesh_fallback_cull_words_type{};
     bool wants_mesh_fallback{};
     Id mesh_fallback_word_ptr{};   ///< PhysicalStorageBuffer pointer to a block of one u32
     u32 mesh_fallback_payload_member_index{};
@@ -501,6 +465,8 @@ public:
     u32 mesh_fallback_indirect_input_member_index{};
     /// A pointer to the u32 at a PhysicalStorageBuffer device address
     Id MeshFallbackWord(Id address);
+    /// (longshot, mma_layout.h mesh_fallback_shared_warp) a pointer to one of the shared warp's counters past the records
+    Id MeshFallbackWarpCounter(u32 counter);
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};
@@ -516,6 +482,28 @@ public:
     bool uses_nonuniform_storage_image{};
     bool uses_nonuniform_uniform_texel_buffer{};
     bool uses_nonuniform_storage_texel_buffer{};
+
+    // (longshot, AMD RDNA 3/3.5/4) Fused WMMA 16x16x16 N-pair, zero-C, quad-A, and K-chain state.
+    struct Wmma16Step {
+        enum class Kind : u8 { Skip, Single, Pair, PairZeroC, QuadZeroC, PairK2ZeroC };
+        Kind kind{Kind::Single};
+        IR::Inst* m0{};
+        IR::Inst* m1{};
+        IR::Inst* m2{};
+        IR::Inst* m3{};
+        std::vector<IR::Inst*> deferred_extracts;
+    };
+    struct Wmma16FusedState {
+        bool active{};
+        Id pair_fn{};
+        Id pair_zero_c_fn{};
+        Id quad_zero_c_fn{};
+        Id quad_ret_type{};
+        Id pair_k2_zero_c_fn{};
+        std::unordered_map<const IR::Inst*, Wmma16Step> steps;
+        std::unordered_set<const IR::Inst*> skip_insts;
+    };
+    Wmma16FusedState wmma16_fused{};
 
 private:
     void DefineCommonTypes(const Info& info);
@@ -533,7 +521,7 @@ private:
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
-    void DefineGlobalMemoryFunctions(const IR::Program& program);
+    void DefineGlobalMemoryFunctions(const Info& info);
     void DefineRescalingInput(const Info& info);
     void DefineRescalingInputPushConstant();
     void DefineRescalingInputUniformConstant();
@@ -542,7 +530,8 @@ private:
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
-    void DefineWorkgroupWarp(const IR::Program& program);
+    void PlanSharedWarp(const IR::Program& program);
+    void DefineSharedWarp();
 };
 
 } // namespace Shader::Backend::SPIRV

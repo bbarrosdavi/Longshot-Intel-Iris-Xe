@@ -1,12 +1,11 @@
 // (longshot) How many of the GPU driver's compute compiles run at once (vk_draw.cpp cached_compute and prepare_run's
 // warm_compute: the shader preparation, the precompile, the mesh fallback's compute pipelines and play's own builds).
 //
-// The preparation ran one on every worker: half the CPUs in its first part, every CPU in the precompile. That is right
-// where a compile holds a few hundred MB (prepare_workers.h: 400-520 MB a worker on AMD's Windows driver). Mesa's Intel
-// driver held gigabytes for each of the game's large compute programs while every one was held to 32 lanes, and an
-// integrated GPU has no memory of its own to hold anything else in: on an i9-13900H with Iris Xe and 32 GB (20 threads,
-// Mesa 26.2.4) the process passed 24 GB of private memory and 7 GB of swap and Linux killed it, in the build's last step
-// and then at every start of the game (issue 496 is the same compiler in play: four at once froze an A750's PC).
+// One on every worker (half the CPUs in the preparation's first part, every CPU in the precompile) is right where a
+// compile holds a few hundred MB (prepare_workers.h: 400-520 MB a worker on AMD's Windows driver). Mesa's Intel driver
+// holds gigabytes for each of the game's large compute programs held to 32 lanes, and an integrated GPU has no memory of
+// its own to hold anything else in: on an Iris Xe PC with 32 GB the process passes 24 GB of private memory and 7 GB of
+// swap and Linux kills it. (Intel's Windows compiler is the same in play: four at once can freeze the PC.)
 //
 // With only the programs that see their lanes held to 32 (compute_pin.h), ordinary compiles there were measured one at
 // a time: 16a842f009aff538 (730 KB of SPIR-V) added 0.8-1 GB over 23-25 s; one at the lanes the driver chose added
@@ -32,10 +31,10 @@
 // freed memory back when it leaves (trims(), glibc's malloc_trim; nothing on other C libraries).
 //
 // On by default on Mesa's Intel driver, where it was measured, and on RADV with an integrated GPU, whose memory is the
-// system's, on a PC with under kRadvSmallRamMB of RAM (radv_by_memory): an AMD Radeon 760M PC with 12 GB and 2 GB of swap
-// (Mesa 25.2.8, 12 threads, #1398) was killed for memory at a game's first start, while it made the mesh fallback's compute
-// pipelines on every CPU (precompile_at_create). The Steam Deck (16 GB, about 14.5 GB of it the system's) and the 16 GB APUs
-// work on main and keep its rule: nobody has run the gate there. RADV weighs a compile by its phis, at twice what
+// system's, on a PC with under kRadvSmallRamMB of RAM (radv_by_memory): a Radeon 760M PC with 12 GB and 2 GB of swap is
+// killed for memory at a game's first start, while it makes the mesh fallback's compute pipelines on every CPU
+// (precompile_at_create). The Steam Deck (16 GB, about 14.5 GB of it the system's) and the 16 GB APUs work without the
+// gate and keep that rule: the gate is untested there. RADV weighs a compile by its phis, at twice what
 // fallback_size_policy.h measured, as the Intel weights are twice theirs: about 2.9 GB for the two stages of 80,000 phis on
 // GFX9 and later, under 700 MB for those up to 29,400 phis (both on discrete cards); the rest, far smaller, at twice what
 // Mesa's Intel compiler took for most of them, under 200 MB (weight_radv: kRadvBigMB, kRadvMidMB, kRadvMB). None of the three
@@ -50,15 +49,18 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
 #include <mutex>
 
 namespace compute_gate {
 
-constexpr uint64_t kReserveMB = 3584;   // (memory left to the rest of the PC, as prepare_workers.h)
-constexpr uint64_t kPinnedMB = 1024;    // (an ordinary compile held to 32 lanes with compact global-memory SPIR-V)
+constexpr uint64_t kReserveMB = 4096;   // (memory left to the rest of the PC, as prepare_workers.h)
+constexpr uint64_t kPinnedMB = 2048;    // (an ordinary compile held to 32 lanes: twice 16a842f009aff538's measured peak)
 constexpr uint32_t kHeavyPhis = 2000;   // (a pinned program this big may take minutes and gigabytes)
-constexpr uint64_t kHeavyMB = 6144;     // (large >=2000-phi compute compile reserve)
-constexpr uint64_t kMeshMB = 1280;      // (a mesh fallback stage with compact global-memory SPIR-V)
+constexpr uint64_t kHeavyMB = 8192;     // (7a548525c239b91b's measured 7.6 GB)
+constexpr uint64_t kMeshMB = 3072;     // (a mesh fallback stage: twice the largest measured, 1.55 GB)
 constexpr uint64_t kFreeMB = 512;       // (one at the lanes the driver chooses: the largest measured, with room)
 constexpr unsigned kMost = 16;
 constexpr uint64_t kUnknownMB = UINT64_MAX;   // (the system does not say what is available: one at a time)
@@ -71,7 +73,7 @@ constexpr uint64_t kRadvBigMB = 6144;
 constexpr uint32_t kRadvMidPhis = 10000;
 constexpr uint64_t kRadvMidMB = 1536;
 constexpr uint64_t kRadvMB = 512;   // (twice the under 200 MB Mesa's Intel compiler took for most: not RADV's own figure)
-constexpr uint64_t kRadvSmallRamMB = 13312;   // (#1398's 12 GB is under it; a 16 GB PC or a Steam Deck, about 14.5 GB, is not)
+constexpr uint64_t kRadvSmallRamMB = 13312;   // (a 12 GB PC is under it; a 16 GB PC or a Steam Deck, about 14.5 GB, is not)
 
 /// A compile's weight: held to 32 lanes or not, how many phis its SPIR-V has, and whether it is a mesh fallback stage
 inline uint64_t weight(bool pinned, uint32_t phis, bool mesh_fallback = false) {
@@ -96,6 +98,53 @@ inline uint64_t cgroup_room_mb(const char* max_text, uint64_t current_bytes) {
     for (const char* c = max_text; *c >= '0' && *c <= '9'; c++) max = max * 10 + (uint64_t)(*c - '0');
     return max > current_bytes ? (max - current_bytes) >> 20 : 0;
 }
+
+#ifndef _WIN32
+struct CgroupMemory {
+    uint64_t limit_mb = kUnknownMB;
+    uint64_t available_mb = kUnknownMB;
+};
+
+/// A parent slice can impose a tighter limit or have less room than the leaf.
+inline CgroupMemory cgroup_memory(const char* membership = "/proc/self/cgroup", const char* mount = "/sys/fs/cgroup") {
+    CgroupMemory result;
+    std::string path;
+    if (FILE* f = fopen(membership, "r")) {
+        char line[4096];
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "0::", 3)) {
+                path = line + 3;
+                while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+                break;
+            }
+        fclose(f);
+    }
+    if (path.empty() || path[0] != '/') return result;
+    // A namespace may expose a membership outside its root. Only the mounted root is visible then.
+    if (path.find("/../") != std::string::npos || (path.size() >= 3 && path.compare(path.size() - 3, 3, "/..") == 0)) path = "/";
+    for (;;) {
+        const std::string dir = std::string(mount) + (path == "/" ? std::string() : path);
+        char max[64] = {};
+        unsigned long long current = 0;
+        bool read = false;
+        if (FILE* f = fopen((dir + "/memory.max").c_str(), "r")) {
+            read = fgets(max, sizeof max, f) != nullptr;
+            fclose(f);
+        }
+        if (read && max[0] >= '0' && max[0] <= '9') {
+            result.limit_mb = std::min(result.limit_mb, cgroup_room_mb(max, 0));
+            if (FILE* f = fopen((dir + "/memory.current").c_str(), "r")) {
+                if (fscanf(f, "%llu", &current) == 1) result.available_mb = std::min(result.available_mb, cgroup_room_mb(max, current));
+                fclose(f);
+            }
+        }
+        if (path == "/") break;
+        const size_t slash = path.find_last_of('/');
+        path = slash == 0 ? "/" : path.substr(0, slash);
+    }
+    return result;
+}
+#endif
 
 /// What the compiles may hold together, with avail_mb available when the first one starts: what is past kReserveMB.
 /// 0 (one at a time) when the system does not say

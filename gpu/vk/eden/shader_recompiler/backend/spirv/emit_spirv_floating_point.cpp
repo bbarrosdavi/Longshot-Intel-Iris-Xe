@@ -3,8 +3,6 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
-
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -13,12 +11,8 @@
 namespace Shader::Backend::SPIRV {
 namespace {
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
-    static const bool emit_no_contraction = [] {
-        const char* e = std::getenv("RX_VK_NO_CONTRACTION");
-        return !e || e[0] != '0';
-    }();
     const auto flags{inst->Flags<IR::FpControl>()};
-    if (emit_no_contraction && flags.no_contraction) {
+    if (flags.no_contraction) {
         ctx.Decorate(op, spv::Decoration::NoContraction);
     }
     return op;
@@ -111,6 +105,9 @@ Id EmitFPMul16(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+    if (ctx.mesh_fallback && mesh_fallback_strict_fmul && inst->Flags<IR::FpControl>().no_contraction) {
+        return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, ctx.Const(-0.0f)));
+    }
     return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
 }
 

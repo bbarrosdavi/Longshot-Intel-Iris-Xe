@@ -44,8 +44,8 @@ inline uint32_t spirv_phis(const uint32_t* words, size_t count) {
 // finish within 14 GB)
 constexpr uint32_t kIntelPhiLimit = 20000;
 
-// (longshot: compact GM_RANGES + zero_page global memory helpers remove per-SSBO inline branching, so 250+ calls build fast)
-constexpr uint32_t kIntelCallLimit = 0;
+// (longshot: between the 153 calls that build in seconds and the 251 that never finished)
+constexpr uint32_t kIntelCallLimit = 200;
 
 // The OpFunctionCall instructions in a SPIR-V module: each one a copy of its function once the driver has inlined it. 0 for a
 // module that is not SPIR-V or is cut short.

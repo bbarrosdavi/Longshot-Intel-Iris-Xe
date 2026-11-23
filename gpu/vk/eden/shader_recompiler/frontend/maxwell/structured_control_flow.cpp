@@ -1010,7 +1010,7 @@ IR::AbstractSyntaxList BuildASL(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::
                                 const HostTranslateInfo& host_info) {
     ObjectPool<Statement> stmt_pool{64};
     const Stage stage{env.ShaderStage()};
-    GotoPass goto_pass{cfg, stmt_pool, stage == Stage::Task || stage == Stage::Mesh || cfg.ExitsToDispatcher()};
+    GotoPass goto_pass{cfg, stmt_pool, stage == Stage::Task || stage == Stage::Mesh};
     Statement& root{goto_pass.RootStatement()};
     IR::AbstractSyntaxList syntax_list;
     TranslatePass{inst_pool, block_pool, stmt_pool, env, root, syntax_list, host_info};

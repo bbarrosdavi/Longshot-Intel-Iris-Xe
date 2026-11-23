@@ -1120,47 +1120,13 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
         FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a != b; });
         return;
     case IR::Opcode::BitwiseAnd32:
-        if (FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a & b; })) {
-            return;
-        }
-        if (!inst.HasAssociatedPseudoOperation()) {
-            const IR::Value a0{inst.Arg(0)}, a1{inst.Arg(1)};
-            if ((a0.IsImmediate() && a0.U32() == 0U) || (a1.IsImmediate() && a1.U32() == 0U)) {
-                inst.ReplaceUsesWith(IR::Value{0U});
-            } else if (a0.IsImmediate() && a0.U32() == ~0U) {
-                inst.ReplaceUsesWith(a1);
-            } else if (a1.IsImmediate() && a1.U32() == ~0U) {
-                inst.ReplaceUsesWith(a0);
-            }
-        }
+        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a & b; });
         return;
     case IR::Opcode::BitwiseOr32:
-        if (FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a | b; })) {
-            return;
-        }
-        if (!inst.HasAssociatedPseudoOperation()) {
-            const IR::Value a0{inst.Arg(0)}, a1{inst.Arg(1)};
-            if ((a0.IsImmediate() && a0.U32() == ~0U) || (a1.IsImmediate() && a1.U32() == ~0U)) {
-                inst.ReplaceUsesWith(IR::Value{~0U});
-            } else if (a0.IsImmediate() && a0.U32() == 0U) {
-                inst.ReplaceUsesWith(a1);
-            } else if (a1.IsImmediate() && a1.U32() == 0U) {
-                inst.ReplaceUsesWith(a0);
-            }
-        }
+        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a | b; });
         return;
     case IR::Opcode::BitwiseXor32:
-        if (FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a ^ b; })) {
-            return;
-        }
-        if (!inst.HasAssociatedPseudoOperation()) {
-            const IR::Value a0{inst.Arg(0)}, a1{inst.Arg(1)};
-            if (a0.IsImmediate() && a0.U32() == 0U) {
-                inst.ReplaceUsesWith(a1);
-            } else if (a1.IsImmediate() && a1.U32() == 0U) {
-                inst.ReplaceUsesWith(a0);
-            }
-        }
+        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a ^ b; });
         return;
     case IR::Opcode::BitFieldUExtract:
         FoldWhenAllImmediates(inst, [](u32 base, u32 shift, u32 count) {
