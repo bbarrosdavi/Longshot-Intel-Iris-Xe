@@ -33,6 +33,10 @@ Longshot is a continuation of [Hookshot](https://github.com/NotRexed/Hookshot). 
 **[Join us on Discord](https://discord.gg/magicbean)!**
 <br>
 
+> [!NOTE]
+> **Intel Iris Xe / Gen12 Optimization Fork (`opt/iris-xe`):** This fork adds empirically validated Vulkan, FP16 FSR 3.1, 3D motion-vector Frame Generation, and low-latency optimizations for **Intel Iris Xe / Gen12 integrated GPUs (Linux Mesa ANV)** (+46.9% Base FPS, -22.4% GPU frame time, and -121 ms FrameGen handover latency at `1787×1005 → 1920×1080` FSR 3.1 + 100% sharpness).
+> See [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md) for full benchmarks and architecture details, and [`PR_INTEL_IRIS_XE.md`](PR_INTEL_IRIS_XE.md) for the upstream contribution PR summary.
+
 > [!IMPORTANT]
 > This repository **does not contain the game, keys or an executable**, and it does not explain how to get them. You
 > need your own copy. Everything the build creates (`longshot.exe`, the generated code, the shader caches and your
