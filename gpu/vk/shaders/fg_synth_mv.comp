@@ -1,9 +1,11 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-// (Batch 13) Clean, artifact-free FP16 single-output 3D Motion-Vector synthesis (2x / Auto / >3x FG).
+// (Batch 14) Clean, artifact-free FP16 single-output 3D Motion-Vector synthesis (2x / Auto / >3x FG).
 // - Uses exact 3D camera+actor motion vectors (skipping fg_flow) where warped (fa, fb) agree cleanly and stay off HUD.
-// - On unmatchable pixels (animated limbs, shadows, water splashes, moving speech bubbles, disocclusion seams), smoothly
-//   falls back to unwarped near=(t<=0.5?a0:b0), matching fg_synth.comp's zero-speckle, zero-hole, zero-flicker guarantee.
+// - Checks BOTH forward (p + (1-t)*v0) and backward (p - t*v0) MV consistency so floor pixels downstream of Link never
+//   sample through Link's boots/shield into cast shadows.
+// - When exact pre/post-HUD alpha mask is active (depth_sign > 0), warps all consistent 3D scene pixels at full agree
+//   weight so low-contrast cobblestone grout lines never wash out or double-image during camera pans.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D fa;
 layout(binding = 1) uniform sampler2D fb;
@@ -44,9 +46,11 @@ void main() {
         imageStore(dst, g, vec4(vec3(mix(a0_4.rgb, b0_4.rgb, float16_t(pc.t))), 1.0));
         return;
     }
-    const float16_t moved = smoothstep(0.03hf, 0.09hf, gap(a0_4.rgb, b0_4.rgb));
+    const float16_t g0 = gap(a0_4.rgb, b0_4.rgb);
+    const float16_t moved = smoothstep(0.02hf, 0.07hf, g0);
     const f16vec3 still = (a0_4.a < 0.5hf) ? b0_4.rgb : mix(a0_4.rgb, b0_4.rgb, float16_t(pc.t));
-    if (moved <= 0.0hf) {
+    const bool exact_hud = pc.depth_sign > 0.0;
+    if (!exact_hud && moved <= 0.0hf) {
         imageStore(dst, g, vec4(vec3(still), 1.0));
         return;
     }
@@ -58,15 +62,16 @@ void main() {
     const vec2 max_v = d_f * 0.45;
     const vec2 v0 = sample_v(p, inv_size);
     if (!all(lessThan(abs(v0), max_v)) || dot(v0, v0) < 0.25) {
+        imageStore(dst, g, vec4(vec3(still), 1.0));
+        return;
+    }
+    const vec2 v_fwd = sample_v(p + (1.0 - pc.t) * v0, inv_size);
+    const vec2 v_bwd = sample_v(p - pc.t * v0, inv_size);
+    if (!mv_consistent(v0, v_fwd) || !mv_consistent(v0, v_bwd)) {
         imageStore(dst, g, vec4(vec3(fallback), 1.0));
         return;
     }
-    const vec2 v_mid = sample_v(p + (1.0 - pc.t) * v0, inv_size);
-    if (!mv_consistent(v0, v_mid)) {
-        imageStore(dst, g, vec4(vec3(fallback), 1.0));
-        return;
-    }
-    const vec2 vm = 0.5 * (v0 + v_mid);
+    const vec2 vm = 0.5 * (v0 + v_fwd);
     const vec2 uv_a = (p - pc.t * vm) * inv_size;
     const vec2 uv_b = (p + (1.0 - pc.t) * vm) * inv_size;
     const bool in_bounds = all(greaterThanEqual(uv_a, vec2(0.0))) && all(lessThanEqual(uv_a, vec2(1.0))) &&
@@ -81,6 +86,12 @@ void main() {
         imageStore(dst, g, vec4(vec3(fallback), 1.0));
         return;
     }
-    const float16_t agree = 1.0hf - smoothstep(0.06hf, 0.22hf, gap(a4.rgb, b4.rgb));
-    imageStore(dst, g, vec4(vec3(mix(fallback, mix(a4.rgb, b4.rgb, float16_t(pc.t)), moved * agree)), 1.0));
+    const float16_t gw = gap(a4.rgb, b4.rgb);
+    if (gw > g0 + 0.025hf && g0 < 0.08hf) {
+        imageStore(dst, g, vec4(vec3(fallback), 1.0));
+        return;
+    }
+    const float16_t agree = 1.0hf - smoothstep(0.04hf, 0.12hf, gw);
+    const float16_t w = exact_hud ? agree : (moved * agree);
+    imageStore(dst, g, vec4(vec3(mix(fallback, mix(a4.rgb, b4.rgb, float16_t(pc.t)), w)), 1.0));
 }

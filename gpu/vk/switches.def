@@ -252,7 +252,7 @@ SW(RX_VK_BC_IDLE_S, tune, int, "0: the BC scratch images are kept once made", "S
 SW(RX_VK_BC_LAYERS, tune, int, "1 (clamped 1-8)", "How many layers the ASTC-to-BC scratch images have, which is how many one run decodes and encodes.")
 SW(RX_VK_BC_POOL, attempt, bool, "off: the BC scratch images each get a dedicated allocation", "=1 takes the two ASTC-to-BC scratch images from the shared image pool instead of dedicated allocations.")
 SW(RX_VK_BC_STORAGE, kill, bool, "on: compressed images get STORAGE usage when the raw format supports it", "=0 makes block-compressed images without storage usage, as before v2.0.8 on AMD, so the game's BC encoders do not run there.")
-SW(RX_VK_BDA_HOIST, hw, bool, "on on Mesa's Intel driver, off elsewhere", "Hoists repeated guest_pages BDA load lookups sharing a 64-bit base pointer into a single page-table lookup + contiguous run_pages bounds check.")
+SW(RX_VK_BDA_HOIST, hw, bool, "off", "Hoists repeated guest_pages BDA load lookups sharing a 64-bit base pointer into a single page-table lookup + contiguous run_pages bounds check.")
 SW(RX_VK_BDA_SSBO, hw, int, "1 on Mesa's Intel driver, 0 elsewhere", "Lowers BDA guest_pages helper calls whose cbuf base is already bound as an SSBO into direct SSBO accesses (1: FS clustered light loads + safe CS, 2: +all CS loads, 3: +all CS stores/atomics).")
 SW(RX_VK_BENCH, diag, string, "no benchmark", "Replays the frame at the given present repeatedly (<present>[,<times>], 50 times) to time it.")
 SW(RX_VK_BG_IMPORT, attempt, bool, "off: pools are imported by chunk at first use", "1 imports every pool the game makes eagerly on a background thread.")

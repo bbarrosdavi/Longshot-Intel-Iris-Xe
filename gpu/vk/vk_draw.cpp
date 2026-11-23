@@ -5409,8 +5409,9 @@ int custom_spv_mode() {
 bool bda_hoist_on() {
     static const bool on = []() {
         const char* e = getenv("RX_VK_BDA_HOIST");
-        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
-        const bool v = e && *e ? (atoi(e) != 0) : intel_mesa;
+        // (opt/iris-xe) Off by default: direct_groups substitutes zero_page without guest_load_* fallback when a struct
+        // straddles a 4 KB page boundary, and Aligned 16/8 PSB loads corrupt unaligned vertex/GI addresses into polygon spikes.
+        const bool v = e && *e ? (atoi(e) != 0) : false;
         if (v) logf("vk: RX_VK_BDA_HOIST=1 (hoisted guest_pages + run_pages base-pointer translation)");
         return v;
     }();
@@ -7899,25 +7900,10 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
         // programs the same position to the last bit, and the ground came out in holes: the sky through them, a white forest.
         // A small margin towards the camera instead. RX_VK_EQ_BIAS=<units>, 0: as the game asks
         static const float eq_bias = dev.policy.equal_depth_bias;   // (device_policy.h: 64 on Intel, then the switch)
-        static const bool eq_skip_alpha = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
         if (eq_bias > 0 && d.dt && !d.dw && d.dop == VK_COMPARE_OP_EQUAL) {
-            bool skip_bias = false;
-            if (eq_skip_alpha) {
-                if (s.color.blend_en & 1u) {
-                    skip_bias = true;
-                } else {
-                    for (const Stage& st : p.stages)
-                        if (st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT && st.info.uses_demote_to_helper_invocation) {
-                            skip_bias = true;
-                            break;
-                        }
-                }
-            }
-            if (!skip_bias) {
-                d.dop = VK_COMPARE_OP_LESS_OR_EQUAL;
-                d.bias_en = VK_TRUE;
-                d.bias[0] = -eq_bias, d.bias[1] = 0.0f, d.bias[2] = 0.0f;
-            }
+            d.dop = VK_COMPARE_OP_LESS_OR_EQUAL;
+            d.bias_en = VK_TRUE;
+            d.bias[0] = -eq_bias, d.bias[1] = 0.0f, d.bias[2] = 0.0f;
         }
     }
     d.st = stencil && s.ds.st;
@@ -12036,7 +12022,8 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     // GPU without cooperative matrices they are left out): the temporal upscaler is offered it first, as temporal_stand_in
     // offers the networks that did translate, and so is FSR 3.1, as fsr3_stand_in. It takes only the scene into the picture;
     // anything else goes on below
-    if ((temporal_wanted() || temporal_off() || fsr3_inputs::wanted()) && temporal_rejected_network(cmd, key, src, &in, dst, &out))
+    if ((temporal_wanted() || temporal_off() || fsr3_inputs::wanted() || temporal_fg_inputs()) &&
+        temporal_rejected_network(cmd, key, src, &in, dst, &out))
         return true;
     VkFormatProperties fs{}, fd{};
     vkGetPhysicalDeviceFormatProperties(dev.physical, src->format, &fs);
@@ -12380,7 +12367,7 @@ bool temporal_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p)
 /// HUD mark (vk_framegen.h framegen_hud_before: copied once the upscale wrote it, whichever drew it). Null unless AMD FSR
 /// 3.1's frame interpolation is asked for, or for any other dispatch
 static Texture* upscale_picture(const NvnState& s, const Program& p, uint32_t* level) {
-    if (p.stages.empty() || !fsr3fi::frames_wanted()) return nullptr;
+    if (p.stages.empty() || (!fsr3fi::frames_wanted() && !framegen_on())) return nullptr;
     const Stage& st = p.stages[0];
     if (!gameplay_network(p.key) && !(st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
                                       st.info.image_descriptors.size() == 1))
@@ -14166,7 +14153,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                                 (force_stub >= 2 || !gameplay_network(cp->key))));
     if ((!cp || cp->failed || slow_network) && upscale_stub(cmd, s, compute_code_key(s))) {
         // (a gameplay upscale's picture, as the dispatch below copies its own: frame generation's HUD mark)
-        if (stub_picture && fsr3fi::frames_wanted()) framegen_hud_before(cmd, stub_picture, 0);
+        if (stub_picture && (fsr3fi::frames_wanted() || framegen_on())) framegen_hud_before(cmd, stub_picture, 0);
         return void(st_dispatches++);
     }
     if (slow_network) SKIP_HERE();   // (an earlier pass of the network: the stub is its last pass)

@@ -1503,10 +1503,11 @@ bool hud_source(VkCommandBuffer cmd, int cur, uint32_t sw, uint32_t sh, int x0, 
 } // namespace
 
 void framegen_hud_before(VkCommandBuffer cmd, Texture* picture, uint32_t level) {
+    static const bool mv_off = env_on("RX_VK_FG_NO_MV");
     if (!picture || level || !picture->image || picture->samples != VK_SAMPLE_COUNT_1_BIT || picture->levels != 1 ||
         picture->layers != 1 || picture->type != VK_IMAGE_TYPE_2D ||
         (picture->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && picture->format != VK_FORMAT_R16G16B16A16_SFLOAT) ||
-        !framegen_on() || !fsr3fi::frames_wanted())
+        !framegen_on() || (!fsr3fi::frames_wanted() && (mv_off || temporal_wanted())))
         return;
     std::lock_guard lk(hud.mu);
     if (hud.failed) return;
@@ -1640,15 +1641,36 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     const bool dlss_held = blend && m > 1 && dlss_fg_holds();
     const bool fsr_wanted = fsr3fi::frames_wanted() != 0;
     const bool use_mv = have_mv && blend && m > 1 && !dlss_held && !fsr_wanted && fg.synth_mv.pipe && tm.depth_view;
-    const bool exact_hud =
+    VkImageView exact_before_view = tm.hud_before_view;
+    VkImageView exact_after_view = tm.hud_after_view;
+    bool exact_square = tm.hud_square;
+    bool exact_hud =
         fg.copy_hud.pipe && !mv_off && m > 1 && !dlss_held && !fsr_wanted && !auto_rate &&
-        tm.hud_before_view && tm.hud_after_view && tm.hud_after_tex && tm.hud_after_image &&
+        exact_before_view && exact_after_view && tm.hud_after_tex && tm.hud_after_image &&
         tm.hud_w == sw && tm.hud_h == sh &&
         texture_alive(tm.hud_after_gpu, tm.hud_after_tex, tm.hud_after_image);
-    // (Batch 13) Use fg_copy_hud only when exact before/after HUD diff is available (FSR3/DLSS/XeSS).
-    // In dlss=0 mode, motion-contradiction heuristic falsely flags flat dark shadows/wood/bright stone rims as HUD
-    // (alpha=0), punching salt-and-pepper fallback dots into 3D scenes; fg_synth2_mv's moved==0 guard already keeps
-    // static HUD elements completely unwarped with zero false positives.
+    // (opt/iris-xe) In dlss=0 mode (Game upscaler / Off stretch / upscale_stub), framegen_hud_before() captured
+    // hud.before right after the gameplay upscale wrote the pre-HUD picture: copy post-HUD hud.picture into hud.after
+    // so fg_copy_hud gets exact before/after HUD alpha masking in dlss=0 mode too.
+    if (!exact_hud && fg.copy_hud.pipe && !mv_off && m > 1 && !dlss_held && !fsr_wanted && !auto_rate) {
+        std::lock_guard lk(hud.mu);
+        hud_free_dead();
+        const bool fresh = hud.fresh;
+        hud.fresh = false;
+        if (fresh && !hud.failed && hud.picture && hud.before.view && hud.pw == sw && hud.ph == sh &&
+            texture_alive(hud.gpu, hud.tex, hud.picture) &&
+            hud_image(cmd, hud.after, sw, sh, hud.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            full_barrier(cmd);
+            const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                                {sw, sh, 1}};
+            vkCmdCopyImage(cmd, hud.picture, VK_IMAGE_LAYOUT_GENERAL, hud.after.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            full_barrier(cmd);
+            exact_before_view = hud.before.view;
+            exact_after_view = hud.after.view;
+            exact_square = false;
+            exact_hud = true;
+        }
+    }
     const bool use_copy_hud = exact_hud;
     const bool need_luma = !dlss_held && (!fsr_wanted || auto_rate) && !use_mv && !use_copy_hud;
     const int game_slot = blend ? (m - 1) : 0;
@@ -1666,7 +1688,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         const float tw = (float)std::max(tm.tex_w, std::max(tm.render_w, 1u)),
                     th = (float)std::max(tm.tex_h, std::max(tm.render_h, 1u));
         return {t0, t1, {rw / tw, rh / th}, {(rw - 0.5f) / tw, (rh - 0.5f) / th}, {(float)uw / rw, (float)uh / rh},
-                tm.depth_reversed ? -1.0f : 1.0f};
+                exact_hud ? 1.0f : -1.0f};
     };
     if (use_copy_hud) {
         const MvPush mvp = make_mv_push(0.0f, 0.0f);
@@ -1679,11 +1701,11 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
             float uv_max[2];
             float mv_scale[2];
         } hpc{{x0, y0}, {w, h}, direct_game ? 1 : 0,
-              exact_hud ? (1 | (tm.hud_square ? 4 : 0)) : 2,
+              exact_hud ? (1 | (exact_square ? 4 : 0)) : 2,
               {mvp.uv_scale[0], mvp.uv_scale[1]}, {mvp.uv_max[0], mvp.uv_max[1]}, {mvp.mv_scale[0], mvp.mv_scale[1]}};
         static_assert(sizeof hpc == 48);
-        const VkImageView aux0 = exact_hud ? tm.hud_before_view : fg.frames[prev].view;
-        const VkImageView aux1 = exact_hud ? tm.hud_after_view : tm.view;
+        const VkImageView aux0 = exact_hud ? exact_before_view : fg.frames[prev].view;
+        const VkImageView aux1 = exact_hud ? exact_after_view : tm.view;
         pass(cmd, fg.copy_hud,
              {{src, fg.nearest},
               {aux0, fg.nearest},
