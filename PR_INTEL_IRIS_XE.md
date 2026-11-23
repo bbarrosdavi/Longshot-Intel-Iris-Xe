@@ -3,11 +3,23 @@
 ## Summary
 This PR contributes a comprehensive, empirically validated set of GPU, shader, Frame Generation, and latency optimizations targeting **Intel Iris Xe / Gen12 integrated GPUs (Linux Mesa ANV)** — while keeping all Intel-specific heuristics scoped to `VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA` (or runtime switches in `gpu/vk/switches.def`) so NVIDIA and AMD behavior is preserved.
 
-At maximum gameplay resolution (**`1787×1005 → 1920×1080`**, AMD FSR 3.1, 100% sharpness, `vsync=2`) on an **Intel Core i5-1235U / Iris Xe 96 EUs (26W)**:
-- **Base FPS:** `14.0 FPS → 20.56 FPS` (**+46.9%**)
-- **Displayed FPS (FrameGen Auto / 2x):** `28.0 FPS → 41.1 FPS` (`0 late`, `0 <12 ms`)
-- **GPU Frame Time:** `53.9 ms → 41.8–42.8 ms` (**-22.4%**)
-- **FrameGen Handover Latency:** `156.9 ms → 35.1 ms` (Auto) / `65.5 ms` (2x), plus **`-50 ms`** end-to-end input queue reduction via `ahead=1` in-flight depth.
+### Full Progression on Intel Core i5-1235U / Iris Xe 96 EUs (26W, Linux Mesa ANV 26.2.4, `1920×1080 @ 60 Hz`)
+
+| Milestone | Base FPS | Displayed FPS | GPU / Frame | FrameGen Handover | State |
+|---|---:|---:|---:|---:|---|
+| **Unoptimized Upstream (`nightly-469-9af4808f`)** | `~9` | `~9` | `>110 ms` | N/A | Unplayable: black/rainbow surface corruption + i915 10s GPU hangs |
+| **First Functional Baseline (Batch 5–10)** | `~13` | `~13–24` | `~75 ms` | `>160 ms` | Bootable, but blocky + Gen12 spill glow/white blow-out + hair fringes + `~7 ms` optical-flow FG |
+| **Clean-Visual Checkpoint (`suprassumo`, Batch 14)** | `14.0` | `28.0` (2x) | `53.9 ms` | `156.9 ms` (`BATCH=1`) | Clean visuals at `1787×1005 → 1920×1080` FSR 3.1 + 100% sharpness, high input lag |
+| **Final (`supertop`, Batch 15 — FG Auto)** | **`20.56`** (**2.3×** vs upstream / **+58%** vs func. baseline) | **`41.1`** | **`41.8–42.8 ms`** | **`35.1 ms`** (`0 late`) | Clean across all areas + `-50 ms` GPU queue depth (`ahead=1`) |
+| **Final (`supertop`, Batch 15 — FG 2x)** | **`20.1`** | **`40.2`** | **`42.2 ms`** | **`65.5 ms`** (`0 late`) | Clean across all areas, `0 <12 ms` bursts |
+
+### Visual Comparison
+
+| Unoptimized Upstream (`~9 FPS`, black/rainbow corruption) | Final `supertop` (Kokiri Forest — 100% clean) |
+|:---:|:---:|
+| ![Unoptimized upstream 9 FPS](docs/images/iris-xe/01_baseline_unoptimized_kokiri_9fps.jpg) | ![Optimized Kokiri Forest](docs/images/iris-xe/04_optimized_kokiri_clean.jpg) |
+| **First Functional Baseline (`~13 FPS`, blocky)** | **Final `supertop` (Castle Town Market — 100% clean)** |
+| ![First functional baseline 13 FPS](docs/images/iris-xe/02_functional_baseline_deku_13fps.jpg) | ![Optimized Market](docs/images/iris-xe/05_optimized_market_clean.jpg) |
 
 Full technical write-up and per-pass breakdown: [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md).
 

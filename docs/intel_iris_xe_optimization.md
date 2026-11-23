@@ -6,17 +6,31 @@ All vendor-specific heuristics are scoped to `VK_DRIVER_ID_INTEL_OPEN_SOURCE_MES
 
 ---
 
-## 1. Empirical Results (Before vs. After)
+## 1. Empirical Progression (Unoptimized Upstream → Functional Baseline → `supertop`)
 
-Measured on **Intel Core i5-1235U / Iris Xe 96 EUs (26W)**, 16 GB LPDDR4x UMA, EndeavourOS Linux, Mesa ANV 26.2.4, `1920×1080 @ 60 Hz` (`vsync=2` MAILBOX), **Hyrule Castle Courtyard (`slot_01`)** at **`1787×1005 → 1920×1080`**, **AMD FSR 3.1 (`dlss=3`, `resolution=9`)**, **100% Sharpness**:
+Measured on **Intel Core i5-1235U / Iris Xe 96 EUs (26W)**, 16 GB LPDDR4x UMA, EndeavourOS Linux, Mesa ANV 26.2.4, `1920×1080 @ 60 Hz` (`vsync=2` MAILBOX). Final max-resolution benchmarks run in **Hyrule Castle Courtyard (`slot_01`)** at **`1787×1005 → 1920×1080`**, **AMD FSR 3.1 (`dlss=3`, `resolution=9`)**, **100% Sharpness**:
 
-| Configuration | Base FPS | Displayed FPS | GPU / Frame | FrameGen Handover Latency | `late` / `<12 ms` |
-|---|---:|---:|---:|---:|---:|
-| **`suprassumo` baseline** (`RX_VK_BATCH=1`, FG 2x) | `14.0` | `28.0` | `53.9 ms` | `156.9 ms` | `0 / 0` |
-| **`supertop` (FG Auto — default)** | **`20.56`** (+46.9%) | **`41.1`** | **`41.8–42.8 ms`** (-22.4%) | **`35.1 ms`** (-121.8 ms) | **`0 / 0`** |
-| **`supertop` (FG 2x)** | **`20.1`** (+43.6%) | **`40.2`** | **`42.2 ms`** (-21.7%) | **`65.5 ms`** (-91.4 ms) | **`0 / 0`** |
+| Milestone | Base FPS | Displayed FPS | GPU / Frame | FrameGen Handover | Visual & Stability State |
+|---|---:|---:|---:|---:|---|
+| **Unoptimized Upstream** (`nightly-469-9af4808f` / `main`) | `~9` | `~9` | `>110 ms` | N/A | **Unplayable:** severe black/rainbow surface corruption, i915 10s GPU hangs/TDR |
+| **First Functional Baseline** (early Batch 5–10) | `~13` | `~13–24` | `~75 ms` | `>160 ms` | First bootable/non-hanging pass; low-res/blocky, Gen12 spill neon/white blow-out, hair fringes, `~7 ms` optical-flow FG |
+| **Clean-Visual Checkpoint (`suprassumo`, Batch 14)** | `14.0` | `28.0` (2x) | `53.9 ms` | `156.9 ms` (`BATCH=1`) | 100% clean visuals (`0` neon, `0` hair fringes, `0` spikes), high input lag |
+| **Final (`supertop`, Batch 15 — FG Auto)** | **`20.56`** (**2.3×** vs upstream / **+58%** vs func. baseline) | **`41.1`** | **`41.8–42.8 ms`** | **`35.1 ms`** (`0 late`) | **100% clean** across Kokiri, Market & Castle; `ahead=1` saves extra `~50 ms` input queue |
+| **Final (`supertop`, Batch 15 — FG 2x)** | **`20.1`** | **`40.2`** | **`42.2 ms`** | **`65.5 ms`** (`0 late`) | **100% clean**, `0 <12 ms` bursts, `k0=25.5 / k1=24.0 ms` |
 
-> In addition to the handover latency cut, reducing the Mesa Intel FrameGen in-flight depth from 2 frames to **1 frame (`ahead=1`)** eliminates an extra **~50 ms** of end-to-end input queue depth with **0% FPS loss** (`+0.55 FPS` in Auto mode).
+### Visual Comparison (Before vs. After)
+
+| Unoptimized Upstream (`~9 FPS`, black/rainbow corruption) | First Functional Baseline (`~13 FPS`, blocky + Gen12 bugs) |
+|:---:|:---:|
+| ![Unoptimized upstream 9 FPS](images/iris-xe/01_baseline_unoptimized_kokiri_9fps.jpg) | ![First functional baseline 13 FPS](images/iris-xe/02_functional_baseline_deku_13fps.jpg) |
+| **Gen12 Spill/Bloom Bug (`shader_spilling_rate=2`)** | **Final `supertop` (Kokiri Forest — 100% clean)** |
+| ![Gen12 spill bloom bug](images/iris-xe/03_gen12_spill_bloom_bug_castle.jpg) | ![Optimized Kokiri Forest](images/iris-xe/04_optimized_kokiri_clean.jpg) |
+| **Final `supertop` (Castle Town Market — 100% clean)** | **Final `supertop` (Hyrule Castle Path — 100% clean)** |
+| ![Optimized Market](images/iris-xe/05_optimized_market_clean.jpg) | ![Optimized Castle Wagon](images/iris-xe/06_optimized_castle_wagon_clean.jpg) |
+
+**3D-MV FrameGen Real vs. Synthesized (`_made`) Frames in Active Sprint + Camera Pan:**
+
+![Real vs Synthesized FrameGen frames](images/iris-xe/07_framegen_3dmv_real_vs_made.jpg)
 
 ### Per-Pass GPU Breakdown (`RX_VK_PASS_TIMING=2`, `1787×1005 → 1920×1080`)
 
