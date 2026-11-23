@@ -38,11 +38,11 @@ Longshot is a continuation of [Hookshot](https://github.com/NotRexed/Hookshot). 
 >
 > 📄 Full benchmarks & engineering write-up: [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md) · Upstream PR summary: [`PR_INTEL_IRIS_XE.md`](PR_INTEL_IRIS_XE.md)
 >
-> | Before — Unoptimized Upstream (`~9 FPS`, black/rainbow corruption) | After — Optimized Build (`opt/iris-xe`, Kokiri Forest) |
+> | Before — Unoptimized Upstream (`~9 FPS`, black/rainbow corruption) | After — Optimized Build (`20.6 Base / 41.1 Displayed FPS`, Kokiri Forest) |
 > |:---:|:---:|
 > | ![Before: Unoptimized upstream 9 FPS](docs/images/iris-xe/01_baseline_unoptimized_kokiri_9fps.jpg) | ![After: Optimized Kokiri Forest](docs/images/iris-xe/04_optimized_kokiri_clean.jpg) |
 >
-> | Before — First Functional Baseline (`~13 FPS`, blocky) | After — Optimized Build (`opt/iris-xe`, Hyrule Castle Path) |
+> | Before — First Functional Baseline (`~13 FPS`, blocky) | After — Optimized Build (`20.6 Base / 41.1 Displayed FPS`, Hyrule Castle Path) |
 > |:---:|:---:|
 > | ![Before: First functional baseline 13 FPS](docs/images/iris-xe/02_functional_baseline_deku_13fps.jpg) | ![After: Optimized Hyrule Castle Path](docs/images/iris-xe/06_optimized_castle_wagon_clean.jpg) |
 

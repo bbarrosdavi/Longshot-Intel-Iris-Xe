@@ -15,11 +15,11 @@ This PR contributes a comprehensive, empirically validated set of GPU, shader, F
 
 ### Visual Comparison
 
-| Before — Unoptimized Upstream (`~9 FPS`) | After — Optimized Build (Kokiri Forest) |
+| Before — Unoptimized Upstream (`~9 FPS`) | After — Optimized Build (`20.6 Base / 41.1 Displayed FPS`, Kokiri Forest) |
 |:---:|:---:|
 | ![Unoptimized upstream 9 FPS](docs/images/iris-xe/01_baseline_unoptimized_kokiri_9fps.jpg) | ![Optimized Kokiri Forest](docs/images/iris-xe/04_optimized_kokiri_clean.jpg) |
 
-| Before — First Functional Baseline (`~13 FPS`) | After — Optimized Build (Hyrule Castle Path) |
+| Before — First Functional Baseline (`~13 FPS`) | After — Optimized Build (`20.6 Base / 41.1 Displayed FPS`, Hyrule Castle Path) |
 |:---:|:---:|
 | ![First functional baseline 13 FPS](docs/images/iris-xe/02_functional_baseline_deku_13fps.jpg) | ![Optimized Castle Wagon](docs/images/iris-xe/06_optimized_castle_wagon_clean.jpg) |
 
