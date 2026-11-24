@@ -120,6 +120,30 @@ void temporal_note_present(uint32_t width, uint32_t height);
 /// scene now, whether or not an engine then drew it (failed, refused, not this frame). Not in its own menus, movies and
 /// loading screens. Without the lock (an atomic frame number)
 bool temporal_scene_now();
+/// Exact 3D camera + skinned-actor motion vectors, scene depth, and before/after HUD picture views computed this frame by
+/// the temporal chain (RG16F motion, render pixels toward the frame before, x right and y down, no jitter), for built-in
+/// FrameGen synthesis and exact HUD protection.
+struct TemporalMotion {
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageView depth_view = VK_NULL_HANDLE;
+    VkImageView hud_before_view = VK_NULL_HANDLE;   // s.output / fsr3::last_upscaled_view (before HUD)
+    VkImageView hud_after_view = VK_NULL_HANDLE;    // game's upscale output texture (after HUD)
+    VkImage hud_after_image = VK_NULL_HANDLE;
+    const Texture* hud_after_tex = nullptr;
+    uint64_t hud_after_gpu = 0;
+    uint64_t hud_after_gen = 0;
+    uint32_t render_w = 0, render_h = 0;
+    uint32_t tex_w = 0, tex_h = 0;
+    uint32_t hud_w = 0, hud_h = 0;
+    bool depth_reversed = false;
+    bool hud_square = false;
+    bool reset = false;
+    uint64_t frame = 0;
+};
+bool temporal_last_motion(TemporalMotion& out);
+/// Fallback 3D camera+actor motion prep before framegen_record() when no upscaler dispatch ran this frame
+/// (e.g. dlss=0 Native/TAAU with built-in FrameGen on): runs lean fg_mv_prep.comp + actor_motion from the scene depth.
+void temporal_prepare_fg_motion(VkCommandBuffer cmd, uint32_t out_w, uint32_t out_h);
 void temporal_reset_failure();
 
 /// For the renderer's status line (vk_replay.cpp status_tick): while an engine draws, its details since the last call into b
@@ -160,6 +184,8 @@ struct TemporalFrame {
     /// (longshot) depth holds 1 - d (the engine's fsr_depth, where the projection puts the near plane at 0: FSR 3.1). Anything
     /// else that reads this frame's depth (frame generation, other passes) must look here, not assume the plain depth
     bool depth_reversed = false;
+    /// Direct squared output into game's B10G11R11 target (skips dlss_out.comp and s.output RGBA16F roundtrip)
+    bool square_output = false;
 };
 /// An engine: plain functions, each called with the chain's lock held, on the recording thread
 struct TemporalEngine {

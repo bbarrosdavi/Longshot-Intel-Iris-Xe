@@ -12493,7 +12493,8 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     // GPU without cooperative matrices they are left out): the temporal upscaler is offered it first, as temporal_stand_in
     // offers the networks that did translate, and so is FSR 3.1, as fsr3_stand_in. It takes only the scene into the picture;
     // anything else goes on below
-    if ((temporal_wanted() || temporal_off() || fsr3_inputs::wanted()) && temporal_rejected_network(cmd, key, src, &in, dst, &out))
+    if ((temporal_wanted() || temporal_off() || fsr3_inputs::wanted() || temporal_fg_inputs()) &&
+        temporal_rejected_network(cmd, key, src, &in, dst, &out))
         return true;
     VkFormatProperties fs{}, fd{};
     vkGetPhysicalDeviceFormatProperties(dev.physical, src->format, &fs);

@@ -59,6 +59,7 @@ struct PassInfo {
     const Kind* bindings;
     size_t binding_count;
     const char* spv_name;   ///< the array's, for builtin_spv (RX_VK_SHADER_DIR)
+    bool spec_const0 = false;   ///< Specialization constant ID 0 = VK_TRUE
 };
 
 constexpr Kind PREPARE_INPUTS[]{T, T, T, I, I, I, I, I, U};
@@ -69,7 +70,8 @@ constexpr Kind PREPARE_REACTIVITY[]{T, T, T, T, T, T, T, T, T, I, I, I, U};
 constexpr Kind LUMA_INSTABILITY[]{T, T, T, T, T, T, T, I, I, U};
 constexpr Kind ACCUMULATE[]{T, T, T, T, T, T, T, T, T, I, I, I, U};
 
-#define PASS(n, spv, b) PassInfo{n, spv, sizeof spv, b, sizeof b / sizeof b[0], #spv}
+#define PASS(n, spv, b) PassInfo{n, spv, sizeof spv, b, sizeof b / sizeof b[0], #spv, false}
+#define PASS_SPEC(n, spv, b) PassInfo{n, spv, sizeof spv, b, sizeof b / sizeof b[0], #spv, true}
 
 /// The passes, in the order PassId numbers them. The two _nowave pyramids are alternatives to the two before them, for
 /// devices without the subgroup operations the single-pass downsampler wants. FSR's own sharpening (accumulate_sharpen and
@@ -83,10 +85,13 @@ const PassInfo PASSES[]{
          SHADING_CHANGE_PYRAMID),
     PASS("shading_change", FSR3_SHADING_CHANGE_COMP_SPV, SHADING_CHANGE),
     PASS("prepare_reactivity", FSR3_PREPARE_REACTIVITY_COMP_SPV, PREPARE_REACTIVITY),
+    PASS_SPEC("prepare_reactivity_mask", FSR3_PREPARE_REACTIVITY_COMP_SPV, PREPARE_REACTIVITY),
     PASS("luma_instability", FSR3_LUMA_INSTABILITY_COMP_SPV, LUMA_INSTABILITY),
     PASS("accumulate", FSR3_ACCUMULATE_COMP_SPV, ACCUMULATE),
+    PASS_SPEC("accumulate_sq", FSR3_ACCUMULATE_COMP_SPV, ACCUMULATE),
 };
 #undef PASS
+#undef PASS_SPEC
 
 enum PassId : size_t {
     P_PREPARE_INPUTS,
@@ -96,8 +101,10 @@ enum PassId : size_t {
     P_SHADING_CHANGE_PYRAMID_NOWAVE,
     P_SHADING_CHANGE,
     P_PREPARE_REACTIVITY,
+    P_PREPARE_REACTIVITY_MASK,
     P_LUMA_INSTABILITY,
     P_ACCUMULATE,
+    P_ACCUMULATE_SQ,
     kPassCount
 };
 static_assert(sizeof PASSES / sizeof PASSES[0] == kPassCount, "PassId must name every pass");
@@ -197,6 +204,7 @@ struct State {
     float frame_index = 0.0f;
     uint32_t parity = 0;
     bool first_evaluation = true;   ///< the images are new: their first layout, cleared
+    bool output_needs_layout = false; ///< lazy g.output created after first_evaluation
     bool lut_uploaded = false;
     // Images of an earlier size, released only after their GPU uses complete.
     std::vector<std::pair<uint64_t, Image>> dead;
@@ -298,9 +306,12 @@ bool make_pipeline(Pipeline& p, const PassInfo& info) {
         IntelDriverGate gate;   // (released before shared_compute_pipeline, which takes the same lock)
         if (extern_guarded_shader_module(&mi, &m) != VK_SUCCESS) return false;
     }
+    const VkBool32 spec_val = VK_TRUE;
+    const VkSpecializationMapEntry spec_entry{0, 0, sizeof spec_val};
+    const VkSpecializationInfo spec_info{1, &spec_entry, sizeof spec_val, &spec_val};
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
-                nullptr};
+                info.spec_const0 ? &spec_info : nullptr};
     ci.layout = p.layout;
     // (longshot, a stutter: through the pipeline cache kept across runs. Made with none, FSR 3.1's dozen passes were compiled
     // again at every start, inside the first upscaled frame: a 2.7 s first frame of play against 1.0 s without FSR, 2026-11-10)
@@ -360,10 +371,10 @@ void make_uniform_layout() {
 void record_pass(VkCommandBuffer cmd, size_t pass, const Resource* res, size_t count, uint32_t groups_x, uint32_t groups_y) {
     const PassInfo& info = PASSES[pass];
     const Pipeline& p = g.passes[pass];
-    std::vector<VkDescriptorImageInfo> images(count);
-    std::vector<VkDescriptorBufferInfo> buffers(count);
-    std::vector<VkWriteDescriptorSet> writes;
-    writes.reserve(count + 2);
+    VkDescriptorImageInfo images[16];
+    VkDescriptorBufferInfo buffers[16];
+    VkWriteDescriptorSet writes[18];
+    size_t nw = 0;
     for (size_t i = 0; i < count; i++) {
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w.dstBinding = (uint32_t)i;
@@ -377,7 +388,7 @@ void record_pass(VkCommandBuffer cmd, size_t pass, const Resource* res, size_t c
             w.descriptorType = info.bindings[i] == T ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w.pImageInfo = &images[i];
         }
-        writes.push_back(w);
+        writes[nw++] = w;
     }
     const VkDescriptorImageInfo point{g.point, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     const VkDescriptorImageInfo linear{g.linear, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
@@ -388,11 +399,11 @@ void record_pass(VkCommandBuffer cmd, size_t pass, const Resource* res, size_t c
         w.descriptorCount = 1;
         w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         w.pImageInfo = info_ptr;
-        writes.push_back(w);
+        writes[nw++] = w;
     }
     const bool timed = gprof_begin(cmd);   // (RX_VK_PASS_TIMING=1: GPU ms by pass name)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, (uint32_t)writes.size(), writes.data());
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, (uint32_t)nw, writes);
     vkCmdDispatch(cmd, std::max(1u, groups_x), std::max(1u, groups_y), 1);
     if (timed) gprof_end(cmd, std::string("fsr3 ") + info.name);
     memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
@@ -414,7 +425,8 @@ std::vector<Image*> all_images() {
 }
 
 /// The pipelines and the internal images for an evaluation at these sizes, made again when the sizes change
-bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height) {
+bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height,
+             bool need_output = true) {
     if (!supported()) return false;
     if (!g.tried) {
         g.tried = true;
@@ -428,12 +440,17 @@ bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_wid
         if (g.ok) logf("vk: fsr3: its passes are ready (%s subgroup operations)", g.wave ? "with" : "without");
     }
     if (!g.ok) return false;
-    if (g.output.image && g.render_width == render_width && g.render_height == render_height &&
-        g.upscale_width == upscale_width && g.upscale_height == upscale_height)
-        return true;
-
     const uint32_t rw = std::max(1u, render_width), rh = std::max(1u, render_height);
     const uint32_t uw = std::max(1u, upscale_width), uh = std::max(1u, upscale_height);
+    if (g.accumulation[0].image && g.render_width == rw && g.render_height == rh &&
+        g.upscale_width == uw && g.upscale_height == uh) {
+        if (need_output && !g.output.image) {
+            if (!make_image(g.output, VK_FORMAT_R16G16B16A16_SFLOAT, uw, uh)) return false;
+            g.output_needs_layout = true;
+        }
+        return true;
+    }
+
     bool made = true;
     for (size_t i = 0; i < 2 && made; i++) {
         made = made && make_image(g.accumulation[i], VK_FORMAT_R8_UNORM, rw, rh);
@@ -458,8 +475,10 @@ bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_wid
     made = made && make_image(g.spd_atomic, VK_FORMAT_R32_UINT, 1, 1);
     made = made && make_image(g.lanczos_lut, VK_FORMAT_R16_SNORM, 128, 1);
     made = made && make_image(g.default_reactive, VK_FORMAT_R8_UNORM, 1, 1);
-    made = made && make_image(g.output, VK_FORMAT_R16G16B16A16_SFLOAT, uw, uh);
+    if (need_output) made = made && make_image(g.output, VK_FORMAT_R16G16B16A16_SFLOAT, uw, uh);
+    else drop_image(g.output);
     g.first_evaluation = true;   // (new images: their first layout and cleared, the history from nothing)
+    g.output_needs_layout = false;
     g.lut_uploaded = false;
     g.parity = 0;
     if (!made) {
@@ -474,13 +493,14 @@ bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_wid
 
 } // namespace
 
-int prepare_sizes(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height) {
+int prepare_sizes(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height,
+                  bool need_output) {
     if (!supported()) return -1;
     free_dead();   // (as upscale does first: a prepare that fails retires what it made, and the next try must not keep it all)
-    const bool had = g.output.image && g.render_width == std::max(1u, render_width) &&
+    const bool had = g.accumulation[0].image && g.render_width == std::max(1u, render_width) &&
                      g.render_height == std::max(1u, render_height) && g.upscale_width == std::max(1u, upscale_width) &&
                      g.upscale_height == std::max(1u, upscale_height);
-    if (!prepare(render_width, render_height, upscale_width, upscale_height)) return g.tried && !g.ok ? -1 : 0;
+    if (!prepare(render_width, render_height, upscale_width, upscale_height, need_output)) return g.tried && !g.ok ? -1 : 0;
     return had ? 1 : 2;
 }
 
@@ -492,8 +512,9 @@ bool supported() {
             logf("vk: fsr3: not on this GPU: no push descriptors, or fewer than 15 (%u)", dev.max_push_descriptors);
             return false;
         }
-        if (!dev.features.shaderStorageImageExtendedFormats || !dev.features.shaderStorageImageWriteWithoutFormat) {
-            logf("vk: fsr3: not on this GPU: no extended storage image formats, or no storage writes without a format");
+        if (!dev.features.shaderStorageImageExtendedFormats || !dev.features.shaderStorageImageWriteWithoutFormat ||
+            !dev.vk12.shaderFloat16) {
+            logf("vk: fsr3: not on this GPU: no extended storage image formats, storage writes without a format, or shaderFloat16");
             return false;
         }
         if (!formats_supported()) return false;
@@ -528,7 +549,8 @@ void release() {
 bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     free_dead();
     if (!in.color || !in.depth || !in.motion) return false;
-    if (!prepare(in.render_width, in.render_height, in.upscale_width, in.upscale_height)) return false;
+    if (!prepare(in.render_width, in.render_height, in.upscale_width, in.upscale_height, in.output == VK_NULL_HANDLE))
+        return false;
 
     const UniformUpload uniforms = uniform_upload(g.frame_stride);
     if (!uniforms.binding) return false;
@@ -601,16 +623,19 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     const uint32_t p = g.parity, q = p ^ 1u;
 
     // What was written before (the inputs: vk_fsr3_inputs.cpp) has to be visible, and new images need their first layout.
-    memory_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                   VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                       VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                   VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                   VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    if (!in.inputs_synced) {
+        memory_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
     const std::vector<Image*> all = all_images();
     if (first) {
         std::vector<VkImageMemoryBarrier2> to_general;
         to_general.reserve(all.size());
         for (const Image* t : all) {
+            if (!t->image) continue;
             VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
             b.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
             b.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -627,7 +652,22 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         di.pImageMemoryBarriers = to_general.data();
         vkCmdPipelineBarrier2(cmd, &di);
         const VkClearColorValue zero{};
-        for (const Image* t : all) vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
+        for (const Image* t : all)
+            if (t->image) vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
+    } else if (g.output_needs_layout && g.output.image) {
+        g.output_needs_layout = false;
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = g.output.image;
+        b.subresourceRange = ALL_LEVELS;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &di);
     }
     if (!g.lut_uploaded) {
         g.lut_uploaded = true;
@@ -637,10 +677,13 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         copy.imageExtent = {128, 1, 1};
         vkCmdCopyBufferToImage(cmd, uniforms.binding.buffer, g.lanczos_lut.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     }
-    // Per frame: the nearest-depth scratch, the SPD counter and its mips; the history on a reset.
+    // Per frame: clear previous_nearest_depth (atomicMax target). When g.wave is true, both fsr3_luma_pyramid and
+    // fsr3_shading_change_pyramid auto-reset rw_spd_global_atomic to 0 in their last workgroup (cleared on first/reset only),
+    // saving 2 vkCmdClearColorImage + 2 barriers per frame.
     const VkClearColorValue zero{};
-    for (const Image* t : {&g.previous_nearest_depth, &g.spd_atomic, &g.spd_mips})
-        vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
+    vkCmdClearColorImage(cmd, g.previous_nearest_depth.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
+    if (!g.wave || reset)
+        vkCmdClearColorImage(cmd, g.spd_atomic.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
     if (reset) {
         vkCmdClearColorImage(cmd, g.accumulation[p].image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
         VkClearColorValue info{};
@@ -672,20 +715,19 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         {current_luma, tex(g.farthest_depth), tex(g.spd_atomic), tex(g.frame_info), mip(0), mip(1), mip(2), mip(3), mip(4),
          mip(5), tex(g.farthest_depth_mip1), cb_fsr, cb_spd},
         spd_x, spd_y);
-    // The two pyramid passes share one atomic counter, and the single-pass downsampler uses it to elect the workgroup that
-    // finishes the chain: it counts up to num_work_groups and the last one through does the tail. Cleared only once a frame,
-    // the second pass would start at the total, elect no workgroup, and the ones waiting on the tail would spin
-    memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                   VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    vkCmdClearColorImage(cmd, g.spd_atomic.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
-    memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                   VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    if (!g.wave) {
+        memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        vkCmdClearColorImage(cmd, g.spd_atomic.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
+        memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    }
     run(g.wave ? P_SHADING_CHANGE_PYRAMID : P_SHADING_CHANGE_PYRAMID_NOWAVE,
         {current_luma, tex(g.luma[q]), tex(g.dilated_motion_vectors), exposure, tex(g.spd_atomic), mip(0), mip(1), mip(2),
          mip(3), mip(4), mip(5), cb_fsr, cb_spd},
         spd_x, spd_y);
     run(P_SHADING_CHANGE, {tex(g.spd_mips), tex(g.shading_change), cb_fsr}, groups(rw / 2, 8), groups(rh / 2, 8));
-    run(P_PREPARE_REACTIVITY,
+    run(in.reactive ? P_PREPARE_REACTIVITY_MASK : P_PREPARE_REACTIVITY,
         {tex(g.previous_nearest_depth), tex(g.dilated_motion_vectors), tex(g.dilated_depth),
          in.reactive ? Resource{in.reactive} : tex(g.default_reactive),
          tex(g.default_reactive), tex(g.accumulation[p]), tex(g.shading_change), current_luma, exposure,
@@ -695,7 +737,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         {exposure, tex(g.dilated_reactive_masks), tex(g.dilated_motion_vectors), tex(g.frame_info), tex(g.luma_history[p]),
          tex(g.farthest_depth_mip1), current_luma, tex(g.luma_history[q]), tex(g.farthest_depth), cb_fsr},
         groups(rw, 8), groups(rh, 8));
-    run(P_ACCUMULATE,
+    run(in.square_output ? P_ACCUMULATE_SQ : P_ACCUMULATE,
         {exposure, tex(g.dilated_reactive_masks), tex(g.dilated_motion_vectors), tex(g.internal_upscaled[p]),
          tex(g.lanczos_lut), tex(g.farthest_depth_mip1), current_luma, tex(g.farthest_depth), color,
          tex(g.internal_upscaled[q]), in.output ? Resource{in.output} : tex(g.output), tex(g.new_locks), cb_fsr},
@@ -706,6 +748,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
 
 VkImage output_image() { return g.output.image; }
 VkImageView output_view() { return g.output.view; }
+VkImageView last_upscaled_view() { return g.internal_upscaled[g.parity].view; }
 
 } // namespace mkwvk::fsr3
 
@@ -824,7 +867,7 @@ int chain_prepare(VkCommandBuffer, uint32_t rw, uint32_t rh, uint32_t ow, uint32
     // (the passes' pipelines and images for these sizes, here and not in the evaluation: an image that cannot be made now
     // (VRAM full as the size changes) is "not this frame", and the next frame tries again, as fsr3_upscale's own path did)
     *in_w = rw, *in_h = rh;
-    const int r = fsr3::prepare_sizes(rw, rh, ow, oh);
+    const int r = fsr3::prepare_sizes(rw, rh, ow, oh, false);
     if (r == 0) *why = "its images could not be made at this size";
     if (r < 0) *why = "its passes could not be made";
     return r;
@@ -836,12 +879,17 @@ bool chain_evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
         logf("vk: fsr3 on the chain: the scene's projection is not one FSR takes");
         return false;
     }
-    if (!f.color.view || !f.depth.view || !f.motion.view || !f.output.image || f.output.format != VK_FORMAT_R16G16B16A16_SFLOAT)
+    const bool out_ok = f.output.format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                        (f.square_output && f.output.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    if (!f.color.view || !f.depth.view || !f.motion.view || !f.output.image || !out_ok)
         return false;
     const bool direct_out = f.output.view != VK_NULL_HANDLE && (f.output.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+    if (f.square_output && !direct_out) return false;
     fsr3::Inputs ai;
     ai.color = f.color.view, ai.depth = f.depth.view, ai.motion = f.motion.view;
     if (direct_out) ai.output = f.output.view;
+    ai.square_output = f.square_output;
+    ai.inputs_synced = true;
     ai.render_width = f.render_w, ai.render_height = f.render_h;
     ai.upscale_width = f.output.width, ai.upscale_height = f.output.height;
     ai.jitter[0] = f.jitter[0], ai.jitter[1] = f.jitter[1];

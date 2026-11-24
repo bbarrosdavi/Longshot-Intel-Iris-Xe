@@ -79,7 +79,9 @@
 #include "vk_fsr3.h"   // (fsr3_wanted: AMD FSR 3.1 upscales with inputs of its own; fsr3_engine: on this chain)
 #include "vk_fsr3_inputs.h"   // (longshot: take_motion, this chain's motion for FSR 3.1's frame interpolation)
 #include "vk_fsr3fi.h"        // (frames_wanted: that interpolation is asked for)
+#include "vk_framegen.h"      // (framegen_on for built-in MV framegen inputs when no upscaler engine runs)
 #include "vk_fsr4.h"
+#include "vk_reactive.h"      // (gate R11G11B10 s.color off when reactive mask binds it as rgba16f storage)
 #include "vk_xess.h"
 #include "xess_rules.h"
 #include "vk_menu.h"
@@ -91,6 +93,8 @@
 #include "shaders/dlss_out_comp_spv.h"
 #include "shaders/dlss_out_rgba_comp_spv.h"
 #include "shaders/dlss_prep_comp_spv.h"
+#include "shaders/dlss_prep_r11_comp_spv.h"
+#include "shaders/fg_mv_prep_comp_spv.h"
 #include "reshade/fx_runtime.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -219,6 +223,14 @@ struct State {
     VkDescriptorSetLayout prep_set = VK_NULL_HANDLE, out_set = VK_NULL_HANDLE;
     VkPipelineLayout prep_layout = VK_NULL_HANDLE, out_layout = VK_NULL_HANDLE;
     VkPipeline prep = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
+    VkDescriptorSetLayout prep_r11_set = VK_NULL_HANDLE;
+    VkPipelineLayout prep_r11_layout = VK_NULL_HANDLE;
+    VkPipeline prep_r11 = VK_NULL_HANDLE;
+    bool prep_r11_tried = false;
+    VkDescriptorSetLayout mv_prep_set = VK_NULL_HANDLE;
+    VkPipelineLayout mv_prep_layout = VK_NULL_HANDLE;
+    VkPipeline mv_prep = VK_NULL_HANDLE;
+    bool mv_prep_tried = false;
     // (dlss_prep.comp and dlss_out.comp again for an engine that takes HDR colour (TemporalEngine::hdr): linear light in,
     // not clamped to 1, and its linear picture out as it is)
     VkDescriptorSetLayout prep_hdr_set = VK_NULL_HANDLE, out_hdr_set = VK_NULL_HANDLE;
@@ -274,6 +286,7 @@ struct State {
     float fg_last_jitter[2]{};
     uint64_t fg_last_frame = 0;
     bool fg_told = false;
+    TemporalMotion last_mv{};   // (latest valid 3D camera+actor motion vector image for built-in FrameGen)
     // (actor motion: the skinned draws into the scene since the last upscale; the poses the engine last drew, by draw: the
     // frame before's, where they were copied to in one of the two pose buffers (each frame's poses go to the other one))
     struct Skin {
@@ -281,12 +294,15 @@ struct State {
         uint64_t key = 0;
         uint32_t nbones = 0;
         // (its pose as the draw saw it, read at the draw with ub_read: at this byte of pose_bytes, the origin (12 bytes, then
-        // 4 of padding), then the nbones bones. kNoPose: not read, and the pose is copied from the game's memory at the upscale
-        // as before)
+        // 4 of zeroed padding), then the nbones bones. kNoPose: not read, and the pose is copied from the game's memory at the
+        // upscale as before)
         static constexpr uint32_t kNoPose = UINT32_MAX;
         uint32_t pose = kNoPose;
+        float place[3]{};        // (precomputed while pose is L1-hot outside s.mu)
+        uint64_t h0 = 0, h1 = 0; // (128-bit lossless static-pose hash over origin + bones)
     };
     std::vector<Skin> skins;
+    std::unordered_map<uint64_t, int> skin_model_nth;   // (O(1) nth lookup per model, cleared when skins empty)
     // (the poses of skins read at their draws, one after another: one buffer kept from frame to frame, its room reused, in
     // place of an allocation of up to 13 KB a draw. Emptied when the first of a frame's skins is noted)
     std::vector<uint8_t> pose_bytes;
@@ -296,9 +312,27 @@ struct State {
         uint64_t frame = 0;
         bool placed = false;           // (read at the draw: its place is known here, and the next frame pairs by place)
         float place[3]{};              // (dlss_actor::place_of)
+        bool has_hash = false;         // (h0/h1 valid for static-pose draw culling)
+        uint64_t h0 = 0, h1 = 0;
     };
     std::unordered_map<uint64_t, Pose> poses;
     std::unordered_map<uint64_t, uint32_t> model_bones;   // (by model: the bones its vertices use, 0 when unreadable)
+    struct ModelCopies {
+        std::vector<dlss_actor::Placed> now, then;
+        std::vector<size_t> skin;    // (now's: its index in skins)
+        std::vector<uint64_t> key;   // (then's: its key)
+    };
+    // Reused actor_motion scratch containers (zero per-frame heap alloc/free churn).
+    std::vector<Skin> am_skins;
+    std::unordered_map<uint64_t, Pose> am_old_poses;
+    std::vector<dlss_actor::Push> am_draws;
+    std::vector<uint32_t> am_counts;
+    std::vector<VkBufferCopy> am_staged;
+    std::vector<uint64_t> am_pair_key;
+    std::vector<char> am_paired;
+    std::unordered_set<uint64_t> am_taken;
+    std::unordered_map<uint64_t, ModelCopies> am_models;
+    std::vector<uint64_t> am_used_models;
     struct PoseBuffer {
         VkBuffer buffer = VK_NULL_HANDLE;
         VmaAllocation memory = nullptr;
@@ -317,9 +351,9 @@ struct State {
     Upload pose_stages[6];      // (the poses read at the draws, staged for their copy into the pose buffer: a ring as the cameras')
     int pose_stage_at = 0;
     uint64_t actor_draws = 0, actor_frames = 0, actor_skipped = 0;
-    // (since the last status line: the poses taken as their draws read them, and those copied from the game's memory at the
-    // upscale instead (not read at the draw, or RX_VK_DLSS_ACTOR_LIVE=1))
-    uint64_t poses_read = 0, poses_copied = 0;
+    // (since the last status line: the poses taken as their draws read them, those copied from the game's memory at the
+    // upscale instead (not read at the draw, or RX_VK_DLSS_ACTOR_LIVE=1), and static-pose draws culled)
+    uint64_t poses_read = 0, poses_copied = 0, actor_static = 0;
     int64_t actor_ns = 0;       // (the CPU's time in it, since the last status line)
     uint64_t status_draws = 0, status_frames = 0;   // (actor_draws and _frames at the last status line: temporal_status)
     uint64_t status_drawn = 0, status_passed = 0;   // (since the last status line: frames an engine drew, and frames a network
@@ -477,6 +511,15 @@ bool make_pipelines() {
     const VkDescriptorType prep_types[5] = {S, S, I, I, I}, out_types[2] = {S, I};
     if (!s.prep && !make_pipeline(BUILTIN_SPV_ARGS(DLSS_PREP_COMP_SPV), prep_types, 5, 84, s.prep_set, s.prep_layout, s.prep))
         return false;
+    if (!s.prep_r11_tried) {
+        s.prep_r11_tried = true;
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &fp);
+        if ((fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) ==
+            (VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+            (void)make_pipeline(BUILTIN_SPV_ARGS(DLSS_PREP_R11_COMP_SPV), prep_types, 5, 84, s.prep_r11_set,
+                                s.prep_r11_layout, s.prep_r11);
+    }
     // (the HDR ones, for an engine that takes HDR colour. dlss_prep.comp squares the square-root encoded scene into linear
     // light (kSquare, its constant 1), what an HDR feature and its auto exposure are made for, and its ceiling (kColorMax,
     // constant 0) is 16384 in place of 1: the game's native HDR keeps its highlights, and a stray value stays well inside the
@@ -666,6 +709,27 @@ uint64_t device_address(const BufferRef& r) {
 
 constexpr uint64_t kPoseBytes = 4 << 20;   // (a pose buffer: 280 bones of 48 bytes are 13 KB a draw, 300 of them)
 
+// 128-bit lossless pose hash over origin [0..12) + zeroed pad [12..16) + nbones*48 bone matrices.
+// Identical origin + bones across consecutive frames produces bit-identical world positions -> dlss_prep.comp
+// already wrote exact camera-reprojected motion, so re-skinning and rasterizing in actor_motion() is skipped.
+inline void hash_pose_128(const uint8_t* data, uint32_t nbones, uint64_t& h0, uint64_t& h1) {
+    const size_t qwords = (16 + (size_t)nbones * 48) >> 3;   // always even: 2 + 6 * nbones
+    uint64_t a = 0x9e3779b97f4a7c15ull ^ ((uint64_t)nbones << 32);
+    uint64_t b = 0xbf58476d1ce4e5b9ull ^ (uint64_t)nbones;
+    for (size_t i = 0; i < qwords; i += 2) {
+        uint64_t w0, w1;
+        std::memcpy(&w0, data + i * 8, 8);
+        std::memcpy(&w1, data + (i + 1) * 8, 8);
+        a = (a ^ w0) * 0x94d049bb133111ebull;
+        a ^= a >> 31;
+        b = (b ^ w1) * 0xd6e8feb86659fd93ull;
+        b ^= b >> 29;
+        a += b;
+        b ^= a >> 17;
+    }
+    h0 = a, h1 = b;
+}
+
 /// The skinned draws into the scene (cam's depth) with a pose of the frame before (the engine's last), drawn into the motion
 /// image over the camera's motion. Each one's pose (bones and origin), as its draw read it (temporal_note_skinned_draw),
 /// else copied on the GPU from where the game has it, goes into this frame's pose buffer, for this frame and the next.
@@ -680,10 +744,13 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timed() { s.actor_ns += (std::chrono::steady_clock::now() - t0).count(); }
     } timed{s};
-    std::vector<State::Skin> skins = std::move(s.skins);
-    s.skins.clear();
-    std::unordered_map<uint64_t, State::Pose> old = std::move(s.poses);
-    s.poses.clear();
+    s.am_skins.clear();
+    s.am_skins.swap(s.skins);
+    s.skin_model_nth.clear();
+    s.am_old_poses.clear();
+    s.am_old_poses.swap(s.poses);
+    const auto& skins = s.am_skins;
+    const auto& old = s.am_old_poses;
     if (skins.empty() || !make_actor_pipeline()) return 0;
     for (auto& b : s.pose_buffers)
         if (!b.buffer) {
@@ -696,8 +763,10 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     const State::PoseBuffer& here = s.pose_buffers[s.pose_at];
     const State::PoseBuffer& there = s.pose_buffers[s.pose_at ^ 1];
     static const uint32_t tolerance = env_switch("RX_VK_DLSS_ACTOR_TOL") >= 0 ? (uint32_t)env_switch("RX_VK_DLSS_ACTOR_TOL") : 64;
-    std::vector<ActorPush> draws;
-    std::vector<uint32_t> counts;
+    auto& draws = s.am_draws;
+    auto& counts = s.am_counts;
+    auto& staged = s.am_staged;
+    draws.clear(), counts.clear(), staged.clear();
     // (the poses read at the draws go through a host-visible stage, copied into the pose buffer in one go after the loop: the
     // GPU's order as the copies from the game's memory had it, and no write into a buffer a frame in flight still reads)
     State::Upload& stage = s.pose_stages[s.pose_stage_at];
@@ -707,21 +776,6 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     if (any_read && !stage.buffer &&
         !create_buffer_cached(kPoseBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stage.buffer, stage.memory, &stage.map))
         stage = {};
-    std::vector<VkBufferCopy> staged;
-    // (which of the frame before's draws each of this frame's is. A draw with its pose read at the draw pairs by place (its
-    // origin plus its bones' mean translation: dlss_actor::place_of): all copies of its model at once, the nearest pairs
-    // first, or by draw order where that is as good, never further apart than the reach: dlss_actor::pair_by_place. Else
-    // the same n-th draw of the model as before.
-    // The reach is a speed, RX_VK_DLSS_ACTOR_REACH world units a second (default 60), times the time between the two poses,
-    // that time taken as 1/60 s at the least and 1/30 s at the most. It holds for a model drawn once (Link, Epona, a boss) too,
-    // since a lone copy can be another one (a Gossip Stone drawn by the other model the frame before: this model's only
-    // copy then is the next stone, 2.3 away), so it must not refuse an actor that really moved: as a distance a frame, a
-    // hitch or a low base frame rate (frame generation from 30 fps) took actors past it and they lost their motion for that
-    // frame, ghosting the ones that move most. 60 a second is 1 a frame at 60 fps, and some ten times a running Link (about
-    // 6 a second). The 1/30 s keeps the reach (2 at the default) under the stones' 2.3 after any gap: past it, draw order,
-    // which wins whenever it pairs more copies, pairs a whole row with its neighbours (each stone's frame before the next
-    // one's, once a stone changes model), and a lone stone takes its neighbour. The cost: across a gap longer than 1/30 s (a
-    // hitch, a base under 30 fps) an actor that moved more than 2 units keeps only the camera's motion for that frame)
     static const float speed = [] {
         const char* e = getenv("RX_VK_DLSS_ACTOR_REACH");
         if (!e || !*e) return 60.0f;
@@ -738,52 +792,93 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
                                : std::chrono::duration<double>(taken - s.poses_time).count();
     s.poses_time = taken;
     const float reach = speed * (float)std::clamp(between, 1.0 / 60.0, 1.0 / 30.0);
+    const double reach2 = (double)reach * (double)reach;
     const auto read_at_draw = [&](const State::Skin& k) {
         return k.pose != State::Skin::kNoPose && stage.map && (size_t)k.pose + 16 + (size_t)k.nbones * 48 <= s.pose_bytes.size();
     };
-    struct Copies {
-        std::vector<dlss_actor::Placed> now, then;
-        std::vector<size_t> skin;    // (now's: its index in skins)
-        std::vector<uint64_t> key;   // (then's: its key)
+    if (s.am_models.size() > 512) {
+        s.am_models.clear();
+        s.am_used_models.clear();
+    } else {
+        for (uint64_t mk : s.am_used_models) {
+            if (auto it = s.am_models.find(mk); it != s.am_models.end()) {
+                it->second.now.clear(), it->second.then.clear();
+                it->second.skin.clear(), it->second.key.clear();
+            }
+        }
+        s.am_used_models.clear();
+    }
+    const auto get_model = [&](uint64_t mk) -> State::ModelCopies& {
+        State::ModelCopies& c = s.am_models[mk];
+        if (c.now.empty() && c.then.empty()) s.am_used_models.push_back(mk);
+        return c;
     };
-    std::unordered_map<uint64_t, Copies> models;
     for (const auto& [key, p] : old)
         if (p.placed) {
-            Copies& c = models[key >> 8];
+            State::ModelCopies& c = get_model(key >> 8);
             c.then.push_back({{p.place[0], p.place[1], p.place[2]}, (int)(key & 0xff)});
             c.key.push_back(key);
         }
-    std::vector<float> places(skins.size() * 3, 0.0f);
     for (size_t i = 0; i < skins.size(); i++) {
         const State::Skin& k = skins[i];
         if (k.k.depth != cam.depth || !read_at_draw(k)) continue;
-        float* place = &places[i * 3];
-        dlss_actor::place_of(s.pose_bytes.data() + k.pose, k.nbones, place);
-        Copies& c = models[k.key >> 8];
-        c.now.push_back({{place[0], place[1], place[2]}, (int)(k.key & 0xff)});
+        State::ModelCopies& c = get_model(k.key >> 8);
+        c.now.push_back({{k.place[0], k.place[1], k.place[2]}, (int)(k.key & 0xff)});
         c.skin.push_back(i);
     }
-    std::vector<uint64_t> pair_key(skins.size(), 0);
-    std::vector<char> paired(skins.size(), 0);
-    std::unordered_set<uint64_t> taken_by_place;   // (the frame before's draws paired by place: not a fallback's by n-th too)
-    for (const auto& [model, c] : models) {
+    auto& pair_key = s.am_pair_key;
+    auto& paired = s.am_paired;
+    auto& taken_by_place = s.am_taken;
+    pair_key.assign(skins.size(), 0);
+    paired.assign(skins.size(), 0);
+    taken_by_place.clear();
+    for (uint64_t mk : s.am_used_models) {
+        const State::ModelCopies& c = s.am_models[mk];
         if (c.now.empty() || c.then.empty()) continue;
+        // Allocation-free 1v1 fast path (~80% of Market models): exact equivalent of pair_by_place.
+        if (c.now.size() == 1 && c.then.size() == 1) {
+            const double dx = (double)c.now[0].place[0] - (double)c.then[0].place[0];
+            const double dy = (double)c.now[0].place[1] - (double)c.then[0].place[1];
+            const double dz = (double)c.now[0].place[2] - (double)c.then[0].place[2];
+            const double d2 = dx * dx + dy * dy + dz * dz;
+            if (std::isfinite(d2) && d2 <= reach2) {
+                pair_key[c.skin[0]] = c.key[0], paired[c.skin[0]] = 1, taken_by_place.insert(c.key[0]);
+            }
+            continue;
+        }
         const std::vector<int> pairs = dlss_actor::pair_by_place(c.now, c.then, reach);
         for (size_t a = 0; a < pairs.size(); a++)
             if (pairs[a] >= 0)
                 pair_key[c.skin[a]] = c.key[pairs[a]], paired[c.skin[a]] = 1, taken_by_place.insert(c.key[pairs[a]]);
     }
+    // Per-frame stack BDA cache: eliminates ~300 vkGetBufferDeviceAddress driver calls/frame.
+    std::pair<VkBuffer, uint64_t> bda_cache[16];
+    int bda_n = 0;
+    const auto cached_bda = [&](const BufferRef& r) -> uint64_t {
+        if (!r) return 0;
+        for (int b = 0; b < bda_n; b++)
+            if (bda_cache[b].first == r.buffer) return bda_cache[b].second ? bda_cache[b].second + r.offset : 0;
+        VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        da.buffer = r.buffer;
+        const VkDeviceAddress base = vkGetBufferDeviceAddress(dev.device, &da);
+        if (bda_n < 16) bda_cache[bda_n++] = {r.buffer, base};
+        return base ? base + r.offset : 0;
+    };
     uint32_t at = 0;
+    uint32_t culled = 0;
     for (size_t i = 0; i < skins.size(); i++) {
         const State::Skin& k = skins[i];
         if (k.k.depth != cam.depth) continue;
         const uint32_t bytes = 16 + k.nbones * 48;
         if (at + bytes > kPoseBytes) break;
         const bool placed = read_at_draw(k);
-        const float* place = &places[i * 3];
         if (placed) {
             std::memcpy((uint8_t*)stage.map + at, s.pose_bytes.data() + k.pose, bytes);
-            staged.push_back({at, at, bytes});
+            if (!staged.empty() && staged.back().srcOffset + staged.back().size == at &&
+                staged.back().dstOffset + staged.back().size == at)
+                staged.back().size += bytes;
+            else
+                staged.push_back({at, at, bytes});
             s.poses_read++;
         } else {
             // (this frame's pose, from where the game has it now: its bones, then its origin at the object's 0x40)
@@ -799,14 +894,14 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
             s.poses_copied++;
         }
         State::Pose& kept = s.poses[k.key];
-        kept = {at, k.nbones, now, placed, {place[0], place[1], place[2]}};
+        kept = {at, k.nbones, now, placed, {k.place[0], k.place[1], k.place[2]}, placed, k.h0, k.h1};
         const uint32_t mine = at;
         at += (bytes + 15) & ~15u;
         // (the frame before's draw it pairs with: by place (above) when that frame's copies of its model were read at their
         // draws too, else its n-th, as before, unless that one is already another draw's by place)
         auto it = old.end();
-        const auto m = placed ? models.find(k.key >> 8) : models.end();
-        if (m == models.end() || m->second.then.empty()) {
+        const auto m = placed ? s.am_models.find(k.key >> 8) : s.am_models.end();
+        if (m == s.am_models.end() || m->second.then.empty()) {
             if (!taken_by_place.count(k.key)) it = old.find(k.key);
         } else if (paired[i]) {
             it = old.find(pair_key[i]);
@@ -815,9 +910,15 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
             s.actor_skipped++;
             continue;
         }
+        // Lossless static-pose draw culling: pose already saved in here.buffer for next frame,
+        // and dlss_prep/fg_mv_prep already wrote exact camera-reprojected motion for stationary meshes.
+        if (placed && it->second.has_hash && k.h0 == it->second.h0 && k.h1 == it->second.h1) {
+            culled++, s.actor_static++;
+            continue;
+        }
         // (the vertices and indices where the game has them: its buffers as this recording binds them)
-        const uint64_t va = device_address(gpu_buffer_bind(k.k.vbuf, k.k.vsize, false));
-        const uint64_t ia = device_address(gpu_buffer_bind(k.k.ibuf, (uint64_t)k.k.count << k.k.itype, false));
+        const uint64_t va = cached_bda(gpu_buffer_bind(k.k.vbuf, k.k.vsize, false));
+        const uint64_t ia = cached_bda(gpu_buffer_bind(k.k.ibuf, (uint64_t)k.k.count << k.k.itype, false));
         if (!va || !ia || va % 4 || k.k.count <= 0 || k.k.itype < 0 || k.k.itype > 2) {
             s.actor_skipped++;
             continue;
@@ -841,7 +942,10 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
         vkCmdCopyBuffer(cmd, stage.buffer, here.buffer, (uint32_t)staged.size(), staged.data());
     }
     s.pose_at ^= 1;
-    if (draws.empty()) return 0;
+    if (draws.empty()) {
+        if (culled) s.actor_frames++;
+        return 0;
+    }
     // (the cameras: this frame's as drawn, the frame before's without its jitter, the jitter, the render size)
     State::Upload& u = s.uploads[s.upload_at];
     s.upload_at = (s.upload_at + 1) % (int)(sizeof s.uploads / sizeof s.uploads[0]);
@@ -931,7 +1035,10 @@ void drop_all() {
                 later([gone] { destroy_buffer(gone.buffer, gone.memory); });
                 u = {};
             }
-    s.poses.clear(), s.skins.clear(), s.model_bones.clear();
+    s.poses.clear(), s.skins.clear(), s.skin_model_nth.clear(), s.model_bones.clear();
+    s.am_skins.clear(), s.am_old_poses.clear(), s.am_draws.clear(), s.am_counts.clear();
+    s.am_staged.clear(), s.am_pair_key.clear(), s.am_paired.clear(), s.am_taken.clear();
+    s.am_models.clear(), s.am_used_models.clear();
     s.pose_bytes = {}, s.poses_time = {};
     for (auto* views : {&s.depth_views, &s.color_views})   // (longshot: the scene's colour views too)
         if (!views->empty()) {
@@ -1055,13 +1162,14 @@ int temporal_status(char* b, size_t n) {
     char pre[64] = "";   // (longshot: DLAA before the game's bloom and tone map, temporal_pre_bloom)
     if (s.status_pre) snprintf(pre, sizeof pre, " (%llu before the bloom)", (unsigned long long)s.status_pre);
     snprintf(b, n, "; %s: %llu frames drawn%s%s, %llu made, jitter %+.3f %+.3f px%s, actor motion %llu draws in %llu "
-             "frames (%.3f ms CPU a frame; poses %llu read at the draw, %llu copied later), its images %llu MB%s",
+             "frames (%.3f ms CPU a frame; poses %llu read at the draw, %llu copied later, %llu static culled), its images %llu MB%s",
              name_of(mode), (unsigned long long)s.status_drawn, pre, passed, (unsigned long long)s.engines_made,
              s.status_jitter[0], s.status_jitter[1], s.status_motion ? "" : " (no motion)",
              (unsigned long long)draws, (unsigned long long)frames, frames ? s.actor_ns / 1e6 / (double)frames : 0.0,
-             (unsigned long long)s.poses_read, (unsigned long long)s.poses_copied, (unsigned long long)(own >> 20), feature);
+             (unsigned long long)s.poses_read, (unsigned long long)s.poses_copied, (unsigned long long)s.actor_static,
+             (unsigned long long)(own >> 20), feature);
     s.status_draws = s.actor_draws, s.status_frames = s.actor_frames, s.actor_ns = 0, s.status_drawn = s.status_passed = s.status_pre = 0;
-    s.poses_read = s.poses_copied = 0;
+    s.poses_read = s.poses_copied = s.actor_static = 0;
     return mode;
 }
 
@@ -1278,6 +1386,7 @@ void temporal_note_skinned_draw(const SkinnedDraw& k) {
     // by that thread, and the wait would count it twice. Added under the lock)
     int64_t waited = 0;
     const auto take = [&] {
+        if (s.mu.try_lock()) return;   // zero clock syscalls on uncontended lock
         const std::chrono::steady_clock::time_point w = std::chrono::steady_clock::now();
         s.mu.lock();
         waited += (std::chrono::steady_clock::now() - w).count();
@@ -1310,24 +1419,38 @@ void temporal_note_skinned_draw(const SkinnedDraw& k) {
     static const bool live = env_switch("RX_VK_DLSS_ACTOR_LIVE") == 1;
     thread_local std::vector<uint8_t> pose;
     bool read = false;
+    float place[3]{};
+    uint64_t h0 = 0, h1 = 0;
+    const size_t pbytes = 16 + (size_t)nbones * 48;
     if (!live) {
-        pose.resize(16 + (size_t)nbones * 48);
+        pose.resize(pbytes);
         read = ub_read(k.object + 0x40, pose.data(), 12) && ub_read(k.bones, pose.data() + 16, (uint64_t)nbones * 48);
+        if (read) {
+            // Zero padding [12..15] and compute place + 128-bit static-pose hash outside s.mu while L1-hot.
+            uint32_t z = 0;
+            std::memcpy(pose.data() + 12, &z, 4);
+            dlss_actor::place_of(pose.data(), nbones, place);
+            hash_pose_128(pose.data(), nbones, h0, h1);
+        }
     }
     take();
     std::lock_guard lk(s.mu, std::adopt_lock);
     if (s.skins.size() >= 512) s.skins.clear();   // (no upscale for a while: what was kept is stale)
-    if (s.skins.empty()) s.pose_bytes.clear();    // (a frame's first: the poses read before are gone with their skins)
+    if (s.skins.empty()) s.pose_bytes.clear(), s.skin_model_nth.clear();
     State::Skin d;
     d.k = k;
     d.nbones = nbones;
     if (read) {
-        d.pose = (uint32_t)s.pose_bytes.size();
-        s.pose_bytes.insert(s.pose_bytes.end(), pose.begin(), pose.end());
+        const size_t off = s.pose_bytes.size();
+        d.pose = (uint32_t)off;
+        s.pose_bytes.resize(off + pbytes);
+        std::memcpy(s.pose_bytes.data() + off, pose.data(), pbytes);
+        d.place[0] = place[0], d.place[1] = place[1], d.place[2] = place[2];
+        d.h0 = h0, d.h1 = h1;
     }
-    int nth = 0;   // (the same model drawn twice in a frame: the n-th draw of it is the n-th the frame before)
-    for (const auto& o : s.skins) nth += dlss_actor::same_model(o.key, model);
-    d.key = dlss_actor::key(k.vbuf, k.ibuf, k.count, k.base_vertex, k.program, nth);
+    // O(1) nth lookup per model (replaces O(N^2) scan over s.skins) and reuse model hash prefix.
+    const int nth = s.skin_model_nth[model >> 8]++;
+    d.key = (model & ~0xffull) | (uint64_t)std::clamp(nth, 0, 255);
     s.skins.push_back(std::move(d));
     spent();
 }
@@ -1443,7 +1566,16 @@ void fg_inputs(VkCommandBuffer cmd, bool known, Texture* in, VkImageView in_view
         ~Disturbed() { descriptors_disturbed(); }
     } disturbed;
     const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh) ||
+    const bool for_fsr3fi = fsr3fi::frames_wanted() != 0;
+    if (!for_fsr3fi && !s.mv_prep_tried) {
+        s.mv_prep_tried = true;
+        const VkDescriptorType mv_types[3] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+        (void)make_pipeline(BUILTIN_SPV_ARGS(FG_MV_PREP_COMP_SPV), mv_types, 3, 84, s.mv_prep_set, s.mv_prep_layout,
+                            s.mv_prep);
+    }
+    const bool lean_mv = !for_fsr3fi && s.mv_prep != VK_NULL_HANDLE;
+    if ((!lean_mv && !make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh)) ||
         !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, rw, rh, copied) ||
         !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied))
         return;
@@ -1470,7 +1602,26 @@ void fg_inputs(VkCommandBuffer cmd, bool known, Texture* in, VkImageView in_view
     // (without a frame before to move from the motion is zero and not handed over, FSR's own inputs this frame; the skinned
     // draws are drawn all the same, as their poses are the next frame's frame before)
     full_barrier(cmd);   // (the scene's colour and depth, written before)
-    {
+    if (lean_mv) {
+        const VkDescriptorImageInfo info[3] = {{s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, s.depth.view, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, s.motion.view, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet w[3]{};
+        for (uint32_t i = 0; i < 3; i++) {
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[i].dstBinding = i, w[i].descriptorCount = 1, w[i].pImageInfo = &info[i];
+            w[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.mv_prep);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.mv_prep_layout, 0, 3, w);
+        vkCmdPushConstants(cmd, s.mv_prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
+        stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    } else {
         const VkDescriptorImageInfo info[5] = {{s.point, in_view, VK_IMAGE_LAYOUT_GENERAL},
                                                {s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, s.color.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -1486,11 +1637,26 @@ void fg_inputs(VkCommandBuffer cmd, bool known, Texture* in, VkImageView in_view
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep_layout, 0, 5, w);
         vkCmdPushConstants(cmd, s.prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
+        full_barrier(cmd);
     }
-    full_barrier(cmd);
     const int actors = actor_motion(cmd, cam, previous, rw, rh, dview, motion, fg_last);
-    if (actors) full_barrier(cmd);
-    const bool taken = motion && fsr3_inputs::take_motion(cmd, s.motion.image, rw, rh);
+    if (actors) {
+        if (lean_mv)
+            stage_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+        else
+            full_barrier(cmd);
+    }
+    s.last_mv = {};
+    s.last_mv.view = motion ? s.motion.view : VK_NULL_HANDLE;
+    s.last_mv.depth_view = motion ? s.depth.view : VK_NULL_HANDLE;
+    s.last_mv.render_w = rw, s.last_mv.render_h = rh;
+    s.last_mv.tex_w = s.motion.width, s.last_mv.tex_h = s.motion.height;
+    s.last_mv.depth_reversed = false;
+    s.last_mv.reset = !motion;
+    s.last_mv.frame = now;
+    const bool taken = for_fsr3fi && motion && fsr3_inputs::take_motion(cmd, s.motion.image, rw, rh);
     if (!s.fg_told && taken) {
         s.fg_told = true;
         logf("vk: frame generation: the chain's motion (the skinned draws' own in it: %d this frame) for AMD FSR 3.1, "
@@ -1644,13 +1810,21 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
     // of its own. A frame that moves it from one to the other starts a new one
     if (s.pre_last != pre) s.pre_last = pre, s.last_frame = 0;
     if (ready == 2) s.engines_made++, s.last_frame = 0;   // (made just now: a new history)
+    // (an engine made for HDR colour, as prepare made it this frame: the game's native HDR goes past 1, and the LDR pass's
+    // clamp cut every highlight at the paper white, a flat picture. It is given linear light and gives it back: the HDR pair)
+    const bool hdr = engine.e->hdr && engine.e->hdr();
+    const bool use_r11 = !pre && mode == ur::FSR3 && !hdr && !rgba && !reactive::wanted() &&
+                         in->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && s.prep_r11;
+    const bool direct_fsr_sq = !pre && mode == ur::FSR3 && !hdr && !rgba && !native && out_level == 0 && dw == ow &&
+                               dh == oh && out_view && out->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+                               (out->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
     // (NVIDIA DLSS Frame Generation through NGX copies the depth and the motion each frame, vk_dlss.cpp dlss_fg_inputs: a
     // transfer's source too, always, so the Frame generation by row can turn it on at any time)
     const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih) ||
+    if (!make_image(cmd, s.color, use_r11 ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih) ||
         !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, iw, ih, copied) ||
         !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, iw, ih, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied) ||
-        !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh, VK_IMAGE_USAGE_TRANSFER_DST_BIT))   // (FSR 3.1 copies in)
+        (!direct_fsr_sq && !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh, VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
         return no("its images were not made");
 
     // (longshot) the projection without this frame's jitter, for an engine that makes its depth constants from it (FSR 3.1), and
@@ -1685,15 +1859,12 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
     pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
     pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
     pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (fsr_flip ? 8 : 0);
-    // (an engine made for HDR colour, as prepare made it this frame: the game's native HDR goes past 1, and the LDR pass's
-    // clamp cut every highlight at the paper white, a flat picture. It is given linear light and gives it back: the HDR pair)
-    const bool hdr = engine.e->hdr && engine.e->hdr();
     // The network receives perceptual colour after the scene pass: decode it even when its storage is RGBA16F.
     if (rgba && !make_rgba_output()) return no("the RGBA16F output shader was not made");
     // (longshot) the scene before its tone map is linear light already: taken as it is (prep_lin), and given back as it is
-    const VkPipeline prep_pipe = pre ? s.prep_lin : hdr ? s.prep_hdr : s.prep;
+    const VkPipeline prep_pipe = pre ? s.prep_lin : hdr ? s.prep_hdr : use_r11 ? s.prep_r11 : s.prep;
     const VkPipeline out_pipe = rgba ? s.out_rgba : hdr ? s.out_hdr : s.out;
-    const VkPipelineLayout prep_layout = pre ? s.prep_lin_layout : hdr ? s.prep_hdr_layout : s.prep_layout;
+    const VkPipelineLayout prep_layout = pre ? s.prep_lin_layout : hdr ? s.prep_hdr_layout : use_r11 ? s.prep_r11_layout : s.prep_layout;
     const VkPipelineLayout out_layout = rgba ? s.out_rgba_layout : hdr ? s.out_hdr_layout : s.out_layout;
 
     const auto prep = [&] {
@@ -1739,7 +1910,9 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
     TemporalFrame f;
-    f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
+    f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown();
+    f.output = direct_fsr_sq ? TemporalImage{out->image, out_view, out->format, ow, oh, out->usage} : s.output.shown();
+    f.square_output = direct_fsr_sq;
     f.render_w = rw, f.render_h = rh;
     // (the jitter in render pixels, x right and y down)
     dlss_math::jitter_to_pixels(cam.jitter, rw, rh, f.jitter);
@@ -1762,7 +1935,8 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
         engine.failed = true;
         return false;   // (the network writes its output over whatever the evaluation did)
     }
-    {
+    // When direct_fsr_sq is active, P_ACCUMULATE_SQ already squared directly into out_view and issued its barrier.
+    if (!direct_fsr_sq) {
         const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
         const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
@@ -1782,6 +1956,31 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
     // (longshot) and AMD FSR 3.1's frame interpolation: this motion, the skinned draws' own in it, over the camera's alone that
     // its own inputs made at this dispatch (vk_fsr3_inputs.h take_motion). Nothing unless it is asked for
     if (motion && fsr3fi::frames_wanted()) (void)fsr3_inputs::take_motion(cmd, f.motion.image, rw, rh);
+    if (!pre) {
+        s.last_mv = {};
+        s.last_mv.view = (motion && !reset) ? s.motion.view : VK_NULL_HANDLE;
+        s.last_mv.depth_view = (motion && !reset) ? s.depth.view : VK_NULL_HANDLE;
+        s.last_mv.render_w = rw, s.last_mv.render_h = rh;
+        s.last_mv.tex_w = s.motion.width, s.last_mv.tex_h = s.motion.height;
+        s.last_mv.depth_reversed = fsr_flip;
+        s.last_mv.reset = !motion || reset;
+        s.last_mv.frame = now;
+        const VkImageView hud_before = direct_fsr_sq ? fsr3::last_upscaled_view() : s.output.view;
+        if (!native && out_level == 0 && dw == ow && dh == oh && out->image &&
+            out->samples == VK_SAMPLE_COUNT_1_BIT && out->type == VK_IMAGE_TYPE_2D &&
+            (out->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && hud_before) {
+            if (const VkImageView aview = color_view(out)) {
+                s.last_mv.hud_before_view = hud_before;
+                s.last_mv.hud_after_view = aview;
+                s.last_mv.hud_after_image = out->image;
+                s.last_mv.hud_after_tex = out;
+                s.last_mv.hud_after_gpu = out->gpu;
+                s.last_mv.hud_after_gen = s.color_views_gen;
+                s.last_mv.hud_w = ow, s.last_mv.hud_h = oh;
+                s.last_mv.hud_square = !hdr && !rgba;
+            }
+        }
+    }
     s.last_frame = now;
     s.drawn_mode = draw_mode;
     s.last_jitter[0] = cam.jitter[0], s.last_jitter[1] = cam.jitter[1];
@@ -1815,7 +2014,142 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
 }
 }  // namespace
 
-bool temporal_fg_inputs() { return temporal_mode() == ur::GAME && fsr3fi::frames_wanted() != 0; }
+bool temporal_fg_inputs() {
+    static const bool mv_off = env_on("RX_VK_FG_NO_MV");
+    return temporal_mode() == ur::GAME && (fsr3fi::frames_wanted() != 0 || (!mv_off && framegen_on()));
+}
+
+void temporal_prepare_fg_motion(VkCommandBuffer cmd, uint32_t out_w, uint32_t out_h) {
+    if (!cmd || !temporal_fg_inputs()) return;
+    State& s = st();
+    if (out_w && out_h && !s.out_w.load(std::memory_order_relaxed)) {
+        s.out_w.store(out_w, std::memory_order_relaxed);
+        s.out_h.store(out_h, std::memory_order_relaxed);
+    }
+    std::lock_guard lk(s.mu);
+    const uint64_t now = texture_frame_no();
+    if (s.last_mv.frame == now) return;   // already produced by temporal_upscale() / fg_inputs() this frame
+    const Camera cam = s.cam;
+    if (!cam.valid || now - cam.frame > 1 || !cam.depth || cam.depth_gen != texture_destroy_generation() ||
+        !temporal_scene_format(cam.scene_format))
+        return;
+    const uint32_t rw = cam.width, rh = cam.height;
+    if (!rw || !rh || cam.depth->width != rw || cam.depth->height != rh ||
+        !(cam.depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || cam.depth->samples != VK_SAMPLE_COUNT_1_BIT ||
+        !(cam.depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
+        return;
+    s.cam.valid = false;
+    struct SkinsDone {
+        State& s;
+        ~SkinsDone() { s.skins.clear(); }
+    } skins_done{s};
+    if (!make_pipelines()) return;
+    const VkImageView dview = depth_view(cam.depth);
+    if (!dview) return;
+    free_dead(false);
+    s.asked = now, s.holding = true;
+    struct Disturbed {
+        ~Disturbed() { descriptors_disturbed(); }
+    } disturbed;
+    if (!s.mv_prep_tried) {
+        s.mv_prep_tried = true;
+        const VkDescriptorType mv_types[3] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+        (void)make_pipeline(BUILTIN_SPV_ARGS(FG_MV_PREP_COMP_SPV), mv_types, 3, 84, s.mv_prep_set, s.mv_prep_layout,
+                            s.mv_prep);
+    }
+    if (s.mv_prep == VK_NULL_HANDLE) return;
+    const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (!make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, rw, rh, copied) ||
+        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied))
+        return;
+    float previous[16];
+    std::memcpy(previous, s.fg_last_vp, sizeof previous);
+    dlss_math::unjitter(previous, s.fg_last_jitter);
+    struct {
+        float reproject[16];
+        float jitter[2];
+        int32_t size[2];
+        int32_t flags;
+    } pc{};
+    const bool history = s.fg_last_frame && now - s.fg_last_frame <= 2;
+    const bool motion = history && dlss_math::reprojection(cam.current, previous, pc.reproject);
+    pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
+    pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
+    pc.flags = motion ? 1 : 0;
+    const uint64_t fg_last = s.fg_last_frame;
+    s.fg_last_frame = now;
+    std::memcpy(s.fg_last_vp, cam.current, sizeof s.fg_last_vp);
+    s.fg_last_jitter[0] = cam.jitter[0], s.fg_last_jitter[1] = cam.jitter[1];
+    full_barrier(cmd);
+    const VkDescriptorImageInfo info[3] = {{s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, s.depth.view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, s.motion.view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[3]{};
+    for (uint32_t i = 0; i < 3; i++) {
+        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstBinding = i, w[i].descriptorCount = 1, w[i].pImageInfo = &info[i];
+        w[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.mv_prep);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.mv_prep_layout, 0, 3, w);
+    vkCmdPushConstants(cmd, s.mv_prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
+    stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                      VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    (void)actor_motion(cmd, cam, previous, rw, rh, dview, motion, fg_last);
+    stage_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
+    s.last_mv = {};
+    s.last_mv.view = motion ? s.motion.view : VK_NULL_HANDLE;
+    s.last_mv.depth_view = motion ? s.depth.view : VK_NULL_HANDLE;
+    s.last_mv.render_w = rw, s.last_mv.render_h = rh;
+    s.last_mv.tex_w = s.motion.width, s.last_mv.tex_h = s.motion.height;
+    s.last_mv.depth_reversed = false;
+    s.last_mv.reset = !motion;
+    s.last_mv.frame = now;
+}
+
+bool temporal_last_motion(TemporalMotion& out) {
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    const uint64_t now = texture_frame_no();
+    out = {};
+    if (!s.last_mv.frame || now - s.last_mv.frame > 1) return false;
+    // Populate exact HUD views even on a reset/first frame so fg_copy_hud marks fg.frames[prev].a immediately.
+    const VkImageView fsr_before = fsr3::last_upscaled_view();
+    const bool before_ok = (s.output.view && s.last_mv.hud_before_view == s.output.view) ||
+                           (fsr_before && s.last_mv.hud_before_view == fsr_before);
+    if (before_ok && s.last_mv.hud_after_view) {
+        out.hud_before_view = s.last_mv.hud_before_view;
+        out.hud_after_view = s.last_mv.hud_after_view;
+        out.hud_after_image = s.last_mv.hud_after_image;
+        out.hud_after_tex = s.last_mv.hud_after_tex;
+        out.hud_after_gpu = s.last_mv.hud_after_gpu;
+        out.hud_after_gen = s.last_mv.hud_after_gen;
+        out.hud_w = s.last_mv.hud_w;
+        out.hud_h = s.last_mv.hud_h;
+        out.hud_square = s.last_mv.hud_square;
+    }
+    out.reset = s.last_mv.reset;
+    out.frame = s.last_mv.frame;
+    if (s.last_mv.reset || !s.motion.view || s.last_mv.view != s.motion.view ||
+        !s.depth.view || s.last_mv.depth_view != s.depth.view || !s.last_mv.render_w || !s.last_mv.render_h)
+        return false;
+    out.view = s.last_mv.view;
+    out.depth_view = s.last_mv.depth_view;
+    out.render_w = s.last_mv.render_w;
+    out.render_h = s.last_mv.render_h;
+    out.tex_w = s.last_mv.tex_w;
+    out.tex_h = s.last_mv.tex_h;
+    out.depth_reversed = s.last_mv.depth_reversed;
+    return true;
+}
 
 bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImageView in_view, Texture* out,
                       VkImageView out_view, uint32_t out_level) {
