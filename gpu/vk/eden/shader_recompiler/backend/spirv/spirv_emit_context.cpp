@@ -1203,6 +1203,14 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // passes 53caac5f, b6122162 at a save's load)
     // (longshot) where an address's entry is in the table: inside one of its windows (page_table_census.h kPageWindows), its page
     // numbered after the windows before it
+    constexpr bool kFast32Windows =
+        kGuestPagesBase == 0x1000000000ull && kGuestPagesBytes == (8ull << 30) &&
+        kGuestPagesBase2 == 0x7c00000000ull && kGuestPagesBytes2 == (16ull << 30) &&
+        kGuestPagesBase3 == 0x10000000000ull && kGuestPagesBytes3 == (4ull << 30);
+    static const bool fast_page_table_32 = [] {
+        const char* e = getenv("RX_VK_GP_FAST32");
+        return !e || atoi(e) != 0;
+    }();
     const auto table_window = [&](Id addr) {
         const Id offset_a{OpISub(U64, addr, Constant(U64, u64{kGuestPagesBase}))};
         const Id offset_b{OpISub(U64, addr, Constant(U64, u64{kGuestPagesBase2}))};
@@ -1222,6 +1230,41 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                            ? OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
                                                        Const(guest_pages_member_index)))
                            : Constant(U64, u64{0})};   // (pushed: the table's device address, 0 for none)
+        if (kFast32Windows && fast_page_table_32) {
+            // (opt/iris-xe) Bit-identical 32-bit window check + index arithmetic: avoids ~15 emulated 64-bit integer ops on Intel Gen12.
+            const Id addr_lo{OpUConvert(U32[1], addr)};
+            const Id addr_hi{OpUConvert(U32[1], OpShiftRightLogical(U64, addr, Const(32U)))};
+            const Id in_a{OpIEqual(U1, OpBitwiseAnd(U32[1], addr_hi, Const(0xfffffffeU)), Const(0x10U))};
+            const Id in_b{OpIEqual(U1, OpBitwiseAnd(U32[1], addr_hi, Const(0xfffffffcU)), Const(0x7cU))};
+            const Id in_c{OpIEqual(U1, addr_hi, Const(0x100U))};
+            const Id in_window{OpLogicalOr(U1, in_a, OpLogicalOr(U1, in_b, in_c))};
+            const Id pgoff32{OpBitwiseAnd(U32[1], addr_lo, Const(0xfffU))};
+            const Id fits{OpULessThanEqual(U1, pgoff32, Const(0x1000U - size))};
+            const Id inside{OpLogicalAnd(U1, OpLogicalAnd(U1, in_window, OpINotEqual(U1, table, Constant(U64, u64{0}))), fits)};
+            const Id then_label{OpLabel()};
+            const Id else_label{OpLabel()};
+            OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
+            OpBranchConditional(inside, then_label, else_label);
+            AddLabel(then_label);
+            const Id pgoff_pg{OpShiftRightLogical(U32[1], addr_lo, Const(12U))};
+            const Id idx_a{OpBitwiseOr(U32[1], OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], addr_hi, Const(1U)), Const(20U)), pgoff_pg)};
+            const Id idx_b{OpBitwiseOr(U32[1], OpShiftLeftLogical(U32[1], OpISub(U32[1], addr_hi, Const(0x7aU)), Const(20U)), pgoff_pg)};
+            const Id idx_c{OpBitwiseOr(U32[1], Const(0x600000U), pgoff_pg)};
+            const Id idx32{OpSelect(U32[1], in_a, idx_a, OpSelect(U32[1], in_b, idx_b, idx_c))};
+            const Id slot{OpIAdd(U64, table, OpUConvert(U64, OpShiftLeftLogical(U32[1], idx32, Const(3U))))};
+            const Id page{psb_load(U64, slot, 8U)};
+            const Id mapped{OpINotEqual(U1, page, Constant(U64, u64{0}))};
+            const Id hit_label{OpLabel()};
+            const Id miss_label{OpLabel()};
+            OpSelectionMerge(miss_label, spv::SelectionControlMask::MaskNone);
+            OpBranchConditional(mapped, hit_label, miss_label);
+            AddLabel(hit_label);
+            hit(OpIAdd(U64, page, OpUConvert(U64, pgoff32)));
+            AddLabel(miss_label);
+            OpBranch(else_label);
+            AddLabel(else_label);
+            return;
+        }
         const auto [in_window, page_index] = table_window(addr);
         const Id fits{OpULessThanEqual(U1, OpBitwiseAnd(U64, addr, Constant(U64, u64{0xfff})), Constant(U64, u64{0x1000 - size}))};
         const Id inside{OpLogicalAnd(U1, OpLogicalAnd(U1, in_window, OpINotEqual(U1, table, Constant(U64, u64{0}))), fits)};
@@ -1503,6 +1546,28 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         const Id table{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
                                                  Const(guest_pages_member_index)))};
         const Id u64_zero{Constant(U64, u64{0})};
+        if (kFast32Windows && fast_page_table_32) {
+            // (opt/iris-xe) Bit-identical 32-bit window check + index arithmetic for Intel Gen12: eliminates ~15 64-bit integer ops/load.
+            const Id addr_lo{OpUConvert(U32[1], addr)};
+            const Id addr_hi{OpUConvert(U32[1], OpShiftRightLogical(U64, addr, Const(32U)))};
+            const Id in_a{OpIEqual(U1, OpBitwiseAnd(U32[1], addr_hi, Const(0xfffffffeU)), Const(0x10U))};
+            const Id in_b{OpIEqual(U1, OpBitwiseAnd(U32[1], addr_hi, Const(0xfffffffcU)), Const(0x7cU))};
+            const Id in_c{OpIEqual(U1, addr_hi, Const(0x100U))};
+            const Id in_window{OpLogicalOr(U1, in_a, OpLogicalOr(U1, in_b, in_c))};
+            const Id inside{OpLogicalAnd(U1, in_window, OpINotEqual(U1, table, u64_zero))};
+            const Id pgoff_pg{OpShiftRightLogical(U32[1], addr_lo, Const(12U))};
+            const Id idx_a{OpBitwiseOr(U32[1], OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], addr_hi, Const(1U)), Const(20U)), pgoff_pg)};
+            const Id idx_b{OpBitwiseOr(U32[1], OpShiftLeftLogical(U32[1], OpISub(U32[1], addr_hi, Const(0x7aU)), Const(20U)), pgoff_pg)};
+            const Id idx_c{OpBitwiseOr(U32[1], Const(0x600000U), pgoff_pg)};
+            const Id idx32{OpSelect(U32[1], in_a, idx_a, OpSelect(U32[1], in_b, idx_b, idx_c))};
+            const Id off32{OpSelect(U32[1], inside, OpShiftLeftLogical(U32[1], idx32, Const(3U)), Const(0U))};
+            const Id slot{OpIAdd(U64, table, OpUConvert(U64, off32))};
+            const Id page{psb_load(U64, slot, 8U)};
+            const Id mapped{OpLogicalAnd(U1, inside, OpINotEqual(U1, page, u64_zero))};
+            const Id pgoff32{OpBitwiseAnd(U32[1], addr_lo, Const(0xfffU))};
+            const Id target{OpSelect(U64, mapped, OpIAdd(U64, page, OpUConvert(U64, pgoff32)), table)};
+            return OpSelect(type, mapped, psb_load(type, target, 4U), ConstantNull(type));
+        }
         const auto [in_window, page_index] = table_window(addr);
         const Id inside{OpLogicalAnd(U1, in_window, OpINotEqual(U1, table, u64_zero))};
         // (outside the table's windows the table's own first word is read, and the answer is 0 all the same)

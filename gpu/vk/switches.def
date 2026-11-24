@@ -482,6 +482,7 @@ SW(RX_VK_GPU_DUMP, diag, bool, "off", "In the statistics frame, also dumps the w
 SW(RX_VK_GPU_HANG_SEC, tune, int, "30 seconds", "Seconds of no GPU progress taken as a hang that ends the game; 0 only logs the stall.")
 SW(RX_VK_GPU_PAGES, diag, bool, "off", "Notes the pages the GPU writes and counts mirror syncs that copy the CPU's version over them.")
 SW(RX_VK_GPU_TIMELINE, diag, bool, "off: no GPU timeline", "Writes longshot_gpu_timeline.csv: each recording's submit and GPU start and end, each job handed to the render thread, each wait of the game's for a fence, each present.")
+SW(RX_VK_GP_FAST32, hw, bool, "on: 32-bit bitmask guest page-table window lookup", "=0 falls back to the 64-bit subtraction window lookup.")
 SW(RX_VK_GP_TABLE, kill, int, "1: vertex, fragment, compute, task and mesh stages read global memory through the guest page table, where the device imports host memory with device addresses (else they search every bound storage buffer)", "0 searches every bound storage buffer for a global load's address, as before; 2 keeps the search and logs the loads where it and the table disagree.")
 SW(RX_VK_GP_TEST, diag, int, "3: all of the global-pointer path (addressing model, page-table load, the loads and stores through it)", "Bisects the global memory pointer path: 1 the addressing model alone, 2 adds the table's load, 3 all of it.")
 SW(RX_VK_GRASS_DISTANCE, player, int, "unset: the menu's Grass distance row decides", "1 to 8: the short grass blades' reach as that many times the game's, over the row, for one run.")

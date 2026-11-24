@@ -2097,6 +2097,10 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
     const auto t0 = std::chrono::steady_clock::now();
     QuestionsNoted noted{p};
     ptr_diag_reset();
+    struct ModuleProgram {
+        explicit ModuleProgram(uint64_t key) { module_program = key; }
+        ~ModuleProgram() { module_program = 0; }
+    } module_for{p.key};
     {   // (EvilOOT, RX_VK_MISS_LOG_PROG=<key prefix>: the miss log for that program only)
         static const char* only = getenv("RX_VK_MISS_LOG_PROG");
         char hex[24];

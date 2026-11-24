@@ -605,6 +605,7 @@ VkDescriptorBufferInfo sim_turf_private_binding(uint64_t addr, uint32_t enc, uin
     const VkDescriptorBufferInfo none{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
     if (!addr || (sim_turf_adaptive() && !sim_turf_monitor_ready)) return none;
     const bool pool = (enc & Shader::kSimTurfStoragePool) != 0, creator = (enc & Shader::kSimTurfStorageCreator) != 0;
+    const uint32_t stock = pool ? Shader::Optimization::kSimTurfPoolCap : Shader::Optimization::kSimTurfBladeCap;
     std::lock_guard lk(sim_turf_mu);
     sim_turf_reap();
     std::vector<SimTurfPrivate>& v = sim_turf_private[pool];
@@ -614,6 +615,10 @@ VkDescriptorBufferInfo sim_turf_private_binding(uint64_t addr, uint32_t enc, uin
     for (SimTurfPrivate& g : v)
         if (g.addr == addr) {
             sim_turf_tally.found[pool]++, g.used = frame;
+            // (opt/iris-xe) While demand stays within stock capacity (target <= stock), keep using the game's own buffer
+            // directly: skips 15 MB VRAM allocation and 13.7 MB/frame mirror copies (~0.75 ms/frame on Iris Xe) while still
+            // sampling 4-byte demand counters so dense areas (>2x grass distance) auto-allocate and expand seamlessly.
+            if (!g.buf && g.policy.target() <= stock) return none;
             if (creator && (!g.buf || g.policy.target() != g.policy.capacity())) {
                 const uint32_t before = g.policy.capacity(), target = g.policy.target();
                 if (sim_turf_resize(g, pool, salign))
@@ -623,6 +628,7 @@ VkDescriptorBufferInfo sim_turf_private_binding(uint64_t addr, uint32_t enc, uin
                     logf("vk: simulated turf: %s at %#llx stayed at %u records: allocation for %u failed", pool ? "pool" : "blade list",
                          (unsigned long long)addr, before, target);
             }
+            if (!g.buf) return none;
             return sim_turf_bound_result(g, addr, enc, pool, creator);
         }
     if (!creator) {
@@ -632,19 +638,9 @@ VkDescriptorBufferInfo sim_turf_private_binding(uint64_t addr, uint32_t enc, uin
     SimTurfPrivate* g = nullptr;
     if (v.size() < kSimTurfPrivateMax) {
         v.emplace_back(pool, sim_turf_max_records(pool, salign));
-        SimTurfPrivate& n = v.back();
-        n.addr = addr, n.used = frame;
-        if (!sim_turf_resize(n, pool, salign)) {
-            v.pop_back();
-            static std::atomic<int> failed{0};
-            if (failed++ < 4) logf("vk: simulated turf: no private %s for %#llx: the game's own buffer and its cap",
-                                   pool ? "pool" : "blade list", (unsigned long long)addr);
-            return none;
-        }
         g = &v.back();
+        g->addr = addr, g->used = frame;
         sim_turf_tally.made[pool]++;
-        logf("vk: simulated turf: a private %s for %#llx (%u records, %.1f MB, %zu of them)", pool ? "pool" : "blade list",
-             (unsigned long long)addr, g->policy.capacity(), g->size / 1048576.0, v.size());
     } else {
         auto old = std::min_element(v.begin(), v.end(), [](const SimTurfPrivate& a, const SimTurfPrivate& b) { return a.used < b.used; });
         if (old == v.end() || frame <= old->used + 600) return none;   // all mappings are still live: stay safely on the game's buffer
@@ -652,20 +648,18 @@ VkDescriptorBufferInfo sim_turf_private_binding(uint64_t addr, uint32_t enc, uin
         sim_turf_retire(*old);
         v.erase(old);
         v.emplace_back(pool, sim_turf_max_records(pool, salign));
-        SimTurfPrivate& replacement = v.back();
-        replacement.addr = addr, replacement.used = frame;
-        if (!sim_turf_resize(replacement, pool, salign)) {
-            v.pop_back();
-            return none;
-        }
-        g = &replacement;
+        g = &v.back();
+        g->addr = addr, g->used = frame;
         sim_turf_tally.retaken[pool]++;
         static std::atomic<int> told{0};
         if (told++ < 8) logf("vk: simulated turf: the private %s of %#llx taken for %#llx", pool ? "pool" : "blade list",
                              (unsigned long long)old_addr, (unsigned long long)addr);
     }
-    g->addr = addr, g->used = frame;
     sim_turf_tally.ever[pool].insert(addr);
+    if (g->policy.target() <= stock) return none;
+    if (!sim_turf_resize(*g, pool, salign)) return none;
+    logf("vk: simulated turf: a private %s for %#llx (%u records, %.1f MB, %zu of them)", pool ? "pool" : "blade list",
+         (unsigned long long)addr, g->policy.capacity(), g->size / 1048576.0, v.size());
     return sim_turf_bound_result(*g, addr, enc, pool, creator);
 }
 /// (RX_VK_DRAW_STATS_PROGS) a stage's uniform and storage buffers as recorded, hex (first 1 KB each), once per program
@@ -9027,8 +9021,14 @@ void sim_turf_sample_demand(VkCommandBuffer cmd, const NvnState& s, const Progra
     }
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
     barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_HOST_READ_BIT;
+    if (mirrors.empty()) {
+        // Only the 4-byte host readback buffer was written; no GPU stage reads it.
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    } else {
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_HOST_READ_BIT;
+    }
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
