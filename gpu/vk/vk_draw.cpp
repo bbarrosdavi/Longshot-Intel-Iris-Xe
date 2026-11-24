@@ -10480,7 +10480,16 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
         f->warp_counters_cleared = true;
     }
     fallback_draw_records = f->records;
-    full_barrier(cmd);
+    {   // (opt/iris-xe) Internal transfer->compute barrier: only the header/pool fills above must reach compute/indirect reads
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &di);
+    }
     if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
     push_constants(cmd, p, nullptr, d.first_task);
     size_t stages[2] = {p.stages.size(), p.stages.size()};
@@ -10515,7 +10524,16 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     };
     if (p.fallback_task) {
         if (!send(stages[0], false)) return false;
-        full_barrier(cmd);
+        {   // (opt/iris-xe) Internal task->mesh compute barrier: preserves kScopeFull post-compute invariant at the end below
+            VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(cmd, &di);
+        }
         if (!send(stages[1], true)) return false;
     } else {
         if (!send(stages[0], true)) return false;
@@ -11087,7 +11105,7 @@ int mfb_batch_limit() {
         uint64_t used = 0, budget = 0;
         const bool have = vram_usage(&used, &budget);
         const uint64_t budget_mb = have ? (budget >> 20) : 0;
-        const int def = budget_mb >= 6000 ? 4 : budget_mb >= 4000 ? 2 : 0;
+        const int def = budget_mb >= 3500 ? 4 : budget_mb >= 2000 ? 2 : 0;
         if (def >= 2)
             logf("vk: RX_VK_MFB_BATCH=%d (default, VRAM allowance %llu MB)", def, (unsigned long long)budget_mb);
         return def;
@@ -11434,7 +11452,10 @@ bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
     return true;
 }
 
-static void draw_impl(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, const MfbBatchItem* pre) {
+thread_local const MfbBatchItem* mfb_pre_item = nullptr;
+
+void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    const MfbBatchItem* pre = mfb_pre_item;
 #ifdef TRACY_ENABLE
     HT_SCOPE_DRAW("draw");
 #endif
@@ -12292,14 +12313,12 @@ static void draw_impl(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, const
     st_draws++, ps.draws++;
 }
 
-void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
-    draw_impl(cmd, s, d, nullptr);
-}
-
 void draw_mfb_batched(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, int slot) {
     MfbBatchState& b = mfb_batch();
-    const MfbBatchItem* pre = (b.flushed && slot >= 0 && slot < b.count) ? &b.items[slot] : nullptr;
-    draw_impl(cmd, s, d, pre);
+    const MfbBatchItem* prev = mfb_pre_item;
+    mfb_pre_item = (b.flushed && slot >= 0 && slot < b.count) ? &b.items[slot] : nullptr;
+    draw(cmd, s, d);
+    mfb_pre_item = prev;
 }
 
 /// A dispatch over 2 ms is logged, 60 times, and only while RX_VK_SLOW_DISPATCH is set. Off, the clock is not read.

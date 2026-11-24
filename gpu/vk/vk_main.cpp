@@ -246,13 +246,10 @@ bool create_instance() {
     }
 #endif
 #ifndef _WIN32
-    // (longshot) Mesa's Intel compiler (driconf shader_spilling_rate, read when the driver loads, ignored by the others): when a
-    // program does not fit its registers it spills some and allocates the whole program again, rounds of one at first and then
-    // of (spilled so far / rate). Held to 32 lanes an Iris Xe has 32 registers a lane, and MKW's large compute programs spill
-    // thousands: at Mesa's default one is not built after 20 minutes and 13 GB, at 2 in 32 s and 1.7 GB (3 and 4 are much
-    // slower). The programs that do not spill are built the same; the driver's estimate of those that do goes from 12% better
-    // to 53% worse. A value the player set is kept
-    setenv("shader_spilling_rate", "2", 0);
+    // (opt/iris-xe) Do not force shader_spilling_rate=2 on Mesa ANV: at rate=2 Mesa 26.2's Gen12 register spiller
+    // over-spills heavy PBR fragment shaders (up to 53% worse register pressure) and triggers a Gen12 spill corruption bug
+    // (neon 4x2 blocks on shadowed surfaces). With wg_warp32 / 8-lane fallback and compute unpinning, Mesa's default
+    // spilling rate compiles all OoT shaders cleanly without neon artifacts. A player-set shader_spilling_rate is still kept.
 #endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "mkw-recomp";
@@ -733,7 +730,7 @@ bool create_device() {
              fc.shaderDenormFlushToZeroFloat32, fc.shaderSignedZeroInfNanPreserveFloat16, fc.shaderSignedZeroInfNanPreserveFloat32,
              dev.vk12.shaderBufferInt64Atomics);
         if (drv.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA && getenv("shader_spilling_rate"))
-            logf("vk: Mesa's Intel compiler spills at rate %s (driconf shader_spilling_rate: 2 unless set)", getenv("shader_spilling_rate"));
+            logf("vk: Mesa's Intel compiler spills at rate %s (driconf shader_spilling_rate)", getenv("shader_spilling_rate"));
     }
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
         logf("vk: the GPU lacks dynamic rendering, synchronization2 or timeline semaphores");
