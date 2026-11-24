@@ -10117,9 +10117,6 @@ struct FallbackBuffers {
 // (grown pairs stay: a command buffer recorded before the growth may still read them)
 TLS_OBJECT(fallback_buffers, std::vector<FallbackBuffers>)
 constexpr size_t kMaxMfbBatchSlots = 12;
-using FallbackBatchSlots = std::array<std::vector<FallbackBuffers>, kMaxMfbBatchSlots - 1>;
-TLS_OBJECT(fallback_batch_slots, FallbackBatchSlots)
-thread_local size_t fallback_buffers_req_slot = 0;
 thread_local VkBuffer fallback_draw_records = VK_NULL_HANDLE;   // (the last fallback_record's: its header is the draw's command)
 
 uint32_t fallback_task_groups(const Program& p) {
@@ -10152,7 +10149,11 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     // (the map, a slot a started mesh workgroup, and a payload a task workgroup, its threads' meshlets sharing it)
     const uint64_t threads = std::max(1u, p.fallback_task_threads);
     const uint64_t payload = p.fallback_task ? capacity * 4 + (capacity + threads - 1) / threads * (uint64_t)p.fallback_payload_words * 4 : 0;
-    auto& sets = fallback_buffers_req_slot == 0 ? fallback_buffers() : fallback_batch_slots()[fallback_buffers_req_slot - 1];
+    // (opt/iris-xe) replay_mu serializes all command recording across threads (Presentation Thread + host);
+    // share one process-wide slot-0 pool instead of duplicating ~160 MB records + payload per thread.
+    (void)fallback_buffers();
+    static std::vector<FallbackBuffers> shared_slot0;
+    auto& sets = shared_slot0;
     for (auto it = sets.rbegin(); it != sets.rend(); ++it) {
         if (it->records && it->records_bytes >= records && (!payload || (it->payload && it->payload_bytes >= payload))) {
             out = &*it;
@@ -10202,12 +10203,66 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     out = &sets.back();
     return true;
 }
+// (opt/iris-xe) Extra MFB batch slots (1..kMaxMfbBatchSlots-1), shared across threads under replay_mu
+// to avoid duplicating ~176 MB/slot per thread on unified-memory integrated GPUs.
 bool fallback_buffers_slot(size_t slot, const Program& p, FallbackBuffers*& out) {
-    if (slot >= kMaxMfbBatchSlots) return false;
-    fallback_buffers_req_slot = slot;
-    const bool ok = fallback_buffers_of(p, out);
-    fallback_buffers_req_slot = 0;
-    return ok;
+    if (slot == 0) return fallback_buffers_of(p, out);
+    if (slot >= kMaxMfbBatchSlots || !p.fallback_vertices_per_workgroup || !p.fallback_record_words) return false;
+    const uint64_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+    const uint64_t warp_counters = Shader::Backend::SPIRV::MeshFallbackCounters() ? Shader::Backend::SPIRV::WARP_COUNTER_BYTES : 0;
+    const uint64_t records = (Shader::Backend::SPIRV::mesh_fallback_global_attributes
+                                  ? Shader::Backend::SPIRV::MESH_FALLBACK_POOL_OFFSET + Shader::Backend::SPIRV::MESH_FALLBACK_POOL_BYTES
+                                  : (uint64_t)(Shader::Backend::SPIRV::MESH_FALLBACK_HEADER_WORDS +
+                                               Shader::Backend::SPIRV::MESH_FALLBACK_RECORD_WORDS) * 4) + warp_counters;
+    if (records > Shader::Backend::SPIRV::MESH_FALLBACK_RECORDS_LIMIT) return false;
+    const uint64_t threads = std::max(1u, p.fallback_task_threads);
+    const uint64_t payload = p.fallback_task ? capacity * 4 + (capacity + threads - 1) / threads * (uint64_t)p.fallback_payload_words * 4 : 0;
+    static std::array<std::vector<FallbackBuffers>, kMaxMfbBatchSlots - 1> shared_batch_slots;
+    auto& sets = shared_batch_slots[slot - 1];
+    for (auto it = sets.rbegin(); it != sets.rend(); ++it) {
+        if (it->records && it->records_bytes >= records && (!payload || (it->payload && it->payload_bytes >= payload))) {
+            out = &*it;
+            return true;
+        }
+    }
+    FallbackBuffers f;
+    void* mapped = nullptr;
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | (warp_counters ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : 0);
+    const bool shared = !sets.empty() && sets.back().records && sets.back().records_bytes >= records;
+    const auto drop_records = [&] {
+        if (!shared) destroy_buffer(f.records, f.records_mem);
+    };
+    if (shared) {
+        const FallbackBuffers& last = sets.back();
+        f.records = last.records, f.records_mem = last.records_mem;
+        f.records_address = last.records_address, f.records_bytes = last.records_bytes;
+        f.warp_counters_cleared = last.warp_counters_cleared;
+    } else {
+        if (!create_buffer(records, usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, f.records, f.records_mem, &mapped)) return false;
+        f.records_address = fallback_buffer_address(f.records);
+        f.records_bytes = records;
+        if (!f.records_address) {
+            drop_records();
+            return false;
+        }
+    }
+    if (payload) {
+        if (!create_buffer(payload, usage, false, f.payload, f.payload_mem, &mapped)) {
+            drop_records();
+            return false;
+        }
+        f.payload_address = fallback_buffer_address(f.payload);
+        f.payload_bytes = payload;
+        if (!f.payload_address) {
+            destroy_buffer(f.payload, f.payload_mem);
+            drop_records();
+            return false;
+        }
+    }
+    sets.push_back(f);
+    out = &sets.back();
+    return true;
 }
 
 bool fallback_compute_pipelines(Program& p) {
@@ -11105,9 +11160,15 @@ int mfb_batch_limit() {
         uint64_t used = 0, budget = 0;
         const bool have = vram_usage(&used, &budget);
         const uint64_t budget_mb = have ? (budget >> 20) : 0;
-        const int def = budget_mb >= 3500 ? 4 : budget_mb >= 2000 ? 2 : 0;
+        // (opt/iris-xe) Each slot takes ~160 MB records (+pool) + payload (~176 MB total) after upstream #2121.
+        // On small-VRAM / <=16 GB integrated GPUs (dev.policy.small_vram_textures), keep 2 shared slots (~352 MB,
+        // below pure upstream's 2-thread TLS footprint) so unified RAM never spills into swap thrashing.
+        const int def = dev.policy.small_vram_textures
+                            ? (budget_mb >= 2000 ? 2 : 0)
+                            : (budget_mb >= 5500 ? 4 : budget_mb >= 3500 ? 3 : budget_mb >= 2000 ? 2 : 0);
         if (def >= 2)
-            logf("vk: RX_VK_MFB_BATCH=%d (default, VRAM allowance %llu MB)", def, (unsigned long long)budget_mb);
+            logf("vk: RX_VK_MFB_BATCH=%d (default, VRAM allowance %llu MB%s)", def, (unsigned long long)budget_mb,
+                 dev.policy.small_vram_textures ? ", small/16GB UMA cap" : "");
         return def;
     }();
     if (cfg < 2) return 0;
