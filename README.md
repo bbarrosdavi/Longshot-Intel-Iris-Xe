@@ -34,6 +34,19 @@ project.
 
 **[Join us on Discord](https://discord.gg/magicbean)!**
 
+> [!NOTE]
+> **Intel Iris Xe / Gen12 Optimization Fork (`opt/iris-xe`, rebased onto `upstream/main @ 209389fa`):** This fork makes **Longshot** playable, visually clean, and responsive on **Intel Iris Xe / Gen12 integrated GPUs (Linux Mesa ANV)** while incorporating all upstream advances (+326 commits: guest page-table global loads, mesh-fallback attribute pool & shared-warp, adaptive `sim_turf`, async recorder parts, and ASTC GPU decoding) — delivering **23.3 Base FPS** in Hyrule Castle Courtyard (`+35.5%` vs pure upstream `17.2 fps`, `+12.0%` vs `v1.0-iris-xe` `20.8 fps`), **17.3 Base FPS** in Kakariko Gate (`88.2 ms` max frame, `3.9 GB` VRAM — `-1.04 GiB` `other buffers` via shared fallback slots), and artifact-free 3D-MV FrameGen (`Auto`/`2x`/`3x`).
+>
+> 📄 Full benchmarks, investigations & engineering write-up: [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md) · Upstream PR summary: [`PR_INTEL_IRIS_XE.md`](PR_INTEL_IRIS_XE.md)
+>
+> | Before — Unoptimized Upstream (`~9 FPS`, black/rainbow corruption) | After — Optimized Build (`23.3 Base / 46+ FG FPS`, Kokiri Forest) |
+> |:---:|:---:|
+> | ![Before: Unoptimized upstream 9 FPS](docs/images/iris-xe/01_baseline_unoptimized_kokiri_9fps.jpg) | ![After: Optimized Kokiri Forest](docs/images/iris-xe/04_optimized_kokiri_clean.jpg) |
+>
+> | Before — First Functional Baseline (`~13 FPS`, blocky) | After — Optimized Build (`Hyrule Castle Path`) |
+> |:---:|:---:|
+> | ![Before: First functional baseline 13 FPS](docs/images/iris-xe/02_functional_baseline_deku_13fps.jpg) | ![After: Optimized Hyrule Castle Path](docs/images/iris-xe/06_optimized_castle_wagon_clean.jpg) |
+
 > [!IMPORTANT]
 > This repository **does not contain the game, keys or an executable**, and it does not explain how to get them. You
 > need your own copy. Everything the build creates (`longshot.exe`, the generated code, the shader caches and your
