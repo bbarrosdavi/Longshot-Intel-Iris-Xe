@@ -104,4 +104,9 @@ inline bool mesh_fallback_shared_warp = false;
 // keeps its subgroup instructions, so it stays at 32 lanes)
 inline bool mesh_fallback_shared_warp_check = false;
 
+// (longshot-iris) When the host has no VRAM mirrors (dma-buf in-place guest memory),
+// every bound buffer's device address matches guest_pages: global writes and atomics skip the SSBO search
+// and resolve directly via guest_pages. RX_VK_NO_DIRECT_GM_STORES=1 disables it.
+inline bool direct_guest_stores = false;
+
 } // namespace Shader::Backend::SPIRV

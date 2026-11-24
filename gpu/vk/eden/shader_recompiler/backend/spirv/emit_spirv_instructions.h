@@ -64,7 +64,7 @@ Id EmitGetAttributeIndexed(EmitContext& ctx, Id offset, Id vertex);
 void EmitSetAttributeIndexed(EmitContext& ctx, Id offset, Id value, Id vertex);
 Id EmitGetPatch(EmitContext& ctx, IR::Patch patch);
 void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value);
-Id EmitIsbeRead(EmitContext& ctx, Id address);
+Id EmitIsbeRead(EmitContext& ctx, const IR::Value& address);
 Id EmitIsbeReadOutput(EmitContext& ctx, Id address);
 void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value);
 void EmitIsbeWriteMapU8(EmitContext& ctx, Id address, Id value);
@@ -643,6 +643,8 @@ Id EmitShuffleDown(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clam
                    Id segmentation_mask);
 Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
                         Id segmentation_mask);
+Id EmitSubgroupBroadcastFirstU32(EmitContext& ctx, Id value);
+Id EmitSubgroupReduceU32(EmitContext& ctx, IR::Inst* inst, Id value, Id mode);
 Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane);
 Id EmitMatrixMulAddF16(EmitContext& ctx, Id a, Id b, Id c);
 void DefineSoftwareMatrixFunction(EmitContext& ctx);

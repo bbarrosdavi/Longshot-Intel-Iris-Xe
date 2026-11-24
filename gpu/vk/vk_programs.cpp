@@ -245,7 +245,9 @@ void load_work(LoadJob& job) {
                 } else {
                     census.load_computes_cold++;   // (its first dispatch asks again, and compiles on a worker: as before)
                 }
-            } else if (notes != index_notes.end()) {
+            } else {
+                if (p->fallback) (void)fallback_compute_from_caches(*p);
+                if (notes != index_notes.end()) {
                 // every noted pipeline of the variant built here: its modules can go, remade from the file if play ever
                 // builds another state of it (program_cache_drop_loaded). One deferred, cold or not read keeps them
                 size_t built = 0, left = 0;
@@ -267,6 +269,7 @@ void load_work(LoadJob& job) {
                     census.load_pipes_deferred++, left++;
                 }
                 if (built && !left && drop_loaded_modules_on()) census.load_modules_dropped += (int64_t)program_cache_drop_loaded(*p);
+                }
             }
             census.load_programs++;
             census.load_unlisted += !p->compute && notes == index_notes.end();
@@ -466,6 +469,7 @@ void programs_index(std::vector<NoteRef> notes, const std::unordered_set<uint64_
          notes.size(), index_notes.size(), index_signatures.size(), index_computes.size(), ms_between(t0, Clock::now()), index_kept.size(),
          workers_cap(false), workers_cap(true), pipeline_source().name());
 }
+bool programs_indexed() { return index_ready.load(std::memory_order_acquire); }
 
 void programs_slow_upload(double ms, uint32_t width, uint32_t height, uint32_t nvn_format) {
     if (!programs_life_flag) return;

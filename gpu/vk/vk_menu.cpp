@@ -4520,6 +4520,7 @@ int menu_memory_tier() {
 /// game's on Minimum and Low (4 and 6 GB, where 113 MB is a lot), 2200 on Balanced (8 GB), 3072 from High (12 GB) up
 int menu_shadow_res() {
     if (opts.shadow_res > 0) return std::min(opts.shadow_res, 3) - 1;
+    if (dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return 0;
     const int tier = opts.budget > 0 ? opts.budget : auto_choice.tier;
     return tier == 1 || tier == 2 ? 0 : tier >= 4 ? 2 : 1;   // (an unknown tier: 2200, the middle)
 }

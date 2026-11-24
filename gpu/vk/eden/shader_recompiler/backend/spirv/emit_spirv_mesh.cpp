@@ -51,6 +51,13 @@ Id PushU32(EmitContext& ctx, u32 member) {
     const Id pointer{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
     return ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(pointer, ctx.rescaling_push_constants, ctx.Const(member)));
 }
+Id PushCullWord(EmitContext& ctx, u32 idx) {
+    const Id pointer{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
+    return ctx.OpLoad(
+        ctx.U32[1],
+        ctx.OpAccessChain(pointer, ctx.rescaling_push_constants,
+                          ctx.Const(ctx.mesh_fallback_cull_member_index), ctx.Const(idx)));
+}
 Id WorkgroupId(EmitContext& ctx);
 Id FallbackSlot(EmitContext& ctx);
 Id BufferWordAt(EmitContext& ctx, Id base, Id word);
@@ -58,6 +65,10 @@ Id BufferWord(EmitContext& ctx, u32 member, Id word);
 
 Id PayloadWord(EmitContext& ctx, Id index) {
     if (ctx.mesh_fallback && ctx.stage == Stage::Mesh && ctx.runtime_info.mesh_fallback_task) {
+        const Id clamped{Clamped(ctx, index, ctx.mesh_info.payload_words)};
+        if (Sirit::ValidId(ctx.mesh_fallback_payload_base)) {
+            return BufferWordAt(ctx, ctx.mesh_fallback_payload_base, clamped);
+        }
         // (the task wrote it out: the mesh workgroups are a later dispatch, and read their task workgroup's payload, a slot
         // being task workgroup * threads + its index in the task)
         const Id task{ctx.OpUDiv(ctx.U32[1], FallbackSlot(ctx), ctx.Const(ctx.runtime_info.mesh_fallback_task_threads))};
@@ -65,8 +76,7 @@ Id PayloadWord(EmitContext& ctx, Id index) {
             ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
             ctx.OpIMul(ctx.U32[1], task, ctx.Const(ctx.mesh_info.payload_words)))};
         return BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
-                            ctx.OpIAdd(ctx.U32[1], first,
-                                       Clamped(ctx, index, ctx.mesh_info.payload_words)));
+                            ctx.OpIAdd(ctx.U32[1], first, clamped));
     }
     return ctx.OpAccessChain(ctx.mesh_payload_u32, ctx.mesh_payload,
                              Clamped(ctx, index, ctx.mesh_info.payload_words));
@@ -270,6 +280,57 @@ void WriteFallbackLines(EmitContext& ctx, Id base, Id taken) {
     const u32 primitive_lines{static_cast<u32>(mesh.primitive_lines.size())};
     const Id records{PushU64(ctx, ctx.mesh_fallback_records_member_index)};
     const Id first{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_HEADER_WORDS), base)};   // (line 0 of record base)
+    if (ctx.mesh_fallback_cull) {
+        const Id line_stride_bytes{ctx.Const(fit * 4U)};
+        Loop(ctx, ctx.mesh_fallback_epilogue_word, LocalInvocation(ctx), taken, ctx.mesh_threads, [&](Id k) {
+            const Id at{ctx.OpIAdd(ctx.U32[1], first, k)};
+            const Id rec_addr{ctx.OpIAdd(
+                ctx.U64, records,
+                ctx.OpUConvert(ctx.U64, ctx.OpShiftLeftLogical(ctx.U32[1], at, ctx.Const(2U))))};
+            StoreWord(ctx, ctx.MeshFallbackWord(rec_addr), ctx.Const(1U));
+            const Id tri_slot{ctx.OpUDiv(ctx.U32[1], k, ctx.Const(3U))};
+            const Id packed_tri{ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_fallback_tri_slots, tri_slot))};
+            const Id vtx_rec_addr{ctx.OpIAdd(ctx.U64, rec_addr, ctx.Constant(ctx.U64, static_cast<u64>(fit) * 4ULL))};
+            if (vertex_lines > 0) {
+                const Id corner{ctx.OpISub(ctx.U32[1], k, ctx.OpIMul(ctx.U32[1], tri_slot, ctx.Const(3U)))};
+                const Id shift{ctx.OpShiftLeftLogical(ctx.U32[1], corner, ctx.Const(3U))};
+                const Id vertex{Clamped(ctx, ctx.OpBitFieldUExtract(ctx.U32[1], packed_tri, shift, ctx.Const(8U)),
+                                        mesh.max_vertices)};
+                const Id group{ctx.OpShiftRightLogical(ctx.U32[1], vertex, ctx.Const(5U))};
+                const Id slot{ctx.OpBitwiseAnd(ctx.U32[1], vertex, ctx.Const(31U))};
+                const Id vbase{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(vertex_lines * 32)), slot)};
+                Loop(ctx, ctx.mesh_fallback_epilogue_line, ctx.u32_zero_value, ctx.Const(vertex_lines), 1, [&](Id line) {
+                    const Id idx{ctx.OpIAdd(ctx.U32[1], vbase, ctx.OpShiftLeftLogical(ctx.U32[1], line, ctx.Const(5U)))};
+                    const Id val{LoadAttribute(ctx, idx)};
+                    const Id addr{ctx.OpIAdd(
+                        ctx.U64, vtx_rec_addr,
+                        ctx.OpUConvert(ctx.U64, ctx.OpIMul(ctx.U32[1], line, line_stride_bytes)))};
+                    StoreWord(ctx, ctx.MeshFallbackWord(addr), val);
+                });
+            }
+            if (primitive_lines > 0) {
+                const Id primitive{Clamped(ctx, ctx.OpShiftRightLogical(ctx.U32[1], packed_tri, ctx.Const(24U)),
+                                           mesh.max_primitives)};
+                const Id pgroup{ctx.OpShiftRightLogical(ctx.U32[1], primitive, ctx.Const(5U))};
+                const Id pslot{ctx.OpBitwiseAnd(ctx.U32[1], primitive, ctx.Const(31U))};
+                const Id pbase{ctx.OpIAdd(ctx.U32[1],
+                                          ctx.OpIMul(ctx.U32[1], pgroup, ctx.Const(primitive_lines * 32)),
+                                          ctx.OpIAdd(ctx.U32[1], pslot, ctx.Const(ctx.mesh_primitive_base)))};
+                const Id prim_rec_addr{ctx.OpIAdd(
+                    ctx.U64, rec_addr,
+                    ctx.Constant(ctx.U64, static_cast<u64>(1U + vertex_lines) * static_cast<u64>(fit) * 4ULL))};
+                Loop(ctx, ctx.mesh_fallback_epilogue_line, ctx.u32_zero_value, ctx.Const(primitive_lines), 1, [&](Id line) {
+                    const Id idx{ctx.OpIAdd(ctx.U32[1], pbase, ctx.OpShiftLeftLogical(ctx.U32[1], line, ctx.Const(5U)))};
+                    const Id val{LoadAttribute(ctx, idx)};
+                    const Id addr{ctx.OpIAdd(
+                        ctx.U64, prim_rec_addr,
+                        ctx.OpUConvert(ctx.U64, ctx.OpIMul(ctx.U32[1], line, line_stride_bytes)))};
+                    StoreWord(ctx, ctx.MeshFallbackWord(addr), val);
+                });
+            }
+        });
+        return;
+    }
     Loop(ctx, ctx.mesh_fallback_epilogue_word, LocalInvocation(ctx), taken, ctx.mesh_threads, [&](Id k) {
         // (an index byte the program left unwritten is held to the vertex count)
         const Id vertex{Clamped(ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, ctx.OpIAdd(ctx.U32[1], k, ctx.Const(4U)))),
@@ -307,6 +368,11 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
     const u32 words{FallbackRecordWords(mesh)};
     const u32 fit{MeshFallbackFit(words)};   // (this program's records the buffer holds)
     const Id none{ctx.Const(0xFFFFFFFFU)};
+    if (ctx.mesh_fallback_cull) {
+        If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
+            ctx.OpStore(ctx.mesh_fallback_live_count, ctx.u32_zero_value);
+        });
+    }
     Barrier(ctx);
     // (with a task program every workgroup dispatched was started by it: the dispatch is the map's, TaskEpilogue)
     const Id slot{FallbackSlot(ctx)};
@@ -314,16 +380,180 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
     Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
                         ctx.Const(mesh.max_primitives))};
     count = ctx.OpSelect(ctx.U32[1], in_range, count, ctx.u32_zero_value);
+    if (ctx.mesh_fallback_cull) {
+        const u32 vertex_lines{static_cast<u32>(mesh.vertex_lines.size())};
+        const Id w7{PushCullWord(ctx, 0U)};
+        const Id w8{PushCullWord(ctx, 1U)};
+        const Id w9{PushCullWord(ctx, 2U)};
+        const Id w10{PushCullWord(ctx, 3U)};
+        const Id w11{PushCullWord(ctx, 4U)};
+        const Id cull_mode{ctx.OpBitwiseAnd(ctx.U32[1], w7, ctx.Const(3U))};
+        const Id vp_y_neg{ctx.OpINotEqual(ctx.U1, ctx.OpShiftRightLogical(ctx.U32[1], w10, ctx.Const(31U)), ctx.u32_zero_value)};
+        const Id vp_w_u{ctx.OpBitwiseAnd(ctx.U32[1], w10, ctx.Const(0xFFFFU))};
+        const Id vp_h_u{ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], w10, ctx.Const(16U)), ctx.Const(0x7FFFU))};
+        const Id vp_valid{ctx.OpLogicalAnd(ctx.U1,
+                                           ctx.OpINotEqual(ctx.U1, vp_w_u, ctx.u32_zero_value),
+                                           ctx.OpINotEqual(ctx.U1, vp_h_u, ctx.u32_zero_value))};
+        Loop(ctx, ctx.mesh_fallback_epilogue_word, LocalInvocation(ctx), count, ctx.mesh_threads, [&](Id p) {
+            const Id map_base{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], p, ctx.Const(3U)), ctx.Const(4U))};
+            const Id i0{Clamped(ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, map_base)), mesh.max_vertices)};
+            const Id i1{Clamped(ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, ctx.OpIAdd(ctx.U32[1], map_base, ctx.Const(1U)))), mesh.max_vertices)};
+            const Id i2{Clamped(ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, ctx.OpIAdd(ctx.U32[1], map_base, ctx.Const(2U)))), mesh.max_vertices)};
+            // Test A: Degenerate index
+            const Id deg{ctx.OpLogicalOr(ctx.U1,
+                                         ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, i0, i1), ctx.OpIEqual(ctx.U1, i1, i2)),
+                                         ctx.OpIEqual(ctx.U1, i2, i0))};
+            auto load_pos = [&](Id v, std::array<Id, 4>& out_p) {
+                const Id group{ctx.OpShiftRightLogical(ctx.U32[1], v, ctx.Const(5U))};
+                const Id vslot{ctx.OpBitwiseAnd(ctx.U32[1], v, ctx.Const(31U))};
+                const Id vbase{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(vertex_lines * 32U)), vslot)};
+                for (u32 c = 0; c < 4; ++c) {
+                    const Id idx{ctx.OpIAdd(ctx.U32[1], vbase, ctx.Const(ctx.mesh_fallback_pos_lines[c] * 32U))};
+                    out_p[c] = ctx.OpBitcast(ctx.F32[1], LoadAttribute(ctx, idx));
+                }
+            };
+            std::array<Id, 4> p0{}, p1{}, p2{};
+            load_pos(i0, p0);
+            load_pos(i1, p1);
+            load_pos(i2, p2);
+            const Id nw0{ctx.OpFNegate(ctx.F32[1], p0[3])};
+            const Id nw1{ctx.OpFNegate(ctx.F32[1], p1[3])};
+            const Id nw2{ctx.OpFNegate(ctx.F32[1], p2[3])};
+            auto all3 = [&](Id a, Id b, Id c) { return ctx.OpLogicalAnd(ctx.U1, ctx.OpLogicalAnd(ctx.U1, a, b), c); };
+            // Test B: Homogeneous 6-plane frustum + behind-eye w <= 0 cull (ordered comparisons: NaN-safe)
+            const Id out_w{all3(ctx.OpFOrdLessThanEqual(ctx.U1, p0[3], ctx.f32_zero_value),
+                                ctx.OpFOrdLessThanEqual(ctx.U1, p1[3], ctx.f32_zero_value),
+                                ctx.OpFOrdLessThanEqual(ctx.U1, p2[3], ctx.f32_zero_value))};
+            const Id out_left{all3(ctx.OpFOrdLessThan(ctx.U1, p0[0], nw0),
+                                   ctx.OpFOrdLessThan(ctx.U1, p1[0], nw1),
+                                   ctx.OpFOrdLessThan(ctx.U1, p2[0], nw2))};
+            const Id out_right{all3(ctx.OpFOrdGreaterThan(ctx.U1, p0[0], p0[3]),
+                                    ctx.OpFOrdGreaterThan(ctx.U1, p1[0], p1[3]),
+                                    ctx.OpFOrdGreaterThan(ctx.U1, p2[0], p2[3]))};
+            const Id out_bottom{all3(ctx.OpFOrdLessThan(ctx.U1, p0[1], nw0),
+                                     ctx.OpFOrdLessThan(ctx.U1, p1[1], nw1),
+                                     ctx.OpFOrdLessThan(ctx.U1, p2[1], nw2))};
+            const Id out_top{all3(ctx.OpFOrdGreaterThan(ctx.U1, p0[1], p0[3]),
+                                  ctx.OpFOrdGreaterThan(ctx.U1, p1[1], p1[3]),
+                                  ctx.OpFOrdGreaterThan(ctx.U1, p2[1], p2[3]))};
+            const Id out_far{all3(ctx.OpFOrdGreaterThan(ctx.U1, p0[2], p0[3]),
+                                  ctx.OpFOrdGreaterThan(ctx.U1, p1[2], p1[3]),
+                                  ctx.OpFOrdGreaterThan(ctx.U1, p2[2], p2[3]))};
+            const Id out_near{all3(ctx.OpFOrdLessThan(ctx.U1, p0[2], nw0),
+                                   ctx.OpFOrdLessThan(ctx.U1, p1[2], nw1),
+                                   ctx.OpFOrdLessThan(ctx.U1, p2[2], nw2))};
+            Id culled{ctx.OpLogicalOr(
+                ctx.U1, deg,
+                ctx.OpLogicalOr(
+                    ctx.U1, out_w,
+                    ctx.OpLogicalOr(
+                        ctx.U1, ctx.OpLogicalOr(ctx.U1, out_left, out_right),
+                        ctx.OpLogicalOr(ctx.U1, ctx.OpLogicalOr(ctx.U1, out_bottom, out_top),
+                                        ctx.OpLogicalOr(ctx.U1, out_far, out_near)))))};
+            const Id pos_w{all3(ctx.OpFOrdGreaterThan(ctx.U1, p0[3], ctx.f32_zero_value),
+                                ctx.OpFOrdGreaterThan(ctx.U1, p1[3], ctx.f32_zero_value),
+                                ctx.OpFOrdGreaterThan(ctx.U1, p2[3], ctx.f32_zero_value))};
+            const Id one_f{ctx.Const(1.0f)};
+            const Id inv_w0{ctx.OpFDiv(ctx.F32[1], one_f, p0[3])};
+            const Id inv_w1{ctx.OpFDiv(ctx.F32[1], one_f, p1[3])};
+            const Id inv_w2{ctx.OpFDiv(ctx.F32[1], one_f, p2[3])};
+            const Id nx0{ctx.OpFMul(ctx.F32[1], p0[0], inv_w0)};
+            const Id ny0{ctx.OpFMul(ctx.F32[1], p0[1], inv_w0)};
+            const Id nx1{ctx.OpFMul(ctx.F32[1], p1[0], inv_w1)};
+            const Id ny1{ctx.OpFMul(ctx.F32[1], p1[1], inv_w1)};
+            const Id nx2{ctx.OpFMul(ctx.F32[1], p2[0], inv_w2)};
+            const Id ny2{ctx.OpFMul(ctx.F32[1], p2[1], inv_w2)};
+            // Test C: Zero-area / Backface in NDC with Kahan 2x2 FMA determinant
+            const Id dx1{ctx.OpFSub(ctx.F32[1], nx1, nx0)};
+            const Id dy1{ctx.OpFSub(ctx.F32[1], ny1, ny0)};
+            const Id dx2{ctx.OpFSub(ctx.F32[1], nx2, nx0)};
+            const Id dy2{ctx.OpFSub(ctx.F32[1], ny2, ny0)};
+            const Id prod1{ctx.OpFMul(ctx.F32[1], dx1, dy2)};
+            const Id prod2{ctx.OpFMul(ctx.F32[1], dy1, dx2)};
+            const Id det{ctx.OpFSub(ctx.F32[1], prod1, prod2)};
+            const Id err{ctx.OpFSub(ctx.F32[1],
+                                    ctx.OpFma(ctx.F32[1], dx1, dy2, ctx.OpFNegate(ctx.F32[1], prod1)),
+                                    ctx.OpFma(ctx.F32[1], dy1, dx2, ctx.OpFNegate(ctx.F32[1], prod2)))};
+            const Id zero_area{ctx.OpLogicalAnd(ctx.U1,
+                                                ctx.OpFOrdEqual(ctx.U1, det, ctx.f32_zero_value),
+                                                ctx.OpFOrdEqual(ctx.U1, err, ctx.f32_zero_value))};
+            const Id det_ok{ctx.OpFOrdGreaterThan(ctx.U1, ctx.OpFAbs(ctx.F32[1], det),
+                                                  ctx.OpFMul(ctx.F32[1], ctx.Const(4.0f), ctx.OpFAbs(ctx.F32[1], err)))};
+            const Id det_scr{ctx.OpSelect(ctx.F32[1], vp_y_neg, ctx.OpFNegate(ctx.F32[1], det), det)};
+            const Id cull_neg{ctx.OpLogicalAnd(ctx.U1, ctx.OpIEqual(ctx.U1, cull_mode, ctx.Const(1U)),
+                                               ctx.OpFOrdLessThan(ctx.U1, det_scr, ctx.f32_zero_value))};
+            const Id cull_pos{ctx.OpLogicalAnd(ctx.U1, ctx.OpIEqual(ctx.U1, cull_mode, ctx.Const(2U)),
+                                               ctx.OpFOrdGreaterThan(ctx.U1, det_scr, ctx.f32_zero_value))};
+            const Id cull_face{ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, cull_mode, ctx.Const(3U)),
+                                               ctx.OpLogicalAnd(ctx.U1, det_ok, ctx.OpLogicalOr(ctx.U1, cull_neg, cull_pos)))};
+            // Test D: 1x MSAA Sub-pixel Between-Sample-Centers & Scissor Cull (guarded on vp_valid)
+            const Id vp_w{ctx.OpConvertUToF(ctx.F32[1], vp_w_u)};
+            const Id vp_h{ctx.OpConvertUToF(ctx.F32[1], vp_h_u)};
+            const Id w11_s{ctx.OpBitcast(ctx.S32[1], w11)};
+            const Id vp_x{ctx.OpConvertSToF(ctx.F32[1], ctx.OpBitFieldSExtract(ctx.S32[1], w11_s, ctx.u32_zero_value, ctx.Const(16U)))};
+            const Id vp_y{ctx.OpConvertSToF(ctx.F32[1], ctx.OpBitFieldSExtract(ctx.S32[1], w11_s, ctx.Const(16U), ctx.Const(16U)))};
+            const Id half{ctx.Const(0.5f)};
+            const Id half_y{ctx.OpSelect(ctx.F32[1], vp_y_neg, ctx.Const(-0.5f), half)};
+            auto to_sx = [&](Id nx) { return ctx.OpFma(ctx.F32[1], ctx.OpFma(ctx.F32[1], nx, half, half), vp_w, vp_x); };
+            auto to_sy = [&](Id ny) { return ctx.OpFma(ctx.F32[1], ctx.OpFma(ctx.F32[1], ny, half_y, half), vp_h, vp_y); };
+            const Id sx0{to_sx(nx0)}, sx1{to_sx(nx1)}, sx2{to_sx(nx2)};
+            const Id sy0{to_sy(ny0)}, sy1{to_sy(ny1)}, sy2{to_sy(ny2)};
+            const Id min_sx{ctx.OpFMin(ctx.F32[1], sx0, ctx.OpFMin(ctx.F32[1], sx1, sx2))};
+            const Id max_sx{ctx.OpFMax(ctx.F32[1], sx0, ctx.OpFMax(ctx.F32[1], sx1, sx2))};
+            const Id min_sy{ctx.OpFMin(ctx.F32[1], sy0, ctx.OpFMin(ctx.F32[1], sy1, sy2))};
+            const Id max_sy{ctx.OpFMax(ctx.F32[1], sy0, ctx.OpFMax(ctx.F32[1], sy1, sy2))};
+            const Id sc_min_x{ctx.OpConvertUToF(ctx.F32[1], ctx.OpBitwiseAnd(ctx.U32[1], w8, ctx.Const(0xFFFFU)))};
+            const Id sc_min_y{ctx.OpConvertUToF(ctx.F32[1], ctx.OpShiftRightLogical(ctx.U32[1], w8, ctx.Const(16U)))};
+            const Id sc_max_x{ctx.OpConvertUToF(ctx.F32[1], ctx.OpBitwiseAnd(ctx.U32[1], w9, ctx.Const(0xFFFFU)))};
+            const Id sc_max_y{ctx.OpConvertUToF(ctx.F32[1], ctx.OpShiftRightLogical(ctx.U32[1], w9, ctx.Const(16U)))};
+            const Id sc_valid{ctx.OpINotEqual(ctx.U1, w9, ctx.u32_zero_value)};
+            const Id out_sc{ctx.OpLogicalAnd(
+                ctx.U1, sc_valid,
+                ctx.OpLogicalOr(ctx.U1,
+                                ctx.OpLogicalOr(ctx.U1, ctx.OpFOrdLessThan(ctx.U1, max_sx, sc_min_x),
+                                                ctx.OpFOrdGreaterThanEqual(ctx.U1, min_sx, sc_max_x)),
+                                ctx.OpLogicalOr(ctx.U1, ctx.OpFOrdLessThan(ctx.U1, max_sy, sc_min_y),
+                                                ctx.OpFOrdGreaterThanEqual(ctx.U1, min_sy, sc_max_y))))};
+            const Id c_lo{ctx.Const(0.5f + 1.0f / 128.0f)};
+            const Id c_hi{ctx.Const(0.5f - 1.0f / 128.0f)};
+            const Id miss_x{ctx.OpLogicalAnd(
+                ctx.U1, ctx.OpFOrdLessThan(ctx.U1, ctx.OpFSub(ctx.F32[1], max_sx, min_sx), one_f),
+                ctx.OpFOrdGreaterThan(ctx.U1, ctx.OpFloor(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], min_sx, c_lo)),
+                                      ctx.OpFloor(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], max_sx, c_hi))))};
+            const Id miss_y{ctx.OpLogicalAnd(
+                ctx.U1, ctx.OpFOrdLessThan(ctx.U1, ctx.OpFSub(ctx.F32[1], max_sy, min_sy), one_f),
+                ctx.OpFOrdGreaterThan(ctx.U1, ctx.OpFloor(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], min_sy, c_lo)),
+                                      ctx.OpFloor(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], max_sy, c_hi))))};
+            const Id subpix_cull{ctx.OpLogicalAnd(ctx.U1, vp_valid,
+                                                  ctx.OpLogicalOr(ctx.U1, out_sc, ctx.OpLogicalOr(ctx.U1, miss_x, miss_y)))};
+            const Id ndc_cull{ctx.OpLogicalAnd(ctx.U1, pos_w,
+                                               ctx.OpLogicalOr(ctx.U1, zero_area, ctx.OpLogicalOr(ctx.U1, cull_face, subpix_cull)))};
+            culled = ctx.OpLogicalOr(ctx.U1, culled, ndc_cull);
+            If(ctx, ctx.OpLogicalNot(ctx.U1, culled), [&] {
+                const Id dst{ctx.OpAtomicIAdd(ctx.U32[1], ctx.mesh_fallback_live_count,
+                                              ctx.Const(static_cast<u32>(spv::Scope::Workgroup)),
+                                              ctx.u32_zero_value, ctx.Const(1U))};
+                const Id p0_8{ctx.OpBitwiseAnd(ctx.U32[1], i0, ctx.Const(0xFFU))};
+                const Id p1_8{ctx.OpShiftLeftLogical(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], i1, ctx.Const(0xFFU)), ctx.Const(8U))};
+                const Id p2_8{ctx.OpShiftLeftLogical(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], i2, ctx.Const(0xFFU)), ctx.Const(16U))};
+                const Id pp_8{ctx.OpShiftLeftLogical(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], p, ctx.Const(0xFFU)), ctx.Const(24U))};
+                const Id packed{ctx.OpBitwiseOr(ctx.U32[1], ctx.OpBitwiseOr(ctx.U32[1], p0_8, p1_8),
+                                                ctx.OpBitwiseOr(ctx.U32[1], p2_8, pp_8))};
+                ctx.OpStore(SharedWord(ctx, ctx.mesh_fallback_tri_slots, dst), packed);
+            });
+        });
+        Barrier(ctx);
+        count = ctx.OpLoad(ctx.U32[1], ctx.mesh_fallback_live_count);
+    }
     const Id taken{ctx.OpIMul(ctx.U32[1], count, ctx.Const(corners))};
     const auto atomic_add = [&](u32 word, Id value) {
         return ctx.OpAtomicIAdd(ctx.U32[1], BufferWord(ctx, ctx.mesh_fallback_records_member_index, ctx.Const(word)),
                                 ctx.Const(static_cast<u32>(spv::Scope::Device)), ctx.u32_zero_value, value);
     };
-    // (every thread has read the primitive count above: thread 0 hands the others its first record in that word. Records
-    // that do not fit are not taken; taking only grows, so the ones that fit are the first, and the draw's count is theirs)
-    Barrier(ctx);
+    // (thread 0 broadcasts its first record via dedicated mesh_fallback_scratch so mesh_primitive_count is not overwritten,
+    // eliminating the extra workgroup barrier before thread 0's store)
     If(ctx, ctx.OpIEqual(ctx.U1, LocalInvocation(ctx), ctx.u32_zero_value), [&] {
-        ctx.OpStore(ctx.mesh_primitive_count, none);
+        ctx.OpStore(ctx.mesh_fallback_scratch, none);
         If(ctx, ctx.OpINotEqual(ctx.U1, taken, ctx.u32_zero_value), [&] {
             const Id base{atomic_add(MESH_FALLBACK_ALLOC_WORD, taken)};
             const Id fits{ctx.OpLogicalAnd(ctx.U1, ctx.OpULessThanEqual(ctx.U1, base, ctx.Const(fit)),
@@ -331,12 +561,12 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
                                                                 ctx.OpISub(ctx.U32[1], ctx.Const(fit), base)))};
             If(ctx, fits, [&] {
                 atomic_add(MESH_FALLBACK_DRAW_WORD, taken);
-                ctx.OpStore(ctx.mesh_primitive_count, base);
+                ctx.OpStore(ctx.mesh_fallback_scratch, base);
             });
         });
     });
     Barrier(ctx);
-    const Id base{ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count)};
+    const Id base{ctx.OpLoad(ctx.U32[1], ctx.mesh_fallback_scratch)};
     If(ctx, ctx.OpINotEqual(ctx.U1, base, none), [&] {
         if (ctx.runtime_info.mesh_fallback_layout == static_cast<u32>(MeshFallbackLayout::Soa)) {
             WriteFallbackLines(ctx, base, taken);
@@ -363,11 +593,24 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
         // (record r is corner r % corners of primitive r / corners: its index byte is the map's byte 4 + r)
         const Id record{ctx.OpUDiv(ctx.U32[1], at, ctx.Const(words))};
         const Id word{ctx.OpISub(ctx.U32[1], at, ctx.OpIMul(ctx.U32[1], record, ctx.Const(words)))};
-        const Id primitive{ctx.OpUDiv(ctx.U32[1], record, ctx.Const(corners))};
-        // (an index byte the program left unwritten is held to the vertex count)
-        const Id vertex{Clamped(
-            ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, ctx.OpIAdd(ctx.U32[1], record, ctx.Const(4U)))),
-            mesh.max_vertices)};
+        Id primitive{};
+        Id vertex{};
+        if (ctx.mesh_fallback_cull) {
+            const Id tri_slot{ctx.OpUDiv(ctx.U32[1], record, ctx.Const(3U))};
+            const Id packed_tri{ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_fallback_tri_slots, tri_slot))};
+            const Id corner{ctx.OpISub(ctx.U32[1], record, ctx.OpIMul(ctx.U32[1], tri_slot, ctx.Const(3U)))};
+            const Id shift{ctx.OpShiftLeftLogical(ctx.U32[1], corner, ctx.Const(3U))};
+            vertex = Clamped(ctx, ctx.OpBitFieldUExtract(ctx.U32[1], packed_tri, shift, ctx.Const(8U)),
+                             mesh.max_vertices);
+            primitive = Clamped(ctx, ctx.OpShiftRightLogical(ctx.U32[1], packed_tri, ctx.Const(24U)),
+                                mesh.max_primitives);
+        } else {
+            primitive = ctx.OpUDiv(ctx.U32[1], record, ctx.Const(corners));
+            // (an index byte the program left unwritten is held to the vertex count)
+            vertex = Clamped(
+                ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, ctx.OpIAdd(ctx.U32[1], record, ctx.Const(4U)))),
+                mesh.max_vertices);
+        }
         // (word 0 the validity, 1 .. vertex_lines its vertex's lines, then its primitive's: one load, its index clamped into the
         // region, as the word 0 and the lines of the other kind ask for one past it)
         const Id line{ctx.OpISub(ctx.U32[1], word, ctx.Const(1U))};
@@ -441,35 +684,43 @@ void TaskEpilogue(EmitContext& ctx) {
     const Id count{ctx.OpUMin(ctx.U32[1], LoadWord(ctx, PayloadWord(ctx, ctx.Const(1U))),
                               ctx.Const(task_cap(ctx.mesh_threads)))};
     if (ctx.mesh_fallback) {
-        // (no OpEmitMeshTasksEXT: each thread that started a mesh workgroup takes an index of the mesh dispatch
-        // (MESH_FALLBACK_DISPATCH_WORD) and writes its slot, task workgroup * threads + its index, at that index of the
-        // payload buffer's map. The mesh dispatch is those indices: no more, whatever the CPU knew of the task count)
-        const Id slot{ctx.OpIAdd(ctx.U32[1],
-                                 ctx.OpIMul(ctx.U32[1], WorkgroupId(ctx), ctx.Const(ctx.mesh_threads)),
-                                 LocalInvocation(ctx))};
-        // (the count is how many meshlets this task workgroup started: the first that many threads, not all of them)
-        const Id started{ctx.OpLogicalAnd(ctx.U1, ctx.OpULessThan(ctx.U1, LocalInvocation(ctx), count),
-                                          ctx.OpULessThan(ctx.U1, slot, ctx.Const(MESH_FALLBACK_CAPACITY)))};
-        If(ctx, started, [&] {
-            const Id index{ctx.OpAtomicIAdd(
-                ctx.U32[1],
-                BufferWord(ctx, ctx.mesh_fallback_records_member_index, ctx.Const(MESH_FALLBACK_DISPATCH_WORD)),
-                ctx.Const(static_cast<u32>(spv::Scope::Device)), ctx.u32_zero_value, ctx.Const(1U))};
-            // (fewer than MESH_FALLBACK_CAPACITY: a started slot is below it)
-            StoreWord(ctx, BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), index), slot);
-        });
-        // (the payload once a task workgroup, its threads sharing the words, where its mesh workgroups read it (PayloadWord).
-        // A copy a slot was 32 times the writes and the memory: 52 MB a draw at 16384 slots)
+        // (no OpEmitMeshTasksEXT: one atomic per task workgroup claims `avail` contiguous slots in the mesh dispatch map;
+        // culled workgroups with avail == 0 skip the atomic, the map writes, and the global payload copy completely.
+        // `avail` is workgroup-uniform because `count` was loaded after Barrier(ctx) and `task` is WorkgroupId.x.)
         const Id task{WorkgroupId(ctx)};
         const Id first_slot{ctx.OpIMul(ctx.U32[1], task, ctx.Const(ctx.mesh_threads))};
-        If(ctx, ctx.OpULessThan(ctx.U1, first_slot, ctx.Const(MESH_FALLBACK_CAPACITY)), [&] {
+        const Id has_room{ctx.OpULessThan(ctx.U1, first_slot, ctx.Const(MESH_FALLBACK_CAPACITY))};
+        const Id room{ctx.OpSelect(ctx.U32[1], has_room,
+                                   ctx.OpISub(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY), first_slot),
+                                   ctx.u32_zero_value)};
+        const Id avail{ctx.OpUMin(ctx.U32[1], count, room)};
+        If(ctx, ctx.OpINotEqual(ctx.U1, avail, ctx.u32_zero_value), [&] {
+            const Id local{LocalInvocation(ctx)};
+            If(ctx, ctx.OpIEqual(ctx.U1, local, ctx.u32_zero_value), [&] {
+                const Id base{ctx.OpAtomicIAdd(
+                    ctx.U32[1],
+                    BufferWord(ctx, ctx.mesh_fallback_records_member_index, ctx.Const(MESH_FALLBACK_DISPATCH_WORD)),
+                    ctx.Const(static_cast<u32>(spv::Scope::Device)), ctx.u32_zero_value, avail)};
+                ctx.OpStore(ctx.mesh_fallback_scratch, base);
+            });
+            Barrier(ctx);
+            const Id started{ctx.OpLogicalAnd(ctx.U1, ctx.OpULessThan(ctx.U1, LocalInvocation(ctx), count),
+                                              ctx.OpULessThan(ctx.U1, local, room))};
+            If(ctx, started, [&] {
+                const Id base{ctx.OpLoad(ctx.U32[1], ctx.mesh_fallback_scratch)};
+                const Id index{ctx.OpIAdd(ctx.U32[1], base, local)};
+                const Id slot{ctx.OpIAdd(ctx.U32[1], first_slot, local)};
+                StoreWord(ctx, BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), index), slot);
+            });
+            // (the payload once a task workgroup, its threads sharing the words, where its mesh workgroups read it (PayloadWord).
+            // A copy a slot was 32 times the writes and the memory: 52 MB a draw at 16384 slots)
+            const Id payload_ptr{PushU64(ctx, ctx.mesh_fallback_payload_member_index)};
             const Id first{ctx.OpIAdd(
                 ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
                 ctx.OpIMul(ctx.U32[1], task, ctx.Const(ctx.mesh_info.payload_words)))};
-            Strided(ctx, ctx.mesh_info.payload_words, ctx.mesh_threads, LocalInvocation(ctx), [&](Id index) {
-                StoreWord(ctx, BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
-                                         ctx.OpIAdd(ctx.U32[1], first, index)),
-                            LoadWord(ctx, PayloadWord(ctx, index)));
+            Strided(ctx, ctx.mesh_info.payload_words, ctx.mesh_threads, local, [&](Id idx) {
+                StoreWord(ctx, BufferWordAt(ctx, payload_ptr, ctx.OpIAdd(ctx.U32[1], first, idx)),
+                          LoadWord(ctx, PayloadWord(ctx, idx)));
             });
         });
         return;
@@ -610,12 +861,16 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
     const Id first{lines ? ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_HEADER_WORDS), vertex)
                          : ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_HEADER_WORDS),
                                       ctx.OpIMul(ctx.U32[1], vertex, ctx.Const(words)))};
-    const Id valid{LoadWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index, first))};
+    const Id records{PushU64(ctx, ctx.mesh_fallback_records_member_index)};
+    const Id rec_addr{ctx.OpIAdd(
+        ctx.U64, records,
+        ctx.OpUConvert(ctx.U64, ctx.OpShiftLeftLogical(ctx.U32[1], first, ctx.Const(2U))))};
+    const Id valid{LoadWord(ctx, ctx.MeshFallbackWord(rec_addr))};
     const auto read = [&](u32 word) {
-        return ctx.OpBitcast(
-            ctx.F32[1],
-            LoadWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index,
-                                              ctx.OpIAdd(ctx.U32[1], first, ctx.Const(word * stride)))));
+        const Id addr{word ? ctx.OpIAdd(ctx.U64, rec_addr,
+                                        ctx.Constant(ctx.U64, static_cast<u64>(word) * static_cast<u64>(stride) * 4ULL))
+                           : rec_addr};
+        return ctx.OpBitcast(ctx.F32[1], LoadWord(ctx, ctx.MeshFallbackWord(addr)));
     };
     std::array<Id, 4> position{};
     for (u32 line = 0; line < vertex_lines; ++line) {
@@ -654,7 +909,7 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
        });
 }
 
-Id EmitIsbeRead(EmitContext& ctx, Id address) {
+Id EmitIsbeRead(EmitContext& ctx, const IR::Value& address) {
     const Id native_workgroup{
         ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), 0U)};
     if (ctx.stage == Stage::Task) {
@@ -683,15 +938,27 @@ Id EmitIsbeRead(EmitContext& ctx, Id address) {
         return workgroup; // the input region holds the workgroup index (VERTEX_ID)
     }
     const Id workgroup{native_workgroup};
-    const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
-    const Id pointer{PayloadWord(ctx, index)};
-    const Id word{ctx.mesh_fallback ? LoadWord(ctx, pointer) : ctx.OpLoad(ctx.U32[1], pointer)};   // (the fallback's: a device address)
     // (longshot) a fallback mesh workgroup is a slot, task workgroup * threads + its index: address 0 is that index in its task,
     // from 0 as OpEmitMeshTasksEXT numbers them. It was the slot, which picked a meshlet past the end of every task's list
     const Id within{ctx.mesh_fallback && ctx.runtime_info.mesh_fallback_task
-                        ? ctx.OpUMod(ctx.U32[1], FallbackSlot(ctx), ctx.Const(ctx.runtime_info.mesh_fallback_task_threads))
+                        ? (Sirit::ValidId(ctx.mesh_fallback_within)
+                               ? ctx.mesh_fallback_within
+                               : ctx.OpUMod(ctx.U32[1], FallbackSlot(ctx),
+                                            ctx.Const(ctx.runtime_info.mesh_fallback_task_threads)))
                         : workgroup};
-    return ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, address, ctx.u32_zero_value), within,
+    if (address.IsImmediate()) {
+        const u32 imm{address.U32()};
+        if (imm == 0U) {
+            return within;
+        }
+        const Id pointer{PayloadWord(ctx, ctx.Const(imm >> 2))};
+        return ctx.mesh_fallback ? LoadWord(ctx, pointer) : ctx.OpLoad(ctx.U32[1], pointer);
+    }
+    const Id addr{ctx.Def(address)};
+    const Id index{ctx.OpShiftRightLogical(ctx.U32[1], addr, ctx.Const(2U))};
+    const Id pointer{PayloadWord(ctx, index)};
+    const Id word{ctx.mesh_fallback ? LoadWord(ctx, pointer) : ctx.OpLoad(ctx.U32[1], pointer)};   // (the fallback's: a device address)
+    return ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, addr, ctx.u32_zero_value), within,
                         word);
 }
 
@@ -752,9 +1019,17 @@ void EmitMeshPrologue(EmitContext& ctx) {
     }
     if (ctx.mesh_fallback && ctx.runtime_info.mesh_fallback_task) {
         // (longshot) the slot its task gave this workgroup, from the map at its index of the dispatch (TaskEpilogue). Read here,
-        // in the entry block, it serves every use; a load, no branch (see below)
-        ctx.mesh_fallback_slot =
-            LoadWord(ctx, BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index), WorkgroupId(ctx)));
+        // in the entry block, it serves every use; a load, no branch (see below). Precompute within and payload base once.
+        const Id payload_ptr{PushU64(ctx, ctx.mesh_fallback_payload_member_index)};
+        ctx.mesh_fallback_slot = LoadWord(ctx, BufferWordAt(ctx, payload_ptr, WorkgroupId(ctx)));
+        const Id task_threads{ctx.Const(ctx.runtime_info.mesh_fallback_task_threads)};
+        const Id task{ctx.OpUDiv(ctx.U32[1], ctx.mesh_fallback_slot, task_threads)};
+        ctx.mesh_fallback_within = ctx.OpUMod(ctx.U32[1], ctx.mesh_fallback_slot, task_threads);
+        const Id first{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
+                                  ctx.OpIMul(ctx.U32[1], task, ctx.Const(ctx.mesh_info.payload_words)))};
+        ctx.mesh_fallback_payload_base =
+            ctx.OpIAdd(ctx.U64, payload_ptr,
+                       ctx.OpShiftLeftLogical(ctx.U64, ctx.OpUConvert(ctx.U64, first), ctx.Const(2U)));
     }
     if (ctx.mesh_attributes_global) {
         // (longshot, mma_layout.h mesh_fallback_global_attributes) the workgroup's pool slot, before anything writes the region:
@@ -783,7 +1058,8 @@ void EmitMeshPrologue(EmitContext& ctx) {
                 return;
             }
             for (u32 first = 0; first < count; first += ctx.mesh_threads) {
-                const Id at{Clamped(ctx, ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)), count)};
+                const Id raw{first ? ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)) : invocation};
+                const Id at{first + ctx.mesh_threads > count ? Clamped(ctx, raw, count) : raw};
                 ctx.OpStore(SharedWord(ctx, array, at), ctx.u32_zero_value);
             }
         };
@@ -807,11 +1083,13 @@ void EmitMeshPrologue(EmitContext& ctx) {
         if (ctx.mesh_info.payload_words) {
             ctx.OpStore(SharedWord(ctx, ctx.mesh_payload, ctx.u32_zero_value), WorkgroupId(ctx));
         }
-        Barrier(ctx);
     }
     // Every invocation stores the zero: no branch here, the entry block's label is a phi
     // predecessor for later blocks.
     ctx.OpStore(ctx.mesh_primitive_count, ctx.u32_zero_value);
+    if (ctx.mesh_fallback_cull && Sirit::ValidId(ctx.mesh_fallback_live_count)) {
+        ctx.OpStore(ctx.mesh_fallback_live_count, ctx.u32_zero_value);
+    }
     Barrier(ctx);
 }
 

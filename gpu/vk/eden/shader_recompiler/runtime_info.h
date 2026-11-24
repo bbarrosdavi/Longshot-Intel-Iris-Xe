@@ -120,6 +120,8 @@ struct RuntimeInfo {
     /// (longshot) how the fallback's mesh stage lays out its records and its vertex stage reads them
     /// (Backend::SPIRV::MeshFallbackLayout, RX_VK_MESH_FB_LAYOUT); 0: record after record
     u32 mesh_fallback_layout{};
+    /// Emulate 32-lane warp operations in workgroup shared memory + LocalInvocationId (SIMD8 on Intel ANV)
+    bool mesh_wg_warp32{};
 
     TessPrimitive tess_primitive{};
     TessSpacing tess_spacing{};

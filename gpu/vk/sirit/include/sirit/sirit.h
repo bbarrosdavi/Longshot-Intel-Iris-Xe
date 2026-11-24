@@ -1322,6 +1322,14 @@ public:
     /// group xor'ed with mask.
     Id OpGroupNonUniformShuffleXor(Id result_type, Id scope, Id value, Id mask);
 
+    Id OpGroupNonUniformIAdd(Id result_type, Id scope, spv::GroupOperation op, Id value);
+    Id OpGroupNonUniformUMin(Id result_type, Id scope, spv::GroupOperation op, Id value);
+    Id OpGroupNonUniformSMin(Id result_type, Id scope, spv::GroupOperation op, Id value);
+    Id OpGroupNonUniformUMax(Id result_type, Id scope, spv::GroupOperation op, Id value);
+    Id OpGroupNonUniformSMax(Id result_type, Id scope, spv::GroupOperation op, Id value);
+    Id OpGroupNonUniformBitwiseOr(Id result_type, Id scope, spv::GroupOperation op, Id value);
+    Id OpGroupNonUniformBitwiseXor(Id result_type, Id scope, spv::GroupOperation op, Id value);
+
     /// Evaluates a predicate for all active invocations in the group, resulting in
     /// true if predicate evaluates to true for all active invocations in the
     /// group, otherwise the result is false.

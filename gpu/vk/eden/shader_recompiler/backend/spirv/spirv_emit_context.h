@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
+#include <vector>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
@@ -170,6 +171,38 @@ public:
     ~EmitContext();
 
     [[nodiscard]] Id Def(const IR::Value& value);
+
+    Id AddLabel(Id label) {
+        const Id res{Sirit::Module::AddLabel(label)};
+        current_block_label = res;
+        wg_shfl_cached_block = {};
+        wg_shfl_cached_value = {};
+        wg_shfl_cached_slot = {};
+        wg_ballot_cached_block = {};
+        wg_ballot_cached_pred = {};
+        wg_ballot_cached_result = {};
+        return res;
+    }
+
+    Id AddLabel() {
+        return AddLabel(OpLabel());
+    }
+
+    Id NullConstant(Id type_id) {
+        if (type_id.value == U1.value) return false_value;
+        if (type_id.value == U32[1].value) return u32_zero_value;
+        if (type_id.value == F32[1].value) return f32_zero_value;
+        const auto [it, inserted] = null_constants.try_emplace(type_id.value, Id{});
+        if (inserted) {
+            it->second = ConstantNull(type_id);
+        }
+        return it->second;
+    }
+
+    Id EndLabelOf(const IR::Block* block, Id fallback) const {
+        const auto it = block_end_labels.find(block);
+        return (it != block_end_labels.end() && Sirit::ValidId(it->second)) ? it->second : fallback;
+    }
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
@@ -408,6 +441,9 @@ public:
     /// (longshot) a fallback mesh workgroup's slot (task workgroup * threads + its index), read from the task's map in the
     /// entry block (EmitMeshPrologue); invalid without a task program, where the slot is the workgroup id
     Id mesh_fallback_slot{};
+    Id mesh_fallback_scratch{};       ///< (longshot) 4-byte workgroup u32 for task/mesh fallback epilogue broadcasts
+    Id mesh_fallback_within{};        ///< (longshot) precomputed FallbackSlot % task_threads (entry block)
+    Id mesh_fallback_payload_base{};  ///< (longshot) precomputed u64 base address of this mesh workgroup's task payload (entry block)
     Id mesh_fallback_epilogue_word{};   ///< (longshot) the fallback epilogue's loop index, a function variable of the entry block
     Id mesh_fallback_epilogue_line{};   ///< (longshot) the Soa records' line, WriteFallbackLines' inner loop index, as above
     /// (longshot, mma_layout.h mesh_fallback_global_attributes) the attribute region in a pool slot, not in workgroup memory: the
@@ -419,7 +455,26 @@ public:
     Id mesh_attribute_claim{};
     Id mesh_attribute_ticket{};
     Id mesh_attribute_base{};
+    Id mesh_wg_ballot{};
+    Id mesh_wg_shfl{};
+    Id wg_ballot_slot{};
+    Id wg_shfl_slot{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
+    u32 mesh_wg_warps{1};
+    u32 wg_size_x{1};
+    u32 wg_size_y{1};
+    u32 wg_size_z{1};
+    Id current_block_label{};
+    Id linear_exec_id{};
+    Id wg_shfl_cached_block{};
+    Id wg_shfl_cached_value{};
+    Id wg_shfl_cached_slot{};
+    Id wg_ballot_cached_block{};
+    Id wg_ballot_cached_pred{};
+    Id wg_ballot_cached_result{};
+    std::unordered_map<const IR::Block*, Id> block_end_labels;
+    std::unordered_map<u32, Id> null_constants;
+    std::vector<IR::Inst*> deferred_ir_phis;
     /// (longshot, mma_layout.h mesh_fallback_shared_warp) the warp in workgroup memory: the words (a region's entered and
     /// reached lanes, a ballot's lanes and arrivals, a shuffle's values and arrivals), the function that waits for lanes'
     /// bits in a word, this invocation's lane and bit (entry block), the lanes that run the block being emitted and those of
@@ -458,6 +513,12 @@ public:
     // (longshot) a GPU without VK_EXT_mesh_shader: Task and Mesh are compute shaders. Their stage buffer outputs go to
     // the payload, map and record buffers, pushed as device addresses; a generated vertex stage reads the records.
     bool mesh_fallback{};
+    bool mesh_fallback_cull{};
+    std::array<u32, 4> mesh_fallback_pos_lines{~0U, ~0U, ~0U, ~0U};
+    Id mesh_fallback_live_count{};
+    Id mesh_fallback_tri_slots{};
+    u32 mesh_fallback_cull_member_index{};
+    Id mesh_fallback_cull_words_type{};
     bool wants_mesh_fallback{};
     Id mesh_fallback_word_ptr{};   ///< PhysicalStorageBuffer pointer to a block of one u32
     u32 mesh_fallback_payload_member_index{};
@@ -530,6 +591,7 @@ private:
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
+    void DefineWorkgroupWarp(const IR::Program& program);
     void PlanSharedWarp(const IR::Program& program);
     void DefineSharedWarp();
 };

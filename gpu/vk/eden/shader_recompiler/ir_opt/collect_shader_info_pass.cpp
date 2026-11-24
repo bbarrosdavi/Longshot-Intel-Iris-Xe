@@ -511,6 +511,8 @@ void VisitUsages(Info& info, IR::Inst& inst) {
     case IR::Opcode::ShuffleUp:
     case IR::Opcode::ShuffleDown:
     case IR::Opcode::ShuffleButterfly:
+    case IR::Opcode::SubgroupBroadcastFirstU32:
+    case IR::Opcode::SubgroupReduceU32:
         info.uses_subgroup_shuffles = true;
         break;
     case IR::Opcode::QuadBroadcast:

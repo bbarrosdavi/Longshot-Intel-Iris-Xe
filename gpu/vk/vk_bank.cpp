@@ -77,10 +77,17 @@ CsLayout cs_layout_of(const uint8_t* c) {   // (c: the control section from +0x5
 }
 CsLayout cs_layout(const NvnState& s) {
     if (seed_cs_control) return cs_layout_of(seed_cs_control + 0x58);
+    // (Batch 10I) TLS 1-entry cache by program serial avoids reg/mutex+map lookup on every compute bank word/fill
+    static thread_local uint64_t tl_serial = UINT64_MAX;
+    static thread_local CsLayout tl_layout{};
+    if (s.prog.serial == tl_serial) return tl_layout;
     static std::mutex mu;
     static std::unordered_map<uint64_t, CsLayout> by_serial;
     std::lock_guard lk(mu);
-    if (auto it = by_serial.find(s.prog.serial); it != by_serial.end()) return it->second;
+    if (auto it = by_serial.find(s.prog.serial); it != by_serial.end()) {
+        tl_serial = s.prog.serial, tl_layout = it->second;
+        return it->second;
+    }
     CsLayout l;
     for (uint32_t i = 0; i < s.prog.nstage && i < 6; i++) {
         uint8_t c[0x60];

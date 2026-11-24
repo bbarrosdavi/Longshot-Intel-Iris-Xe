@@ -43,6 +43,7 @@
 #include "vk_progress.h"   // (PrepareWork: prepare_run's count of the programs, each at its cost)
 #include "pipeline_cache_file.h"
 #include "vk_draw.h"
+#include "vk_custom_spv.h"
 #ifdef TRACY_ENABLE
 #include "../../host/hos_tracy.h"   // (LONGSHOT_TRACY: the profiler's zones; nothing in any other build)
 #endif
@@ -233,6 +234,28 @@ void pin_subgroup(VkPipelineShaderStageCreateInfo& st, uint32_t workgroup_x = 0,
     if (workgroup_x && !(workgroup_x % 32) && dev.vk13.computeFullSubgroups)
         st.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
 }
+void pin_subgroup_8(VkPipelineShaderStageCreateInfo& st, uint32_t workgroup_x = 0) {
+    static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size8 = [] {
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo r{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+        r.requiredSubgroupSize = 8;
+        return r;
+    }();
+    if (dev.subgroup_min > 8 || !(dev.sg32_stages & st.stage)) return;
+    st.pNext = &size8;
+    if (workgroup_x && !(workgroup_x % 8) && dev.vk13.computeFullSubgroups)
+        st.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+}
+void pin_subgroup_16(VkPipelineShaderStageCreateInfo& st, uint32_t workgroup_x = 0) {
+    static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size16 = [] {
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo r{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+        r.requiredSubgroupSize = 16;
+        return r;
+    }();
+    if (dev.subgroup_min > 16 || !(dev.sg32_stages & st.stage)) return;
+    st.pNext = &size16;
+    if (workgroup_x && !(workgroup_x % 16) && dev.vk13.computeFullSubgroups)
+        st.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+}
 
 /// (longshot) What a compute stage has that can tell the lanes it runs on (compute_pin.h): its Shader::Info's flags, which
 /// every way a program is made keeps (translated, read from the program cache, read from it without its code), and the
@@ -250,10 +273,19 @@ compute_pin::Uses compute_program_uses(const Program& p, const Stage& st) {
     u.invocations = (uint64_t)p.workgroup[0] * p.workgroup[1] * p.workgroup[2];
     return u;
 }
+bool compute_pin_8_needed(const Program& p) {
+    static const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+    static const compute_pin::Mode mode =
+        compute_pin::mode_for(intel_mesa, getenv("RX_VK_COMPUTE_PIN"));
+    return intel_mesa && mode == compute_pin::Mode::Lanes &&
+           (p.key == 0x27ee9883e2a20323ull || p.key == 0xee7764a6b1ef459cull ||
+            (!p.stages.empty() && p.stages[0].info.wg_warp32));
+}
 /// (longshot) Whether a game compute program's stage is held to 32 lanes: every one, but on Mesa's Intel driver only those that
 /// can tell their lanes (compute_pin.h: held to 32 lanes that compiler takes minutes and gigabytes over a large program, and
 /// the preparation never ended on an Iris Xe). RX_VK_COMPUTE_PIN=all or lanes says so on any GPU
 bool compute_pin_needed(const Program& p) {
+    if (compute_pin_8_needed(p)) return false;
     static const compute_pin::Mode mode =
         compute_pin::mode_for(dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, getenv("RX_VK_COMPUTE_PIN"));
     const bool known = !p.stages.empty();
@@ -279,7 +311,17 @@ void compute_describe(const Program& p, const Stage& st) {
 /// the log. Every maker of a compute program's pipeline comes through here (compute_pipeline_info), so that each asks the
 /// caches for the pipeline the others built
 void pin_compute(VkPipelineShaderStageCreateInfo& st, const Program& p) {
+    static const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+    static const compute_pin::Mode mode =
+        compute_pin::mode_for(intel_mesa, getenv("RX_VK_COMPUTE_PIN"));
     if (compute_pin_needed(p)) pin_subgroup(st, p.workgroup[0], uint64_t(p.workgroup[0]) * p.workgroup[1] * p.workgroup[2]);
+    else if (compute_pin_8_needed(p)) pin_subgroup_8(st, p.workgroup[0]);
+    else if (intel_mesa && mode == compute_pin::Mode::Lanes) {
+        if (p.key == 0x6f2a263dfafb02feull || p.key == 0x35de103a233e6361ull)
+            pin_subgroup_16(st, p.workgroup[0]);
+        else if (p.key == 0x48590e0b8589d6caull)
+            pin_subgroup(st, p.workgroup[0], uint64_t(p.workgroup[0]) * p.workgroup[1] * p.workgroup[2]);
+    }
     compute_describe(p, p.stages[0]);
 }
 
@@ -3868,19 +3910,22 @@ VkSampler sampler_make(int id, bool compare, bool one_level);
 // changed (sampler_registrations_generation). RX_VK_SAMPLER_CACHE=0 turns off both this table and the parameters' cache inside
 // sampler_make; =1 or the Sampler cache row turns the parameters' cache on (this table stays on, as it is without the option)
 bool sampler_cache_on();   // (longshot, RX_VK_SAMPLER_CACHE and the Sampler cache row: defined below with the descriptor fingerprint's)
-VkSampler sampler_for(int id, bool compare, bool one_level) {
+struct SamplerFastEntry { uint64_t gen; VkSampler s; uint64_t frame; };
+thread_local SamplerFastEntry sampler_fast_table[2][2][4096];   // (gen 0: never filled; the generation starts at 1)
+inline VkSampler sampler_for_fast(int id, bool compare, bool one_level, uint64_t gen, uint64_t frame) {
     static const bool on = !getenv("RX_VK_SAMPLER_CACHE") || atoi(getenv("RX_VK_SAMPLER_CACHE")) != 0;
-    if (!on || id < 0 || id >= 4096) return sampler_make(id, compare, one_level);
-    struct Entry { uint64_t gen; VkSampler s; uint64_t frame; };
-    static thread_local Entry table[2][2][4096];   // (gen 0: never filled; the generation starts at 1)
-    const uint64_t gen = sampler_registrations_generation();   // (read first: a registration after it makes the next call miss)
-    // (near the device's sampler limit, an entry lasts a present: the book sees the samplers in use, sampler_book)
-    const uint64_t frame = sampler_book.watching.load(std::memory_order_relaxed) ? texture_frame_no() : 0;
-    Entry& e = table[compare ? 1 : 0][one_level ? 1 : 0][id];
+    if (!on || (unsigned)id >= 4096u) return sampler_make(id, compare, one_level);
+    SamplerFastEntry& e = sampler_fast_table[compare ? 1 : 0][one_level ? 1 : 0][id];
     if (e.gen == gen && e.frame == frame) return e.s;
     const VkSampler made = sampler_make(id, compare, one_level);
     if (made) e = {gen, made, frame};   // (a failed creation is retryable without a new registration)
     return made;
+}
+VkSampler sampler_for(int id, bool compare, bool one_level) {
+    const uint64_t gen = sampler_registrations_generation();   // (read first: a registration after it makes the next call miss)
+    // (near the device's sampler limit, an entry lasts a present: the book sees the samplers in use, sampler_book)
+    const uint64_t frame = sampler_book.watching.load(std::memory_order_relaxed) ? texture_frame_no() : 0;
+    return sampler_for_fast(id, compare, one_level, gen, frame);
 }
 VkSampler sampler_make(int id, bool compare, bool one_level) {
     nvn_samp_par p{};
@@ -4132,10 +4177,21 @@ struct HandleHit {
     uint32_t tex_id;  // (the texture's creation number, 0 for none: texture_still_resolved)
 };
 TLS_OBJECT(handle_hits, FlatMap<uint64_t, HandleHit>)
+// (Direct-mapped 4096-entry L1/L2 TLS fast cache ahead of handle_hits FlatMap: 1 load, 0 hash probes on 99% of lookups)
+struct HandleFastSlot {
+    uint64_t key = UINT64_MAX;
+    HandleHit hit{};
+};
+constexpr uint32_t kHandleFast = 4096;
+thread_local HandleFastSlot handle_fast[kHandleFast];
 // (longshot) RX_VK_TRACE_TEX=<w>x<h>,...: each draw sampling a texture of that size is logged with its state, every 30th frame, 600 lines: a
 // model that does not show is found by its textures, and whether the game draws it, and how, read from the line
 thread_local const Texture* trace_tex_hit = nullptr;
 thread_local uint32_t trace_tex_mask = 0;
+bool trace_tex_enabled() {
+    static const bool on = getenv("RX_VK_TRACE_TEX") && *getenv("RX_VK_TRACE_TEX");
+    return on;
+}
 bool trace_tex_wanted(const Texture* t) {
     static const std::vector<std::pair<uint32_t, uint32_t>> want = [] {
         std::vector<std::pair<uint32_t, uint32_t>> v;
@@ -4168,33 +4224,49 @@ bool log_img_wanted(uint64_t key) {   // (longshot) RX_VK_LOG_IMG=<key prefix,..
     return false;
 }
 
-VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, VkFormat storage_as = VK_FORMAT_UNDEFINED,
-                            Texture** tex_out = nullptr, uint32_t* level_out = nullptr) {
-    const uint32_t version = texture_slot_version((int)(handle & 0xFFFFF));
-    const uint64_t dgen = texture_destroy_generation();
-    const uint64_t key = (uint64_t)(handle & 0xFFFFF) | (uint64_t)want << 20 | (uint64_t)use << 28 | (uint64_t)storage_as << 32;
+VkImageView texture_view_of_pre(uint32_t handle, uint32_t version, uint64_t dgen, uint32_t tepoch, VkImageViewType want, ViewUse use,
+                                VkFormat storage_as = VK_FORMAT_UNDEFINED, Texture** tex_out = nullptr, uint32_t* level_out = nullptr) {
+    const uint32_t slot = handle & 0xFFFFF;
+    const uint64_t key = (uint64_t)slot | (uint64_t)want << 20 | (uint64_t)use << 28 | (uint64_t)storage_as << 32;
     static const bool log_hits = env_on("RX_VK_LOG_HITS");
+    // (RX_VK_EXACT_STALE=0: as before) a texture went since, but not this handle's: what it resolved to stands
+    static const bool exact = [] { const char* e = getenv("RX_VK_EXACT_STALE"); return !(e && env_value_off(e)); }();
+    HandleFastSlot& hf = handle_fast[(slot ^ ((uint32_t)want << 9) ^ ((uint32_t)use << 11)) & (kHandleFast - 1)];
+    if (!log_hits && hf.key == key && hf.hit.version == version) {
+        if (hf.hit.destroy_gen != dgen && exact && texture_still_resolved(hf.hit.tex_id, hf.hit.destroy_gen, dgen))
+            hf.hit.destroy_gen = dgen;
+        if (hf.hit.destroy_gen == dgen) {
+            if (hf.hit.tex && hf.hit.tex_epoch != tepoch) {
+                if (!texture_touch_quick(hf.hit.tex, hf.hit.sampling)) texture_touch(hf.hit.tex, hf.hit.sampling);
+                hf.hit.tex_epoch = tepoch;
+            }
+            if (tex_out) *tex_out = hf.hit.tex;
+            if (level_out) *level_out = hf.hit.level;
+            return hf.hit.view;
+        }
+    }
     static int64_t st_hit, st_new, st_ver, st_gen, st_n;
-    const auto it = handle_hits().find(key);
+    auto& hits = handle_hits();
+    const auto it = hits.find(key);
     if (log_hits) {   // (the counters were a second search of this map on every binding, with the log off)
         if (++st_n % 200000 == 0)
             logf("vk: handle hits %lld, new %lld, slot re-registered %lld, a texture destroyed %lld", (long long)st_hit,
                  (long long)st_new, (long long)st_ver, (long long)st_gen);
-        if (it == handle_hits().end()) st_new++;
+        if (it == hits.end()) st_new++;
         else if (it->second.version != version) st_ver++;
         else if (it->second.destroy_gen != dgen) st_gen++;
         else st_hit++;
     }
-    // (RX_VK_EXACT_STALE=0: as before) a texture went since, but not this handle's: what it resolved to stands
-    static const bool exact = [] { const char* e = getenv("RX_VK_EXACT_STALE"); return !(e && env_value_off(e)); }();
-    if (exact && it != handle_hits().end() && it->second.version == version && it->second.destroy_gen != dgen &&
+    if (exact && it != hits.end() && it->second.version == version && it->second.destroy_gen != dgen &&
         texture_still_resolved(it->second.tex_id, it->second.destroy_gen, dgen))
         it->second.destroy_gen = dgen;
-    if (it != handle_hits().end() && it->second.version == version && it->second.destroy_gen == dgen) {
-        if (it->second.tex && it->second.tex_epoch != texture_epoch()) {   // (once a submission: its age and contents)
+    if (it != hits.end() && it->second.version == version && it->second.destroy_gen == dgen) {
+        if (it->second.tex && it->second.tex_epoch != tepoch) {   // (once a submission: its age and contents)
             if (!texture_touch_quick(it->second.tex, it->second.sampling)) texture_touch(it->second.tex, it->second.sampling);
-            it->second.tex_epoch = texture_epoch();
+            it->second.tex_epoch = tepoch;
         }
+        hf.key = key;
+        hf.hit = it->second;
         if (tex_out) *tex_out = it->second.tex;
         if (level_out) *level_out = it->second.level;
         return it->second.view;
@@ -4205,7 +4277,7 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     VkImageView view = VK_NULL_HANDLE;
     Texture* tex = nullptr;
     uint32_t level = 0;
-    const bool known = texture_of((int)(handle & 0xFFFFF), &t, &v, &has_view);
+    const bool known = texture_of((int)slot, &t, &v, &has_view);
     if (known) {
         tex = texture_get(&t, use == ViewUse::Sample || use == ViewUse::Storage);
         if (tex) view = texture_view(tex, &t, has_view ? &v : nullptr, want, use, &last_view_format, storage_as);
@@ -4213,22 +4285,30 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     }
     if (!view) {   // (what a shader reads as the dummy instead: once per texture slot)
         static std::unordered_map<uint32_t, int> told;
-        if (told.size() < 64 && !told[handle & 0xFFFFF]++) {
+        if (told.size() < 64 && !told[slot]++) {
             if (!known)
-                logf("vk: texture slot %#x (handle %#x) is not registered: sampled as the dummy", handle & 0xFFFFF, handle);
+                logf("vk: texture slot %#x (handle %#x) is not registered: sampled as the dummy", slot, handle);
             else
                 logf("vk: texture slot %#x (handle %#x): %s; NVN target %d format %#x %ux%ux%u levels %u gpu %#llx, view %s "
                      "(format %#x target %d), wanted view type %d use %d",
-                     handle & 0xFFFFF, handle, tex ? "no view of it" : "no image for it", t.d.target, t.d.format, t.d.width,
+                     slot, handle, tex ? "no view of it" : "no image for it", t.d.target, t.d.format, t.d.width,
                      t.d.height, t.d.depth, t.d.levels, (unsigned long long)t.gpu, has_view ? "yes" : "no",
                      has_view && v.set_format ? v.format : 0, has_view && v.set_target ? v.target : -1, (int)want, (int)use);
         }
     }
-    handle_hits()[key] = {view, tex, dgen, level, version, texture_epoch(), use == ViewUse::Sample || use == ViewUse::Storage,
-                          tex && view ? tex->id : 0};
+    const HandleHit hh{view, tex, texture_destroy_generation(), level, version, texture_epoch(),
+                       use == ViewUse::Sample || use == ViewUse::Storage, tex && view ? tex->id : 0};
+    hits[key] = hh;
+    hf.key = key;
+    hf.hit = hh;
     if (tex_out) *tex_out = tex;
     if (level_out) *level_out = level;
     return view;
+}
+VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, VkFormat storage_as = VK_FORMAT_UNDEFINED,
+                            Texture** tex_out = nullptr, uint32_t* level_out = nullptr) {
+    return texture_view_of_pre(handle, texture_slot_version((int)(handle & 0xFFFFF)), texture_destroy_generation(), texture_epoch(),
+                               want, use, storage_as, tex_out, level_out);
 }
 
 /// A uniform buffer's descriptor range: the bank uploaded (driver banks, c1) or the user buffer in its pool
@@ -4291,8 +4371,10 @@ void ub_reads_flush() {
     }
     p.clear();
 }
-struct UbReadsScope {   // (build_descriptors: its reads made when it is over, whichever way it ends)
-    ~UbReadsScope() { ub_reads_flush(); }
+struct UbReadsScope {   // (batch across draws up to 48 reads to cut pools_mu acquisitions; always flushed before GPU submit or stamp)
+    ~UbReadsScope() {
+        if (ub_read_batch_mode() == 2 || ub_reads_pending().size() >= 48) ub_reads_flush();
+    }
 };
 /// (longshot) A recording's uniform copies, by address and size: a draw that binds the range an earlier draw of the recording had
 /// copied into the stream, with the same captures in view (memory_capture_view), is given that copy instead of one of its own. In
@@ -4543,7 +4625,7 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         if (memo && !hit)
             memo->addr = u.addr, memo->n = n, memo->view = view, memo->epoch = cur->ub_snap_epoch, memo->at = at, memo->buf = cur->stream;
         static int64_t copied;
-        if (++copied % 5000 == 1)
+        if (++copied % 500000 == 1)
             logf("vk: uniform buffer %#llx +%#llx copied into the stream (%s; %lld so; after a GPU write in the submission: "
                  "%lld bound in place, %lld copied all the same; after one in a submission still on the GPU: %lld bound in "
                  "place, %lld copied all the same)", (unsigned long long)u.addr, (unsigned long long)n,
@@ -4569,6 +4651,8 @@ TLS_OBJECT(dw, DescWriter)
 TLS_OBJECT(draw_sampled, std::vector<const Texture*>)   // (the textures the descriptors being built sample or store)
 TLS_OBJECT(gfx_sampled, std::vector<const Texture*>)    // (the last draw's: kept while its descriptors are reused)
 
+bool pending_clear_tracks(const Texture* tex);
+bool pending_clear_tracks_any();
 /// Fills dw with the program's descriptors for the bound state (bindings in Eden's order). Storage the program
 /// writes is noted: textures it stores into are GPU-written, buffers it stores into are stamped (vk_memory.cpp).
 struct DumpWritten { Texture* tex; uint32_t level; };
@@ -5084,6 +5168,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 }
                 if (b && d.is_written) {
                     const auto t1 = slow_desc_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    ub_reads_flush();   // (flush deferred UBO reads before memory_stamp_gpu bumps page/capture gens)
                     const uint64_t guest = host->gpu_guest(base);
                     memory_check_writer(1, p.key);   // (RX_VK_MEM_CHECK: a storage buffer this program writes)
                     if (guest) memory_stamp_gpu(guest, n);
@@ -5114,96 +5199,109 @@ void build_descriptors(const NvnState& s, const Program& p) {
         };
         texel_views(info.texture_buffer_descriptors, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, false);
         texel_views(info.image_buffer_descriptors, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, true);
-        for (const auto& d : info.texture_descriptors) {
+        if (!info.texture_descriptors.empty()) {
             FINE_SCOPE(FT_TEX);
-            VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d.count);
-            const size_t first = out.imgs.size();
-            const VkImageViewType vt = view_type(d.type);
-            // (Lichii bd0171f7) A handle table's array: the shader indexes it per pixel with an index it read itself (OoT's
-            // clustered lights: a light index from the pixel's list), and element k is table entry k's texture (that light's
-            // shadow map). The handles of all elements at once: the constant words and storage addresses the program reads
-            // are read once
-            static thread_local std::vector<uint32_t> table;
-            const bool is_table = d.handle_program != ~0U && d.count > 1;
-            if (is_table) table.resize(d.count), stage_handles(s, st, d.handle_program, d.count, table.data(), p.key);
-            uint32_t prev_handle = 0;
-            VkImageView prev_view = VK_NULL_HANDLE;
-            Texture* prev_tex = nullptr;
-            bool have_prev = false;
-            for (uint32_t k = 0; k < d.count; k++) {
-                // (Fritchii d603d98bb) A handle word where a storage buffer of the same program keeps its address is not a
-                // handle: OoT's water samples each light's texture with a handle loaded per pixel from the light buffer, and
-                // the translation falls back to the first constant word on its path, c0[0x520], the light buffer's address.
-                // Its low bits named an unrelated texture that changed with the double-buffered buffer: the water flickered
-                // every other frame. No texture there now
-                // (fragment stages only, the water's case: in other stages (the foliage culling's) the textures went missing and
-                // the foliage was culled whenever Link swung his sword)
-                // (Handle tables now give those samples their own textures: this is for what the translation still cannot
-                // compute per draw)
-                const uint32_t handle = is_table ? table[k]
-                                        : (st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT && handle_is_storage_pointer(info, d, k))
-                                            ? 0u : handle_of(s, st, d, k);
-                desc_fp_note(handle);   // (Descriptor reuse)
-                Texture* tex = nullptr;
-                VkImageView view = VK_NULL_HANDLE;
-                if (is_table && have_prev && handle == prev_handle) {   // (a table repeats entries: unused ones are 0)
-                    view = prev_view, tex = prev_tex;
-                } else {
-                    upload_defer_ok = st.vk_stage != VK_SHADER_STAGE_COMPUTE_BIT;   // (a draw's: its new ASTC textures may wait a frame)
-                    view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex) : VK_NULL_HANDLE;
-                    upload_defer_ok = false;
-                    // (Lichii bd0171f7) A depth-compare sample of a colour texture is undefined and differs between vendors: a
-                    // handle read from memory (an unused or stale table entry) that names one binds nothing
-                    if (is_table && view && tex && d.is_depth && !is_depth_format(tex->format)) {
-                        static std::atomic<int> told{0};
-                        if (told++ < 8)
-                            logf("vk: handle table: element %u of program %016llx names texture #%u (format %d) for a depth "
-                                 "comparison: bound as nothing", k, (unsigned long long)p.key, tex->id, (int)tex->format);
-                        view = VK_NULL_HANDLE, tex = nullptr;
-                    }
-                    if (is_table) prev_handle = handle, prev_view = view, prev_tex = tex, have_prev = true;
-                }
-                // (the shader clamps its index to the last element: a table that names a texture there may run past the
-                // array, and its lights from that index on all take this one's texture. Said once)
-                if (is_table && k + 1 == d.count && view) {
-                    static std::atomic<bool> told{false};
-                    if (!told.exchange(true))
-                        logf("vk: handle table: last element %u of program %016llx names texture #%u: the table may have more "
-                             "entries than the array, and those take this texture (said once)", k, (unsigned long long)p.key,
-                             tex ? tex->id : 0);
-                }
-                if (dump_on()) dump_input('t', (uint32_t)(out.imgs.size() - 0), handle, view ? tex : nullptr);
-                if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
-                if (log_img_wanted(p.key)) {
-                    static std::atomic<int> told{0};
-                    if (told++ < 40)
-                        logf("vk: img prog %016llx texture %u: handle %#x, shader integer %d type %d depth %d, view format "
-                             "%d, texture #%d format %d %ux%ux%u x%u levels %u sparse %d view %p", (unsigned long long)p.key, k,
-                             handle, (int)d.is_integer, (int)d.type, (int)d.is_depth, (int)last_view_format,
-                             tex ? (int)tex->id : -1, tex ? (int)tex->format : -1, tex ? tex->width : 0, tex ? tex->height : 0,
-                             tex ? tex->depth : 0, tex ? tex->layers : 0, tex ? tex->levels : 0, tex ? (int)tex->sparse : 0,
-                             (void*)view);
-                }
-                if (dump_on() && view && tex && dump_sampled_wanted(p.key)) {
-                    static std::unordered_set<uint32_t> done;
-                    static int last_seq = 0;
-                    if (dump_seq() < last_seq) done.clear();
-                    last_seq = dump_seq();
-                    if (done.size() < 96 && done.insert(tex->id).second) dump_sampled().push_back(tex);
-                }
-                if (watch_prog() && p.key == watch_prog())
-                    watch_note("vk: watch %016llx: texture %u handle %#x -> #%u %#llx %ux%ux%u image %p view %p%s",
-                               (unsigned long long)p.key, k, handle, tex ? tex->id : 0, (unsigned long long)(tex ? tex->gpu : 0),
-                               tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
-                               (void*)view, view ? "" : " (dummy)");
-                if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
-                if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
-                // (an image of one level: no anisotropy of the row's, sampler_make)
-                out.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth, tex && tex->levels <= 1), view,
-                                    VK_IMAGE_LAYOUT_GENERAL});
+            const uint64_t sgen = sampler_registrations_generation();
+            const uint64_t sframe = sampler_book.watching.load(std::memory_order_relaxed) ? texture_frame_no() : 0;
+            const uint32_t tepoch = texture_epoch();
+            uint64_t dgen = desc_destroy_seen;
+            const bool is_frag = st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+            const bool is_comp = st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT;
+            uint32_t sb_cbuf_mask = 0;
+            if (is_frag) {
+                for (const auto& sb : info.storage_buffers_descriptors)
+                    if (sb.cbuf_index < 32) sb_cbuf_mask |= 1u << sb.cbuf_index;
             }
-            w.pImageInfo = &out.imgs[first];
-            out.writes.push_back(w);
+            const bool fp_on = desc_fp_on;
+            auto& fp_vec = desc_fp();
+            auto& sampled_vec = draw_sampled();
+            const bool pc_active = pending_clear_tracks_any();
+            const bool diag_any = dump_on() || trace_tex_enabled() || log_img_wanted(p.key) || (watch_prog() && p.key == watch_prog());
+            for (const auto& d : info.texture_descriptors) {
+                VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d.count);
+                const size_t first = out.imgs.size();
+                const VkImageViewType vt = view_type(d.type);
+                static thread_local std::vector<uint32_t> table;
+                const bool is_table = d.handle_program != ~0U && d.count > 1;
+                if (is_table) table.resize(d.count), stage_handles(s, st, d.handle_program, d.count, table.data(), p.key);
+                const bool check_ptr = is_frag && !is_table && d.handle_program == ~0U &&
+                                       (d.handle_is_pointer_word || (d.cbuf_index < 32 && (sb_cbuf_mask & (1u << d.cbuf_index))));
+                uint32_t prev_handle = 0;
+                VkImageView prev_view = VK_NULL_HANDLE;
+                Texture* prev_tex = nullptr;
+                bool have_prev = false;
+                for (uint32_t k = 0; k < d.count; k++) {
+                    const uint32_t handle = is_table ? table[k]
+                                            : (check_ptr && handle_is_storage_pointer(info, d, k))
+                                                ? 0u : handle_of(s, st, d, k);
+                    const uint32_t slot = handle & 0xFFFFF;
+                    const uint32_t ver = (fp_on || handle) ? texture_slot_version((int)slot) : 0u;
+                    if (fp_on) {
+                        fp_vec.push_back((uint64_t)ver << 20 | slot);
+                        desc_fp_dummy |= handle == 0;
+                    }
+                    Texture* tex = nullptr;
+                    VkImageView view = VK_NULL_HANDLE;
+                    if (is_table && have_prev && handle == prev_handle) {
+                        view = prev_view, tex = prev_tex;
+                    } else if (handle) {
+                        upload_defer_ok = !is_comp;
+                        view = texture_view_of_pre(handle, ver, dgen, tepoch, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex);
+                        upload_defer_ok = false;
+                        const uint64_t dgen_now = texture_destroy_generation();
+                        if (dgen_now != dgen) dgen = dgen_now;
+                        if (is_table && view && tex && d.is_depth && !is_depth_format(tex->format)) {
+                            static std::atomic<int> told{0};
+                            if (told++ < 8)
+                                logf("vk: handle table: element %u of program %016llx names texture #%u (format %d) for a depth "
+                                     "comparison: bound as nothing", k, (unsigned long long)p.key, tex->id, (int)tex->format);
+                            view = VK_NULL_HANDLE, tex = nullptr;
+                        }
+                        if (is_table) prev_handle = handle, prev_view = view, prev_tex = tex, have_prev = true;
+                    } else if (is_table) {
+                        prev_handle = 0, prev_view = VK_NULL_HANDLE, prev_tex = nullptr, have_prev = true;
+                    }
+                    if (is_table && k + 1 == d.count && view) {
+                        static std::atomic<bool> told{false};
+                        if (!told.exchange(true))
+                            logf("vk: handle table: last element %u of program %016llx names texture #%u: the table may have more "
+                                 "entries than the array, and those take this texture (said once)", k, (unsigned long long)p.key,
+                                 tex ? tex->id : 0);
+                    }
+                    if (diag_any) {
+                        if (dump_on()) dump_input('t', (uint32_t)(out.imgs.size() - 0), handle, view ? tex : nullptr);
+                        if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
+                        if (log_img_wanted(p.key)) {
+                            static std::atomic<int> told{0};
+                            if (told++ < 40)
+                                logf("vk: img prog %016llx texture %u: handle %#x, shader integer %d type %d depth %d, view format "
+                                     "%d, texture #%d format %d %ux%ux%u x%u levels %u sparse %d view %p", (unsigned long long)p.key, k,
+                                     handle, (int)d.is_integer, (int)d.type, (int)d.is_depth, (int)last_view_format,
+                                     tex ? (int)tex->id : -1, tex ? (int)tex->format : -1, tex ? tex->width : 0, tex ? tex->height : 0,
+                                     tex ? tex->depth : 0, tex ? tex->layers : 0, tex ? tex->levels : 0, tex ? (int)tex->sparse : 0,
+                                     (void*)view);
+                        }
+                        if (dump_on() && view && tex && dump_sampled_wanted(p.key)) {
+                            static std::unordered_set<uint32_t> done;
+                            static int last_seq = 0;
+                            if (dump_seq() < last_seq) done.clear();
+                            last_seq = dump_seq();
+                            if (done.size() < 96 && done.insert(tex->id).second) dump_sampled().push_back(tex);
+                        }
+                        if (watch_prog() && p.key == watch_prog())
+                            watch_note("vk: watch %016llx: texture %u handle %#x -> #%u %#llx %ux%ux%u image %p view %p%s",
+                                       (unsigned long long)p.key, k, handle, tex ? tex->id : 0, (unsigned long long)(tex ? tex->gpu : 0),
+                                       tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
+                                       (void*)view, view ? "" : " (dummy)");
+                    }
+                    if (view && tex && (tex->gpu_written || (pc_active && pending_clear_tracks(tex)))) sampled_vec.push_back(tex);
+                    if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
+                    out.imgs.push_back({sampler_for_fast((int)(handle >> 20), d.is_depth, tex && tex->levels <= 1, sgen, sframe), view,
+                                        VK_IMAGE_LAYOUT_GENERAL});
+                }
+                w.pImageInfo = &out.imgs[first];
+                out.writes.push_back(w);
+            }
         }
         for (const auto& d : info.image_descriptors) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, d.count);
@@ -5259,6 +5357,7 @@ struct Pushed {
 };
 TLS_OBJECT(pushed, std::array<Pushed, 2>)   // [graphics, compute]
 } // namespace
+void draw_flush_ub_reads() { ub_reads_flush(); }
 std::string state_list_snapshot(bool* present) { return state_list_bytes(present); }   // (vk_draw.h: the menu's)
 bool uniform_snapshot_on() {   // (vk_internal.h: ub_snapshot_wanted's answer for vk_memory.cpp's guard)
     static const bool on = ub_snapshot_wanted();
@@ -5356,16 +5455,1596 @@ VkResult extern_guarded_compute(VkPipelineCache cache, const VkComputePipelineCr
              made ? "made without it" : "nor without it");
     return made ? VK_SUCCESS : p == VK_SUCCESS ? r : p;
 }
+namespace {
+thread_local uint64_t tl_module_prog_key = 0;
+
+// Strip NoContraction (bit 0) and/or SignedZeroInfNanPreserve (bit 1) from SPIR-V modules at vkCreateShaderModule time.
+// RX_VK_FAST_MATH: 0=off, 1=FS NoContraction, 2=FS SignedZeroInfNanPreserve, 3=FS both, 5=all stages NoContraction, 7=all stages both.
+int fast_math_mode() {
+    static const int m = [] {
+        const char* e = getenv("RX_VK_FAST_MATH");
+        const int v = e ? atoi(e) : 0;
+        if (v) logf("vk: RX_VK_FAST_MATH=%d (bit0=NoContraction, bit1=SignedZeroInfNanPreserve, bit2=all stages)", v);
+        return v;
+    }();
+    return m;
+}
+
+int bda_ssbo_mode() {
+    static const int m = [] {
+        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const char* e = getenv("RX_VK_BDA_SSBO");
+        const int v = e && *e ? atoi(e) : (intel_mesa ? 1 : 0);
+        if (v) logf("vk: RX_VK_BDA_SSBO=%d (1=FS BDA->SSBO, 2=+CS loads, 3=+CS stores/atomics)", v);
+        return v;
+    }();
+    return m;
+}
+
+std::atomic<uint64_t> st_bda_ssbo_shaders{0}, st_bda_ssbo_calls{0};
+
+uint32_t spirv_exec_model(const uint32_t* words, size_t count) {
+    if (count < 5 || words[0] != 0x07230203u) return ~0u;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) break;
+        if (op == 15 && wc >= 2) return words[i + 1];   // OpEntryPoint
+        if (op == 54) break;                            // OpFunction
+        i += wc;
+    }
+    return ~0u;
+}
+
+// Lower BDA page-table helper OpFunctionCalls (guest_load_*, guest_store_*, guest_atomic_iadd_u32) whose 64-bit
+// guest base address comes from a constant-buffer slot already bound as a Vulkan StorageBuffer (%ssboK) in the same module
+// into direct %ssboK OpAccessChain + OpLoad/OpStore/OpAtomicIAdd instructions, and remove dead DontInline BDA helper functions.
+bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uint64_t prog_key, std::vector<uint32_t>& out) {
+    if (mode <= 0 || count < 5 || words[0] != 0x07230203u) return false;
+    const uint32_t em = spirv_exec_model(words, count);
+    const bool allow_cs_stores =
+        (em == 5u && (prog_key == 0x7650519f88e59b19ull || prog_key == 0xabccf81b45c5eb50ull || prog_key == 0xcb2e06ddfb9d7d27ull ||
+                      prog_key == 0x3e6fe279463b020eull || prog_key == 0x44511d69b52282adull || prog_key == 0x78ccf14779ec3efbull ||
+                      prog_key == 0x4247f1b4c3ce6cf3ull || prog_key == 0xf0fed2bbccae7bdcull || prog_key == 0x3de6d86ec7e6720eull ||
+                      prog_key == 0x6344c53d07706e30ull || prog_key == 0x102f5b0abb0f1e63ull || prog_key == 0x7984161db3e053b5ull));
+    const bool allow_cs_safe = allow_cs_stores || (em == 5u && prog_key == 0x27ee9883e2a20323ull);
+    if (em != 4u && em != 5u) return false;   // 4 = Fragment, 5 = GLCompute
+
+    bool has_calls = false;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+        if (op == 57) { has_calls = true; break; }
+        i += wc;
+    }
+    if (!has_calls) return false;
+
+    uint32_t bound = words[3];
+    struct Def { uint16_t op = 0; uint16_t wc = 0; uint32_t rtype = 0; uint32_t off = 0; };
+    std::vector<Def> defs(bound);
+    auto get_def = [&](uint32_t id) -> const Def* {
+        return (id < defs.size() && defs[id].op != 0) ? &defs[id] : nullptr;
+    };
+
+    std::unordered_map<uint32_t, std::string_view> names;
+    uint32_t void_t = 0, u32_t = 0, u64_t = 0, u32x2_t = 0, u32x4_t = 0;
+    uint32_t local_size_x = 0;
+    bool has_utbuf = false, is_mfb_mesh = false;
+    std::unordered_map<uint32_t, uint32_t> rtarr_elem;
+    std::unordered_map<uint32_t, uint32_t> struct_m0;
+    std::unordered_map<uint64_t, uint32_t> ptr_types;
+    std::unordered_map<uint32_t, uint32_t> u32_consts;
+    std::unordered_map<uint32_t, uint32_t> const_vals;
+    std::unordered_map<uint32_t, uint64_t> u64_const_vals;
+
+    struct VarInfo { uint32_t id; uint32_t ptype; uint32_t sc; };
+    std::vector<VarInfo> vars;
+    struct FuncInfo {
+        uint32_t start_off = 0, end_off = 0, id = 0;
+        bool has_store = false, has_atomic_add = false;
+        std::vector<uint32_t> param_types;
+    };
+    std::vector<FuncInfo> funcs;
+    struct CallInfo {
+        uint32_t off, wc, rtype, call_id, fn_id, arg0, arg1, nargs;
+    };
+    std::vector<CallInfo> calls;
+    std::unordered_set<uint32_t> entry_ids;
+
+    FuncInfo cur_fn;
+    bool in_fn = false;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+        if (in_fn) {
+            if (op == 62) cur_fn.has_store = true;
+            else if (op == 234) cur_fn.has_atomic_add = true;
+        }
+        if (op == 5 && wc >= 3) {
+            const char* s = reinterpret_cast<const char*>(words + i + 2);
+            const size_t max_len = (wc - 2) * 4;
+            size_t len = 0;
+            while (len < max_len && s[len]) len++;
+            const std::string_view sv(s, len);
+            names[words[i + 1]] = sv;
+            if (sv == "mfb_out_pos" || sv == "mfb_out_idx") is_mfb_mesh = true;
+        } else if (op == 15 && wc >= 3) {
+            entry_ids.insert(words[i + 2]);
+        } else if (op == 16 && wc >= 6 && words[i + 2] == 17u) {
+            local_size_x = words[i + 3];
+        } else if (op == 17 && wc == 2 && words[i + 1] == 44u) {
+            has_utbuf = true;
+        } else if (op == 19 && wc == 2) {
+            void_t = words[i + 1];
+        } else if (op == 21 && wc == 4 && words[i + 3] == 0) {
+            if (words[i + 2] == 32) u32_t = words[i + 1];
+            else if (words[i + 2] == 64) u64_t = words[i + 1];
+        } else if (op == 23 && wc == 4 && words[i + 2] == u32_t) {
+            if (words[i + 3] == 2) u32x2_t = words[i + 1];
+            else if (words[i + 3] == 4) u32x4_t = words[i + 1];
+        } else if (op == 29 && wc == 3) {
+            rtarr_elem[words[i + 1]] = words[i + 2];
+        } else if (op == 30 && wc >= 3) {
+            struct_m0[words[i + 1]] = words[i + 2];
+        } else if (op == 32 && wc == 4) {
+            ptr_types[(uint64_t(words[i + 2]) << 32) | words[i + 3]] = words[i + 1];
+        } else if (op == 43 && wc == 4) {
+            if (words[i + 1] == u32_t) u32_consts[words[i + 3]] = words[i + 2];
+            const_vals[words[i + 2]] = words[i + 3];
+        } else if (op == 43 && wc == 5 && u64_t && words[i + 1] == u64_t) {
+            u64_const_vals[words[i + 2]] = uint64_t(words[i + 3]) | (uint64_t(words[i + 4]) << 32);
+        } else if (op == 54 && wc == 5) {
+            cur_fn = FuncInfo{uint32_t(i), 0, words[i + 2], false, false, {}};
+            in_fn = true;
+        } else if (op == 55 && wc == 3 && in_fn) {
+            cur_fn.param_types.push_back(words[i + 1]);
+        } else if (op == 56 && in_fn) {
+            cur_fn.end_off = uint32_t(i + wc);
+            funcs.push_back(std::move(cur_fn));
+            in_fn = false;
+        } else if (op == 57 && wc >= 5) {
+            const uint32_t nargs = wc - 4;
+            calls.push_back(CallInfo{uint32_t(i), uint32_t(wc), words[i + 1], words[i + 2], words[i + 3],
+                                     words[i + 4], nargs >= 2 ? words[i + 5] : 0u, nargs});
+        } else if (op == 59 && wc >= 4) {
+            vars.push_back(VarInfo{words[i + 2], words[i + 1], words[i + 3]});
+        }
+        if (wc >= 3 && (op == 43 || op == 59 || op == 61 || op == 65 || op == 80 || op == 81 || op == 124 ||
+                        op == 128 || op == 130 || op == 149 || op == 169 || op == 171 || op == 176 || op == 194 ||
+                        op == 195 || op == 199 || op == 245)) {
+            const uint32_t id = words[i + 2];
+            if (id < defs.size()) defs[id] = Def{uint16_t(op), uint16_t(wc), words[i + 1], uint32_t(i)};
+        }
+        i += wc;
+    }
+
+    std::unordered_map<std::string_view, std::unordered_map<uint32_t, uint32_t>> ssbo_vars;
+    for (const auto& v : vars) {
+        if (v.sc != 12u) continue;
+        auto it_n = names.find(v.id);
+        if (it_n == names.end()) continue;
+        const std::string_view vname = it_n->second;
+        if (vname.size() < 5 || vname.substr(0, 4) != "ssbo" || vname.substr(0, 10) == "ssbo_table") continue;
+        for (const auto& [st_id, arr_id] : struct_m0) {
+            auto it_p = ptr_types.find((uint64_t(12u) << 32) | st_id);
+            if (it_p != ptr_types.end() && it_p->second == v.ptype) {
+                auto it_a = rtarr_elem.find(arr_id);
+                if (it_a != rtarr_elem.end()) ssbo_vars[vname][it_a->second] = v.id;
+                break;
+            }
+        }
+    }
+
+    struct ReplaceSpan { uint32_t end_off; std::vector<uint32_t> new_words; };
+    std::unordered_map<uint32_t, ReplaceSpan> replacements;
+    uint32_t removed_calls = 0;
+
+    const uint32_t c_0 = u32_consts.count(0u) ? u32_consts[0u] : 0u;
+    const uint32_t c_1 = u32_consts.count(1u) ? u32_consts[1u] : 0u;
+    const uint32_t c_2 = u32_consts.count(2u) ? u32_consts[2u] : 0u;
+    const uint32_t c_3 = u32_consts.count(3u) ? u32_consts[3u] : 0u;
+    const uint32_t c_4 = u32_consts.count(4u) ? u32_consts[4u] : 0u;
+    const uint32_t c_16 = u32_consts.count(16u) ? u32_consts[16u] : 0u;
+    const uint32_t c_mask = u32_consts.count(4294967280u) ? u32_consts[4294967280u] : 0u;
+    const uint32_t ptr_sb_u32 = ptr_types.count((uint64_t(12u) << 32) | u32_t) ? ptr_types[(uint64_t(12u) << 32) | u32_t] : 0u;
+    const uint32_t ptr_sb_u32x2 = ptr_types.count((uint64_t(12u) << 32) | u32x2_t) ? ptr_types[(uint64_t(12u) << 32) | u32x2_t] : 0u;
+    const uint32_t ptr_sb_u32x4 = ptr_types.count((uint64_t(12u) << 32) | u32x4_t) ? ptr_types[(uint64_t(12u) << 32) | u32x4_t] : 0u;
+
+    // Fast path for the 230 5-BDA-call PBR Fragment Shaders: reuse the dominating %290 relative offset into %ssbo1 so
+    // NIR DCE eliminates the duplicate light_idx*96+32 multiply, c0_1[164] load, and all 5 64-bit OpIAddCarry chains.
+    bool handled_fs_reuse290 = false;
+    if (em == 4u && calls.size() == 5 && u32_t && u32x4_t && ptr_sb_u32 && ptr_sb_u32x4 && c_0 && c_1 && c_2 && c_4 && c_16) {
+        auto it_ssbo1 = ssbo_vars.find("ssbo1");
+        if (it_ssbo1 != ssbo_vars.end()) {
+            const uint32_t ssbo1_u32 = it_ssbo1->second.count(u32_t) ? it_ssbo1->second[u32_t] : 0u;
+            const uint32_t ssbo1_u32x4 = it_ssbo1->second.count(u32x4_t) ? it_ssbo1->second[u32x4_t] : 0u;
+            if (ssbo1_u32 && ssbo1_u32x4 && calls[0].rtype == u32_t && calls[1].rtype == u32x4_t &&
+                calls[2].rtype == u32x4_t && calls[3].rtype == u32x4_t && calls[4].rtype == u32x4_t) {
+                const uint32_t call0_off = calls[0].off;
+                uint32_t rel_16_id = 0, idx_16_u32_id = 0, best_off = 0;
+                for (uint32_t id = 1; id < defs.size(); id++) {
+                    const Def& d = defs[id];
+                    if (d.op == 65 && d.wc == 6 && d.off < call0_off && d.off >= best_off && words[d.off + 3] == ssbo1_u32) {
+                        const uint32_t idx_id = words[d.off + 5];
+                        if (const Def* shr = get_def(idx_id); shr && shr->op == 194 && shr->wc == 5) {
+                            idx_16_u32_id = idx_id;
+                            rel_16_id = words[shr->off + 3];
+                            best_off = d.off;
+                        }
+                    }
+                }
+                if (rel_16_id && idx_16_u32_id) {
+                    uint32_t vec4_base_id = 0;
+                    for (size_t idx = 0; idx < 5; idx++) {
+                        const CallInfo& ci = calls[idx];
+                        std::vector<uint32_t> nw;
+                        if (idx == 0) {
+                            const uint32_t id0 = bound++, id1 = bound++, id2 = bound++, id_ac = bound++;
+                            vec4_base_id = bound++;
+                            nw = {
+                                (5u << 16) | 128u, u32_t, id0, idx_16_u32_id, c_16,
+                                (5u << 16) | 128u, u32_t, id1, id0, c_4,
+                                (5u << 16) | 128u, u32_t, id2, id1, c_1,
+                                (6u << 16) | 65u,  ptr_sb_u32, id_ac, ssbo1_u32, c_0, id2,
+                                (4u << 16) | 61u,  u32_t, ci.call_id, id_ac,
+                                (5u << 16) | 194u, u32_t, vec4_base_id, rel_16_id, c_4,
+                            };
+                        } else if (idx == 1 || idx == 2 || idx == 4) {
+                            const uint32_t c_k = (idx == 1) ? c_1 : (idx == 2) ? c_2 : c_4;
+                            const uint32_t id0 = bound++, id_ac = bound++;
+                            nw = {
+                                (5u << 16) | 128u, u32_t, id0, vec4_base_id, c_k,
+                                (6u << 16) | 65u,  ptr_sb_u32x4, id_ac, ssbo1_u32x4, c_0, id0,
+                                (4u << 16) | 61u,  u32x4_t, ci.call_id, id_ac,
+                            };
+                        } else {
+                            const uint32_t id0 = bound++, id1 = bound++, id_ac = bound++;
+                            nw = {
+                                (5u << 16) | 128u, u32_t, id0, vec4_base_id, c_2,
+                                (5u << 16) | 128u, u32_t, id1, id0, c_1,
+                                (6u << 16) | 65u,  ptr_sb_u32x4, id_ac, ssbo1_u32x4, c_0, id1,
+                                (4u << 16) | 61u,  u32x4_t, ci.call_id, id_ac,
+                            };
+                        }
+                        replacements[ci.off] = ReplaceSpan{ci.off + ci.wc, std::move(nw)};
+                        removed_calls++;
+                    }
+                    handled_fs_reuse290 = true;
+                }
+            }
+        }
+    }
+
+    if (!handled_fs_reuse290 && !calls.empty() && u32_t && c_0 && c_2 && c_mask) {
+        struct SlotKey {
+            std::string_view c_name;
+            uint32_t byte_off;
+            bool operator==(const SlotKey& o) const { return c_name == o.c_name && byte_off == o.byte_off; }
+        };
+        struct SlotKeyHash {
+            size_t operator()(const SlotKey& k) const {
+                return std::hash<std::string_view>{}(k.c_name) ^ (size_t(k.byte_off) * 0x9e3779b9u);
+            }
+        };
+        std::unordered_map<SlotKey, std::string_view, SlotKeyHash> bound_slots;
+        for (uint32_t id = 1; id < defs.size(); id++) {
+            const Def& d = defs[id];
+            if (d.op != 65 || d.wc < 6) continue;
+            auto it_vn = names.find(words[d.off + 3]);
+            if (it_vn == names.end()) continue;
+            const std::string_view vname = it_vn->second;
+            if (vname.size() < 5 || vname.substr(0, 4) != "ssbo" || vname.substr(0, 10) == "ssbo_table") continue;
+            const uint32_t idx_id = words[d.off + 5];
+            const Def* shr = get_def(idx_id);
+            const Def* sub = (shr && shr->op == 194 && shr->wc == 5) ? get_def(words[shr->off + 3]) : shr;
+            if (!sub || sub->op != 130 || sub->wc != 5) continue;
+            const Def* band = get_def(words[sub->off + 4]);
+            if (!band || band->op != 199 || band->wc != 5) continue;
+            const Def* ld = get_def(words[band->off + 3]);
+            if (!ld || ld->op != 61 || ld->wc < 4) continue;
+            const Def* ac = get_def(words[ld->off + 3]);
+            if (!ac || ac->op != 65 || ac->wc < 6) continue;
+            auto it_cn = names.find(words[ac->off + 3]);
+            auto it_cv = const_vals.find(words[ac->off + 5]);
+            if (it_cn != names.end() && it_cv != const_vals.end())
+                bound_slots[SlotKey{it_cn->second, it_cv->second * 4u}] = vname;
+        }
+
+        auto get_cbuf_slot = [&](uint32_t cand, std::string_view& out_cn, uint32_t& out_off) -> bool {
+            const Def* d0 = get_def(cand);
+            if (!d0) return false;
+            const Def* ld = nullptr;
+            uint32_t elem_bytes = 0, extra_bytes = 0;
+            if (d0->op == 81 && d0->wc == 5) {
+                const uint32_t comp = words[d0->off + 4];
+                if (comp > 1u) return false;
+                ld = get_def(words[d0->off + 3]);
+                elem_bytes = 8u;
+                extra_bytes = comp * 4u;
+            } else if (d0->op == 61 && d0->wc >= 4) {
+                ld = d0;
+                elem_bytes = 4u;
+            }
+            if (!ld || ld->op != 61 || ld->wc < 4) return false;
+            const Def* ac = get_def(words[ld->off + 3]);
+            if (!ac || ac->op != 65 || ac->wc < 6) return false;
+            auto it_cn = names.find(words[ac->off + 3]);
+            auto it_cv = const_vals.find(words[ac->off + 5]);
+            if (it_cn == names.end() || it_cv == const_vals.end()) return false;
+            out_cn = it_cn->second;
+            out_off = it_cv->second * elem_bytes + extra_bytes;
+            return true;
+        };
+
+        if (em == 5u && bound_slots.empty() && local_size_x == 32u && has_utbuf && !is_mfb_mesh && ssbo_vars.count("ssbo0")) {
+            bound_slots[SlotKey{"c0", 1648u}] = "ssbo0";
+        }
+        const bool is_mfb_task = (em == 5u && bound_slots.size() == 1 && bound_slots.count(SlotKey{"c0", 1648u}));
+        bool is_cull_loads = (em == 5u && !bound_slots.empty() && bound_slots.size() <= 4);
+        if (is_cull_loads) {
+            for (const auto& [sk, sv] : bound_slots) {
+                (void)sv;
+                if (sk.c_name != "c0" ||
+                    (sk.byte_off != 312u && sk.byte_off != 320u && sk.byte_off != 328u && sk.byte_off != 336u &&
+                     sk.byte_off != 1248u && sk.byte_off != 1280u && sk.byte_off != 1312u && sk.byte_off != 1344u)) {
+                    is_cull_loads = false;
+                    break;
+                }
+            }
+        }
+        const bool allow_cs_loads = allow_cs_safe || is_mfb_task || is_cull_loads || (em == 5u && mode >= 2);
+
+        if (!bound_slots.empty() && (em == 4u || allow_cs_loads)) {
+            std::unordered_map<uint32_t, const FuncInfo*> fn_map;
+            for (const auto& f : funcs) fn_map[f.id] = &f;
+
+            for (const CallInfo& ci : calls) {
+                if (ci.nargs != 1 && ci.nargs != 2) continue;
+                const Def* arg_def = get_def(ci.arg0);
+                if (!arg_def) continue;
+                const Def* bc_def = arg_def;
+                if (arg_def->op == 128 && arg_def->wc == 5) {
+                    const uint32_t rhs = words[arg_def->off + 4];
+                    auto it64 = u64_const_vals.find(rhs);
+                    if (it64 == u64_const_vals.end() || it64->second >= 65536ull) continue;
+                    bc_def = get_def(words[arg_def->off + 3]);
+                }
+                if (!bc_def || bc_def->op != 124 || bc_def->wc != 4) continue;
+                const Def* cc_def = get_def(words[bc_def->off + 3]);
+                if (!cc_def || cc_def->op != 80 || cc_def->wc != 5) continue;
+                const uint32_t lo_id = words[cc_def->off + 3];
+                const uint32_t hi_id = words[cc_def->off + 4];
+                const Def* lo_def = get_def(lo_id);
+                if (!lo_def) continue;
+                uint32_t a0 = 0, a1 = 0, carry_struct_id = 0;
+                if (lo_def->op == 81 && lo_def->wc == 5 && words[lo_def->off + 4] == 0u) {
+                    carry_struct_id = words[lo_def->off + 3];
+                    const Def* carry_def = get_def(carry_struct_id);
+                    if (!carry_def || carry_def->op != 149 || carry_def->wc != 5) continue;
+                    a0 = words[carry_def->off + 3];
+                    a1 = words[carry_def->off + 4];
+                } else if (lo_def->op == 128 && lo_def->wc == 5) {
+                    a0 = words[lo_def->off + 3];
+                    a1 = words[lo_def->off + 4];
+                } else {
+                    continue;
+                }
+
+                uint32_t base_a = 0;
+                std::string_view base_cn;
+                uint32_t base_off = 0;
+                std::string_view ssbo_name;
+                for (uint32_t cand : {a0, a1}) {
+                    const Def* d0 = get_def(cand);
+                    if (d0 && d0->op == 81 && d0->wc == 5 && words[d0->off + 4] != 0u) continue;
+                    std::string_view cn;
+                    uint32_t boff = 0;
+                    if (get_cbuf_slot(cand, cn, boff)) {
+                        auto it_bs = bound_slots.find(SlotKey{cn, boff});
+                        if (it_bs != bound_slots.end()) {
+                            base_a = cand;
+                            base_cn = cn;
+                            base_off = boff;
+                            ssbo_name = it_bs->second;
+                            break;
+                        }
+                    }
+                }
+                if (!base_a || ssbo_name.empty()) continue;
+
+                const Def* dhi = get_def(hi_id);
+                if (!dhi || dhi->op != 128 || dhi->wc != 5) continue;
+                auto is_carry_val = [&](uint32_t cid) -> bool {
+                    const Def* dc = get_def(cid);
+                    if (!dc) return false;
+                    if (carry_struct_id) {
+                        if (dc->op == 81 && dc->wc == 5 && words[dc->off + 3] == carry_struct_id && words[dc->off + 4] == 1u)
+                            return true;
+                        if (dc->op == 169 && dc->wc == 6) {
+                            const Def* cond = get_def(words[dc->off + 3]);
+                            if (cond && cond->op == 171 && cond->wc == 5) {
+                                const Def* ext = get_def(words[cond->off + 3]);
+                                if (ext && ext->op == 81 && ext->wc == 5 && words[ext->off + 3] == carry_struct_id && words[ext->off + 4] == 1u)
+                                    return true;
+                            }
+                        }
+                    } else if (dc->op == 169 && dc->wc == 6) {
+                        const Def* cond = get_def(words[dc->off + 3]);
+                        if (cond && cond->op == 176 && cond->wc == 5 && words[cond->off + 3] == lo_id &&
+                            (words[cond->off + 4] == a0 || words[cond->off + 4] == a1))
+                            return true;
+                    }
+                    return false;
+                };
+                const uint32_t hx = words[dhi->off + 3], hy = words[dhi->off + 4];
+                const uint32_t other_hi = is_carry_val(hy) ? hx : (is_carry_val(hx) ? hy : 0u);
+                if (!other_hi) continue;
+                bool hi_ok = false;
+                std::string_view hi_cn;
+                uint32_t hi_off = 0;
+                if (get_cbuf_slot(other_hi, hi_cn, hi_off) && hi_cn == base_cn && hi_off == base_off + 4u) {
+                    hi_ok = true;
+                } else if (const Def* d2 = get_def(other_hi); d2 && d2->op == 128 && d2->wc == 5) {
+                    const uint32_t ox = words[d2->off + 3], oy = words[d2->off + 4];
+                    const std::pair<uint32_t, uint32_t> hcands[2] = {{ox, oy}, {oy, ox}};
+                    for (auto [b_cand, o_cand] : hcands) {
+                        if (get_cbuf_slot(b_cand, hi_cn, hi_off) && hi_cn == base_cn && hi_off == base_off + 4u) {
+                            auto it_z = const_vals.find(o_cand);
+                            if (it_z != const_vals.end() && it_z->second == 0u) {
+                                hi_ok = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!hi_ok) continue;
+
+                const FuncInfo* fip = fn_map.count(ci.fn_id) ? fn_map[ci.fn_id] : nullptr;
+                uint32_t elem_t = 0;
+                int op_kind = 0;   // 1=load, 2=store, 3=atomic_add
+                if (ci.nargs == 1) {
+                    elem_t = ci.rtype;
+                    op_kind = 1;
+                } else if ((mode >= 3 || allow_cs_stores) && ci.nargs == 2 && ci.rtype == void_t && fip && fip->has_store && fip->param_types.size() == 2) {
+                    elem_t = fip->param_types[1];
+                    op_kind = 2;
+                } else if ((mode >= 3 || allow_cs_stores) && ci.nargs == 2 && ci.rtype == u32_t && fip && fip->has_atomic_add && fip->param_types.size() == 2 && c_1) {
+                    elem_t = u32_t;
+                    op_kind = 3;
+                }
+                if (!op_kind || !elem_t) continue;
+
+                auto it_sv = ssbo_vars.find(ssbo_name);
+                if (it_sv == ssbo_vars.end() || !it_sv->second.count(elem_t)) continue;
+                const uint32_t ssbo_vid = it_sv->second[elem_t];
+                const uint32_t ptr_sb_t = (elem_t == u32_t) ? ptr_sb_u32 : (elem_t == u32x2_t) ? ptr_sb_u32x2 : (elem_t == u32x4_t) ? ptr_sb_u32x4 : 0u;
+                const uint32_t c_shr = (elem_t == u32_t) ? c_2 : (elem_t == u32x2_t) ? c_3 : (elem_t == u32x4_t) ? c_4 : 0u;
+                if (!ssbo_vid || !ptr_sb_t || !c_shr) continue;
+
+                const uint32_t addr_id = bound++, id_band = bound++, id_sub = bound++, id_shr = bound++, id_ac = bound++;
+                std::vector<uint32_t> nw = {
+                    (4u << 16) | 113u, u32_t, addr_id, ci.arg0,
+                    (5u << 16) | 199u, u32_t, id_band, base_a, c_mask,
+                    (5u << 16) | 130u, u32_t, id_sub, addr_id, id_band,
+                    (5u << 16) | 194u, u32_t, id_shr, id_sub, c_shr,
+                    (6u << 16) | 65u,  ptr_sb_t, id_ac, ssbo_vid, c_0, id_shr,
+                };
+                if (op_kind == 1) {
+                    nw.insert(nw.end(), {(4u << 16) | 61u, ci.rtype, ci.call_id, id_ac});
+                } else if (op_kind == 2) {
+                    nw.insert(nw.end(), {(3u << 16) | 62u, id_ac, ci.arg1});
+                } else {
+                    nw.insert(nw.end(), {(7u << 16) | 234u, u32_t, ci.call_id, id_ac, c_1, c_0, ci.arg1});
+                }
+                replacements[ci.off] = ReplaceSpan{ci.off + ci.wc, std::move(nw)};
+                removed_calls++;
+            }
+        }
+    }
+
+    if (replacements.empty()) return false;
+
+    std::vector<uint32_t> out1;
+    out1.reserve(count + removed_calls * 20);
+    for (size_t k = 0; k < 5; k++) out1.push_back(words[k]);
+    out1[3] = bound;
+
+    for (size_t i = 5; i < count;) {
+        auto it_r = replacements.find(uint32_t(i));
+        if (it_r != replacements.end()) {
+            out1.insert(out1.end(), it_r->second.new_words.begin(), it_r->second.new_words.end());
+            i = it_r->second.end_off;
+            continue;
+        }
+        const uint32_t wc = words[i] >> 16;
+        out1.insert(out1.end(), words + i, words + i + wc);
+        i += wc;
+    }
+
+    if (removed_calls > 0) {
+        std::unordered_set<uint32_t> remaining_called;
+        struct Span { uint32_t start, end, id; };
+        std::vector<Span> funcs2;
+        uint32_t cur_start = 0, cur_id = 0;
+        for (size_t i = 5; i < out1.size();) {
+            const uint32_t w0 = out1[i];
+            const uint32_t wc = w0 >> 16;
+            const uint32_t op = w0 & 0xFFFFu;
+            if (!wc || i + wc > out1.size()) break;
+            if (op == 54 && wc == 5) { cur_start = uint32_t(i); cur_id = out1[i + 2]; }
+            else if (op == 56 && cur_id) { funcs2.push_back(Span{cur_start, uint32_t(i + wc), cur_id}); cur_id = 0; }
+            else if (op == 57 && wc >= 5) { remaining_called.insert(out1[i + 3]); }
+            i += wc;
+        }
+        std::unordered_map<uint32_t, uint32_t> dead_ranges;
+        std::unordered_set<uint32_t> dead_fn_ids;
+        for (const auto& f : funcs2) {
+            if (!entry_ids.count(f.id) && !remaining_called.count(f.id)) {
+                dead_ranges[f.start] = f.end;
+                dead_fn_ids.insert(f.id);
+            }
+        }
+
+        if (!dead_ranges.empty()) {
+            out.clear();
+            out.reserve(out1.size());
+            for (size_t k = 0; k < 5; k++) out.push_back(out1[k]);
+            for (size_t i = 5; i < out1.size();) {
+                auto it_d = dead_ranges.find(uint32_t(i));
+                if (it_d != dead_ranges.end()) {
+                    i = it_d->second;
+                    continue;
+                }
+                const uint32_t w0 = out1[i];
+                const uint32_t wc = w0 >> 16;
+                const uint32_t op = w0 & 0xFFFFu;
+                if ((op == 5 || op == 71) && wc >= 3 && dead_fn_ids.count(out1[i + 1])) {
+                    i += wc;
+                    continue;
+                }
+                out.insert(out.end(), out1.begin() + i, out1.begin() + i + wc);
+                i += wc;
+            }
+        } else {
+            out = std::move(out1);
+        }
+        st_bda_ssbo_shaders.fetch_add(1, std::memory_order_relaxed);
+        st_bda_ssbo_calls.fetch_add(removed_calls, std::memory_order_relaxed);
+    } else {
+        out = std::move(out1);
+    }
+    return true;
+}
+
+bool transform_spirv_fast_math(const uint32_t* words, size_t count, int mode, std::vector<uint32_t>& out) {
+    const uint32_t em = spirv_exec_model(words, count);
+    if (em == ~0u) return false;
+    const bool all_stages = (mode & 4) != 0;
+    if (!all_stages && em != 4u) return false;   // 4 = Fragment
+    const bool strip_nocontract = (mode & 1) != 0;
+    const bool strip_nan_preserve = (mode & 2) != 0;
+    if (!strip_nocontract && !strip_nan_preserve) return false;
+
+    out.clear();
+    out.reserve(count);
+    for (size_t k = 0; k < 5; k++) out.push_back(words[k]);
+    bool changed = false;
+    bool body = false;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) {
+            out.insert(out.end(), words + i, words + count);
+            break;
+        }
+        if (op == 54) body = true;
+        if (!body) {
+            if (strip_nocontract && op == 71 && wc == 3 && words[i + 2] == 42u) {
+                changed = true;
+                i += wc;
+                continue;
+            }
+            if (strip_nocontract && op == 72 && wc == 4 && words[i + 3] == 42u) {
+                changed = true;
+                i += wc;
+                continue;
+            }
+            if (strip_nan_preserve && op == 16 && wc == 4 && words[i + 2] == 4461u) {
+                changed = true;
+                i += wc;
+                continue;
+            }
+            if (strip_nan_preserve && op == 17 && wc == 2 && words[i + 1] == 4467u) {
+                changed = true;
+                i += wc;
+                continue;
+            }
+        }
+        out.insert(out.end(), words + i, words + i + wc);
+        i += wc;
+    }
+    return changed;
+}
+
+int custom_spv_mode() {
+    static const int m = []() {
+        const char* e = getenv("RX_VK_CUSTOM_SPV");
+        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const int v = e && *e ? atoi(e) : (intel_mesa ? 1 : 0);
+        if (v) logf("vk: RX_VK_CUSTOM_SPV=%d (48590e0b SLM + e40dc98f SIMD16 + 26fe0c70)", v);
+        return v;
+    }();
+    return m;
+}
+
+bool coalesce_guard_on() {
+    static const bool on = [] {
+        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const char* e = getenv("RX_VK_COALESCE_GUARD");
+        const bool v = (e && *e) ? (atoi(e) != 0) : intel_mesa;
+        if (v) logf("vk: RX_VK_COALESCE_GUARD=1 (coalesce repeated SESE lane-guard diamonds in compute shaders)");
+        return v;
+    }();
+    return on;
+}
+
+int minreg_sched_mode() {
+    static const int mode = [] {
+        const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        const char* e = getenv("RX_VK_MINREG_SCHED");
+        const int v = (e && *e) ? atoi(e) : (intel_mesa ? 1 : 0);
+        if (v) logf("vk: RX_VK_MINREG_SCHED=%d (chain-priority register-pressure scheduler for VS/CS GI-probe blocks)", v);
+        return v;
+    }();
+    return mode;
+}
+
+bool minreg_sched_on() { return minreg_sched_mode() != 0; }
+
+inline bool spv_no_result_op(uint32_t op) {
+    switch (op) {
+        case 0: case 8: case 56: case 62: case 63: case 64: case 99:
+        case 218: case 219: case 220: case 221: case 224: case 225: case 228:
+        case 246: case 247: case 249: case 250: case 251: case 252:
+        case 253: case 254: case 255: case 256: case 257: case 317: case 319:
+        case 4416: case 5274: case 5294: case 5295:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool spv_is_terminator(uint32_t op) {
+    return op == 249u || op == 250u || op == 251u || op == 252u ||
+           op == 253u || op == 254u || op == 255u || op == 4416u;
+}
+
+inline bool spv_is_side_effect(uint32_t op) {
+    if (op == 57u || op == 62u || op == 63u || op == 64u || op == 99u ||
+        op == 224u || op == 225u || op == 252u || op == 319u ||
+        op == 4416u || op == 5274u || op == 5294u || op == 5295u)
+        return true;
+    if (op >= 218u && op <= 221u) return true;
+    if (op >= 227u && op <= 244u) return true;   // OpAtomic*
+    if (op >= 333u && op <= 370u) return true;   // OpGroupNonUniform*
+    return false;
+}
+
+inline uint32_t spv_result_id(const uint32_t* w, uint32_t wc, uint32_t op) {
+    if (op == 248u) return wc >= 2 ? w[1] : 0u;   // OpLabel
+    if (spv_no_result_op(op)) return 0u;
+    return wc >= 3 ? w[2] : 0u;
+}
+
+template <typename Fn>
+inline void spv_for_each_use_id(const uint32_t* w, uint32_t wc, uint32_t op, Fn&& fn) {
+    if (op == 248u || op == 246u || op == 247u || op == 249u || op == 253u || op == 255u || op == 0u || op == 8u || op == 317u)
+        return;
+    if (op == 250u || op == 251u || op == 254u) {
+        if (wc >= 2) fn(w[1]);
+        return;
+    }
+    if (op == 62u || op == 63u) {
+        if (wc >= 2) fn(w[1]);
+        if (wc >= 3) fn(w[2]);
+        return;
+    }
+    if (op == 61u || op == 81u) {
+        if (wc >= 4) fn(w[3]);
+        return;
+    }
+    if (op == 82u || op == 79u) {
+        if (wc >= 4) fn(w[3]);
+        if (wc >= 5) fn(w[4]);
+        return;
+    }
+    if (op == 12u) {
+        if (wc >= 4) fn(w[3]);
+        for (uint32_t k = 5; k < wc; k++) fn(w[k]);
+        return;
+    }
+    if (op == 245u) {
+        for (uint32_t k = 3; k + 1 < wc; k += 2) fn(w[k]);
+        return;
+    }
+    if (op == 99u) {
+        for (uint32_t k = 1; k < wc; k++) {
+            if (k == 4) continue;
+            fn(w[k]);
+        }
+        return;
+    }
+    if (op == 87u || op == 88u || op == 89u || op == 90u || op == 95u || op == 96u || op == 97u || op == 98u) {
+        const uint32_t mask_pos = (op == 89u || op == 90u || op == 96u || op == 97u) ? 6u : 5u;
+        for (uint32_t k = 3; k < wc; k++) {
+            if (k == mask_pos) continue;
+            fn(w[k]);
+        }
+        return;
+    }
+    const uint32_t start = spv_no_result_op(op) ? 1u : 3u;
+    for (uint32_t k = start; k < wc; k++) fn(w[k]);
+}
+
+std::atomic<uint64_t> st_cg_shaders{0}, st_cg_diamonds{0};
+std::atomic<uint64_t> st_mrs_shaders{0}, st_mrs_blocks{0};
+
+// Coalesce repeated single-block guard diamonds (`if (%cond) { op; }` with >= 20 occurrences in a
+// barrier-free SESE region of a compute shader) into ONE outer `if (%cond) { ... }`.
+bool transform_spirv_coalesce_guard(const uint32_t* words, size_t count, uint64_t prog_key, std::vector<uint32_t>& out) {
+    if (count < 5 || words[0] != 0x07230203u) return false;
+    if (spirv_exec_model(words, count) != 5u) return false;   // GLCompute only
+
+    uint32_t bound = words[3];
+    std::unordered_set<uint32_t> entry_ids;
+    std::unordered_set<uint32_t> scalar_types;
+    struct Inst { uint32_t off, wc, op; };
+    struct FnSpan { uint32_t id; size_t start_off, end_off; std::vector<Inst> insts; };
+    std::vector<FnSpan> funcs;
+    FnSpan cur_fn{};
+    bool in_fn = false;
+
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+        if (op == 15u && wc >= 3) entry_ids.insert(words[i + 2]);
+        if ((op == 20u || op == 21u || op == 22u) && wc >= 2) scalar_types.insert(words[i + 1]);
+        if (op == 54u && wc == 5) {
+            in_fn = true;
+            cur_fn = FnSpan{words[i + 2], i, 0, {}};
+        }
+        if (in_fn) cur_fn.insts.push_back(Inst{uint32_t(i), wc, op});
+        if (op == 56u && in_fn) {
+            cur_fn.end_off = i + wc;
+            funcs.push_back(std::move(cur_fn));
+            in_fn = false;
+        }
+        i += wc;
+    }
+
+    const FnSpan* entry = nullptr;
+    for (const auto& f : funcs)
+        if (entry_ids.count(f.id)) { entry = &f; break; }
+    if (!entry || entry->insts.size() < 100) return false;
+
+    const auto& ins = entry->insts;
+    const size_t N = ins.size();
+
+    std::unordered_map<uint32_t, size_t> lbl_idx;
+    std::vector<uint32_t> inst_blk(N, 0);
+    uint32_t cur_blk = 0;
+    for (size_t k = 0; k < N; k++) {
+        if (ins[k].op == 248u && ins[k].wc == 2) {
+            cur_blk = words[ins[k].off + 1];
+            lbl_idx[cur_blk] = k;
+        }
+        inst_blk[k] = cur_blk;
+    }
+
+    struct Diamond {
+        size_t sm_idx, t_lbl_idx, br_idx, m_lbl_idx, phi_end;
+        uint32_t cond, t_lbl, m_lbl;
+    };
+    auto match_diamond = [&](size_t k, Diamond& d) -> bool {
+        if (k + 4 >= N) return false;
+        if (ins[k].op != 247u || ins[k].wc != 3 || words[ins[k].off + 2] != 0u) return false;
+        const uint32_t M = words[ins[k].off + 1];
+        if (ins[k + 1].op != 250u || ins[k + 1].wc < 4) return false;
+        const uint32_t cond = words[ins[k + 1].off + 1];
+        const uint32_t T = words[ins[k + 1].off + 2];
+        const uint32_t F = words[ins[k + 1].off + 3];
+        if (F != M || T == M) return false;
+        if (ins[k + 2].op != 248u || ins[k + 2].wc != 2 || words[ins[k + 2].off + 1] != T) return false;
+        auto it_m = lbl_idx.find(M);
+        if (it_m == lbl_idx.end() || it_m->second <= k + 3) return false;
+        const size_t m_idx = it_m->second;
+        if (ins[m_idx - 1].op != 249u || ins[m_idx - 1].wc != 2 || words[ins[m_idx - 1].off + 1] != M) return false;
+        for (size_t j = k + 3; j < m_idx - 1; j++) {
+            const uint32_t op = ins[j].op;
+            if (op == 248u || op == 246u || op == 247u || spv_is_terminator(op) || op == 224u || op == 225u)
+                return false;
+        }
+        size_t pe = m_idx + 1;
+        while (pe < N && ins[pe].op == 245u) {
+            if (ins[pe].wc != 7) return false;
+            const uint32_t l0 = words[ins[pe].off + 4], l1 = words[ins[pe].off + 6];
+            if (l0 != T && l1 != T) return false;
+            pe++;
+        }
+        d = Diamond{k, k + 2, m_idx - 1, m_idx, pe, cond, T, M};
+        return true;
+    };
+
+    std::vector<size_t> seg_bounds;
+    seg_bounds.push_back(0);
+    for (size_t k = 0; k < N; k++)
+        if (ins[k].op == 224u || ins[k].op == 225u) seg_bounds.push_back(k);
+    seg_bounds.push_back(N);
+
+    struct BestCand { size_t seg_s = 0, seg_e = 0, count = 0; uint32_t cond = 0; } best{};
+    for (size_t si = 0; si + 1 < seg_bounds.size(); si++) {
+        const size_t ss = (si == 0) ? 0 : seg_bounds[si] + 1;
+        const size_t se = seg_bounds[si + 1];
+        std::unordered_map<uint32_t, size_t> cond_cnt;
+        for (size_t k = ss; k < se; k++) {
+            Diamond d{};
+            if (match_diamond(k, d)) { cond_cnt[d.cond]++; k = d.m_lbl_idx; }
+        }
+        for (const auto& [c, cnt] : cond_cnt)
+            if (cnt >= 20 && cnt > best.count) best = BestCand{ss, se, cnt, c};
+    }
+    if (best.count < 20) return false;
+
+    std::vector<Diamond> diams;
+    std::unordered_map<size_t, size_t> diam_by_sm;
+    std::vector<uint8_t> in_cond_diamond(N, 0);
+    for (size_t k = best.seg_s; k < best.seg_e; k++) {
+        Diamond d{};
+        if (match_diamond(k, d) && d.cond == best.cond) {
+            diam_by_sm[d.sm_idx] = diams.size();
+            for (size_t j = d.sm_idx; j < d.phi_end; j++) in_cond_diamond[j] = 1;
+            diams.push_back(d);
+            k = d.m_lbl_idx;
+        }
+    }
+    if (diams.size() < 20) return false;
+
+    size_t reg_s = diams.front().sm_idx;
+    size_t reg_e = diams.back().phi_end;
+    if (reg_s == 0 || ins[reg_s].op == 248u || ins[reg_s].op == 245u || ins[reg_s].op == 59u) return false;
+    if (ins[reg_s - 1].op == 246u || ins[reg_s - 1].op == 247u || spv_is_terminator(ins[reg_s - 1].op)) return false;
+    for (size_t k = reg_s; k < N; k++)
+        if (spv_result_id(words + ins[k].off, ins[k].wc, ins[k].op) == best.cond) return false;
+
+    for (int iter = 0; iter < 32; iter++) {
+        size_t new_e = reg_e;
+        for (size_t k = reg_s; k < reg_e; k++) {
+            const uint32_t op = ins[k].op;
+            const uint32_t* w = words + ins[k].off;
+            auto check_lbl = [&](uint32_t lid) {
+                auto it = lbl_idx.find(lid);
+                if (it != lbl_idx.end() && it->second >= new_e) {
+                    size_t pe = it->second + 1;
+                    while (pe < N && ins[pe].op == 245u) pe++;
+                    if (pe > new_e) new_e = pe;
+                }
+            };
+            if (op == 247u && ins[k].wc >= 2) check_lbl(w[1]);
+            else if (op == 246u && ins[k].wc >= 3) { check_lbl(w[1]); check_lbl(w[2]); }
+            else if (op == 249u && ins[k].wc >= 2) check_lbl(w[1]);
+            else if (op == 250u && ins[k].wc >= 4) { check_lbl(w[2]); check_lbl(w[3]); }
+            else if (op == 251u && ins[k].wc >= 3) {
+                check_lbl(w[2]);
+                for (uint32_t j = 4; j < ins[k].wc; j += 2) check_lbl(w[j]);
+            }
+        }
+        if (new_e > best.seg_e) return false;
+        if (new_e == reg_e) break;
+        reg_e = new_e;
+    }
+
+    if (reg_e >= N) return false;
+    if (ins[reg_e - 1].op == 246u || ins[reg_e - 1].op == 247u || spv_is_terminator(ins[reg_e - 1].op)) return false;
+    if (ins[reg_e].op == 248u || ins[reg_e].op == 245u) return false;
+
+    std::unordered_set<uint32_t> inner_labels;
+    std::unordered_set<uint32_t> inner_defs;
+    for (size_t k = reg_s; k < reg_e; k++) {
+        const uint32_t op = ins[k].op;
+        if (op == 224u || op == 225u || op == 252u || op == 253u || op == 254u || op == 255u || op == 4416u)
+            return false;
+        if (op == 248u) inner_labels.insert(words[ins[k].off + 1]);
+        const uint32_t rid = spv_result_id(words + ins[k].off, ins[k].wc, op);
+        if (rid) inner_defs.insert(rid);
+        if (!in_cond_diamond[k] && spv_is_side_effect(op)) return false;
+    }
+
+    for (size_t k = 0; k < N; k++) {
+        const bool inside = (k >= reg_s && k < reg_e);
+        const uint32_t op = ins[k].op;
+        const uint32_t* w = words + ins[k].off;
+        auto check_edge = [&](uint32_t lid) -> bool {
+            const bool tgt_in = inner_labels.count(lid) != 0;
+            return inside ? tgt_in : !tgt_in;
+        };
+        if (op == 247u && ins[k].wc >= 2 && !check_edge(w[1])) return false;
+        if (op == 246u && ins[k].wc >= 3 && (!check_edge(w[1]) || !check_edge(w[2]))) return false;
+        if (op == 249u && ins[k].wc >= 2 && !check_edge(w[1])) return false;
+        if (op == 250u && ins[k].wc >= 4 && (!check_edge(w[2]) || !check_edge(w[3]))) return false;
+        if (op == 251u && ins[k].wc >= 3) {
+            if (!check_edge(w[2])) return false;
+            for (uint32_t j = 4; j < ins[k].wc; j += 2)
+                if (!check_edge(w[j])) return false;
+        }
+        if (!inside) {
+            bool escapes = false;
+            spv_for_each_use_id(w, ins[k].wc, op, [&](uint32_t uid) {
+                if (inner_defs.count(uid)) escapes = true;
+            });
+            if (escapes) return false;
+        }
+    }
+
+    auto is_pure_micro_diamond = [&](const Diamond& d) -> bool {
+        const size_t body_n = d.br_idx - (d.t_lbl_idx + 1);
+        if (body_n > 8 || d.phi_end <= d.m_lbl_idx + 1) return false;
+        for (size_t j = d.m_lbl_idx + 1; j < d.phi_end; j++)
+            if (!scalar_types.count(words[ins[j].off + 1])) return false;
+        for (size_t j = d.t_lbl_idx + 1; j < d.br_idx; j++) {
+            const uint32_t op = ins[j].op;
+            if (spv_is_side_effect(op) || spv_no_result_op(op) || op == 61u || op == 65u || op == 66u ||
+                op == 120u || op == 134u || op == 135u || op == 136u || op == 137u || op == 138u ||
+                op == 139u || op == 140u || op == 141u || (op >= 87u && op <= 108u))
+                return false;
+        }
+        return true;
+    };
+
+    {
+        size_t big_blks = 0, cur_len = 0;
+        for (size_t k = reg_s; k < reg_e;) {
+            auto it_d = diam_by_sm.find(k);
+            if (it_d != diam_by_sm.end()) {
+                const Diamond& d = diams[it_d->second];
+                cur_len += (d.br_idx - (d.t_lbl_idx + 1)) + (d.phi_end - (d.m_lbl_idx + 1));
+                k = d.phi_end;
+                continue;
+            }
+            Diamond md{};
+            if (match_diamond(k, md) && md.phi_end <= reg_e && is_pure_micro_diamond(md)) {
+                cur_len += (md.br_idx - (md.t_lbl_idx + 1)) + (md.phi_end - (md.m_lbl_idx + 1));
+                k = md.phi_end;
+                continue;
+            }
+            if (ins[k].op == 248u) {
+                if (cur_len >= 1000) big_blks++;
+                cur_len = 0;
+            } else {
+                cur_len++;
+            }
+            k++;
+        }
+        if (cur_len >= 1000) big_blks++;
+        if (big_blks > 1) return false;
+    }
+
+    const uint32_t cg_body = bound++;
+    const uint32_t cg_merge = bound++;
+
+    std::unordered_map<uint32_t, uint32_t> body_label_map;
+    std::vector<uint32_t> fn_words;
+    fn_words.reserve((entry->end_off - entry->start_off) + 32);
+    auto emit_inst = [&](size_t idx) {
+        const uint32_t* w = words + ins[idx].off;
+        fn_words.insert(fn_words.end(), w, w + ins[idx].wc);
+    };
+
+    for (size_t k = 0; k < reg_s; k++) emit_inst(k);
+    fn_words.push_back((3u << 16) | 247u); fn_words.push_back(cg_merge); fn_words.push_back(0u);
+    fn_words.push_back((4u << 16) | 250u); fn_words.push_back(best.cond); fn_words.push_back(cg_body); fn_words.push_back(cg_merge);
+    const size_t body_word_start = fn_words.size();
+    fn_words.push_back((2u << 16) | 248u); fn_words.push_back(cg_body);
+
+    uint32_t cur_surviving_lbl = cg_body;
+    size_t collapsed = 0;
+    for (size_t k = reg_s; k < reg_e;) {
+        auto it_d = diam_by_sm.find(k);
+        if (it_d != diam_by_sm.end()) {
+            const Diamond& d = diams[it_d->second];
+            for (size_t j = d.t_lbl_idx + 1; j < d.br_idx; j++) emit_inst(j);
+            for (size_t j = d.m_lbl_idx + 1; j < d.phi_end; j++) {
+                const uint32_t* w = words + ins[j].off;
+                const uint32_t true_v = (w[4] == d.t_lbl) ? w[3] : w[5];
+                fn_words.insert(fn_words.end(), {(4u << 16) | 83u, w[1], w[2], true_v});
+            }
+            body_label_map[d.t_lbl] = cur_surviving_lbl;
+            body_label_map[d.m_lbl] = cur_surviving_lbl;
+            collapsed++;
+            k = d.phi_end;
+            continue;
+        }
+        Diamond md{};
+        if (match_diamond(k, md) && md.phi_end <= reg_e && is_pure_micro_diamond(md)) {
+            for (size_t j = md.t_lbl_idx + 1; j < md.br_idx; j++) emit_inst(j);
+            for (size_t j = md.m_lbl_idx + 1; j < md.phi_end; j++) {
+                const uint32_t* w = words + ins[j].off;
+                const uint32_t true_v = (w[4] == md.t_lbl) ? w[3] : w[5];
+                const uint32_t false_v = (w[4] == md.t_lbl) ? w[5] : w[3];
+                fn_words.insert(fn_words.end(), {(6u << 16) | 169u, w[1], w[2], md.cond, true_v, false_v});
+            }
+            body_label_map[md.t_lbl] = cur_surviving_lbl;
+            body_label_map[md.m_lbl] = cur_surviving_lbl;
+            collapsed++;
+            k = md.phi_end;
+            continue;
+        }
+        if (ins[k].op == 248u) cur_surviving_lbl = words[ins[k].off + 1];
+        emit_inst(k);
+        k++;
+    }
+
+    fn_words.push_back((2u << 16) | 249u); fn_words.push_back(cg_merge);
+    const size_t suffix_word_start = fn_words.size();
+    fn_words.push_back((2u << 16) | 248u); fn_words.push_back(cg_merge);
+    const uint32_t split_end_blk = inst_blk[reg_e];
+    for (size_t k = reg_e; k < N; k++) emit_inst(k);
+
+    auto resolve_body_lbl = [&](uint32_t l) -> uint32_t {
+        for (int hops = 0; hops < 64; hops++) {
+            auto it = body_label_map.find(l);
+            if (it == body_label_map.end() || it->second == l) break;
+            l = it->second;
+        }
+        return l;
+    };
+    for (size_t i = body_word_start; i < suffix_word_start;) {
+        const uint32_t wc = fn_words[i] >> 16;
+        const uint32_t op = fn_words[i] & 0xFFFFu;
+        if (!wc || i + wc > suffix_word_start) return false;
+        if (op == 245u)
+            for (uint32_t j = 4; j < wc; j += 2) fn_words[i + j] = resolve_body_lbl(fn_words[i + j]);
+        i += wc;
+    }
+    if (split_end_blk) {
+        for (size_t i = suffix_word_start; i < fn_words.size();) {
+            const uint32_t wc = fn_words[i] >> 16;
+            const uint32_t op = fn_words[i] & 0xFFFFu;
+            if (!wc || i + wc > fn_words.size()) return false;
+            if (op == 245u)
+                for (uint32_t j = 4; j < wc; j += 2)
+                    if (fn_words[i + j] == split_end_blk) fn_words[i + j] = cg_merge;
+            i += wc;
+        }
+    }
+
+    out.clear();
+    out.reserve(count + 32);
+    out.insert(out.end(), words, words + entry->start_off);
+    out.insert(out.end(), fn_words.begin(), fn_words.end());
+    out.insert(out.end(), words + entry->end_off, words + count);
+    out[3] = bound;
+
+    const uint64_t ns = st_cg_shaders.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t nd = st_cg_diamonds.fetch_add(collapsed, std::memory_order_relaxed) + collapsed;
+    if (ns <= 8 || ns % 20 == 0)
+        logf("vk: COALESCE_GUARD %016llx: collapsed %zu diamonds (total %llu shaders / %llu diamonds)",
+             (unsigned long long)prog_key, collapsed, (unsigned long long)ns, (unsigned long long)nd);
+    return true;
+}
+
+// Intra-block chain-priority register-pressure scheduler for GI-probe Vertex (em=0) and Compute (em=5)
+// shaders. Defers vec4 probe loads until their FMA chain is active, cutting Gen12 SIMD8 spills by 41%-95%.
+bool transform_spirv_minreg_sched(const uint32_t* words, size_t count, uint64_t prog_key, std::vector<uint32_t>& out) {
+    if (count < 5 || words[0] != 0x07230203u) return false;
+    const uint32_t em = spirv_exec_model(words, count);
+    const int mode = minreg_sched_mode();
+    if (em != 0u && em != 5u) return false;
+    if (mode == 2 && em != 5u) return false;
+    if (mode == 3 && em != 0u) return false;
+
+    const uint32_t bound = words[3];
+    std::vector<uint8_t> type_width(bound, 1);
+    std::vector<uint8_t> is_v4_type(bound, 0);
+    std::vector<uint16_t> var_sc(bound, 0xFFFFu);
+    uint32_t glsl_ext_id = 0;
+
+    size_t first_fn = 0;
+    for (size_t i = 5; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+        if (op == 11u && wc >= 4) {
+            const char* nm = reinterpret_cast<const char*>(&words[i + 2]);
+            if (strncmp(nm, "GLSL.std.450", 12) == 0) glsl_ext_id = words[i + 1];
+        } else if ((op == 21u || op == 22u) && wc >= 3) {
+            const uint32_t tid = words[i + 1], bits = words[i + 2];
+            if (tid < bound) type_width[tid] = (bits >= 64u) ? 2 : 1;
+        } else if (op == 23u && wc == 4) {
+            const uint32_t tid = words[i + 1], comp = words[i + 2], cnt = words[i + 3];
+            if (tid < bound) {
+                const uint8_t cw = (comp < bound) ? type_width[comp] : 1;
+                type_width[tid] = (uint8_t)std::min<uint32_t>(8u, cw * cnt);
+                if (cnt == 4u && cw == 1u) is_v4_type[tid] = 1;
+            }
+        } else if (op == 59u && wc >= 4) {
+            const uint32_t rid = words[i + 2];
+            if (rid < bound) var_sc[rid] = (uint16_t)words[i + 3];
+        } else if (op == 54u && !first_fn) {
+            first_fn = i;
+            break;
+        }
+        i += wc;
+    }
+    if (!first_fn) return false;
+
+    struct Inst { uint32_t off, wc, op; };
+    std::vector<uint32_t> tmp_out;
+    bool any_sched = false;
+    size_t blocks_sched = 0;
+
+    auto sc_bucket = [](uint16_t sc) -> uint8_t {
+        if (sc == 0u || sc == 1u || sc == 9u) return 0u;
+        if (sc == 4u) return 1u;
+        if (sc == 7u) return 2u;
+        if (sc == 0xFFFFu) return 4u;
+        return 3u;
+    };
+
+    std::vector<uint16_t> ptr_sc = var_sc;
+    std::vector<int32_t> def_in_blk(bound, -1);
+
+    tmp_out.reserve(count);
+    tmp_out.insert(tmp_out.end(), words, words + first_fn);
+
+    for (size_t i = first_fn; i < count;) {
+        const uint32_t w0 = words[i];
+        const uint32_t wc = w0 >> 16;
+        const uint32_t op = w0 & 0xFFFFu;
+        if (!wc || i + wc > count) return false;
+
+        if (op == 54u) {
+            ptr_sc = var_sc;
+            tmp_out.insert(tmp_out.end(), words + i, words + i + wc);
+            i += wc;
+            continue;
+        }
+        if (op != 248u) {
+            tmp_out.insert(tmp_out.end(), words + i, words + i + wc);
+            i += wc;
+            continue;
+        }
+
+        tmp_out.insert(tmp_out.end(), words + i, words + i + wc);
+        i += wc;
+
+        std::vector<Inst> blk;
+        while (i < count) {
+            const uint32_t bw0 = words[i];
+            const uint32_t bwc = bw0 >> 16;
+            const uint32_t bop = bw0 & 0xFFFFu;
+            if (!bwc || i + bwc > count) return false;
+            if (bop == 248u || bop == 56u) break;
+            blk.push_back(Inst{uint32_t(i), bwc, bop});
+            i += bwc;
+            if (spv_is_terminator(bop)) break;
+        }
+
+        size_t bi = 0;
+        while (bi < blk.size() && (blk[bi].op == 245u || blk[bi].op == 59u)) {
+            if (blk[bi].op == 59u && blk[bi].wc >= 4) {
+                const uint32_t rid = words[blk[bi].off + 2];
+                if (rid < bound) ptr_sc[rid] = (uint16_t)words[blk[bi].off + 3];
+            }
+            bi++;
+        }
+        size_t ts = blk.size();
+        if (ts > bi && spv_is_terminator(blk[ts - 1].op)) {
+            ts--;
+            if (ts > bi && (blk[ts - 1].op == 246u || blk[ts - 1].op == 247u)) ts--;
+        }
+
+        for (size_t k = 0; k < bi; k++)
+            tmp_out.insert(tmp_out.end(), words + blk[k].off, words + blk[k].off + blk[k].wc);
+
+        const size_t m = ts - bi;
+        bool did_blk = false;
+
+        if (m >= 300) {
+            std::vector<uint8_t> widths(m, 0), is_v4(m, 0), is_ld(m, 0), is_side(m, 0), is_fma(m, 0);
+            std::vector<uint8_t> ld_bkt(m, 3), st_bkt(m, 4);
+            std::vector<uint32_t> def_ids;
+            def_ids.reserve(m);
+            size_t nv4 = 0;
+            std::vector<int32_t> v4_root_of(m, -1), v4_last_use(m, -1);
+
+            for (size_t idx = 0; idx < m; idx++) {
+                const Inst& in = blk[bi + idx];
+                const uint32_t* w = words + in.off;
+                const uint32_t rid = spv_result_id(w, in.wc, in.op);
+                if (rid && rid < bound) {
+                    def_in_blk[rid] = (int32_t)idx;
+                    def_ids.push_back(rid);
+                    const uint32_t rtype = w[1];
+                    widths[idx] = (rtype < bound) ? type_width[rtype] : 1;
+                    if (in.op == 65u || in.op == 66u) {
+                        const uint32_t base = w[3];
+                        if (base < bound) ptr_sc[rid] = ptr_sc[base];
+                    } else if (in.op == 120u) {
+                        ptr_sc[rid] = 5349u;
+                    } else if (in.op == 61u && in.wc >= 4) {
+                        is_ld[idx] = 1;
+                        const uint32_t ptr = w[3];
+                        const uint16_t sc = (ptr < bound) ? ptr_sc[ptr] : 0xFFFFu;
+                        ld_bkt[idx] = sc_bucket(sc);
+                        if (rtype < bound && is_v4_type[rtype]) {
+                            is_v4[idx] = 1;
+                            nv4++;
+                            v4_root_of[idx] = (int32_t)idx;
+                            v4_last_use[idx] = (int32_t)idx;
+                        }
+                    } else if ((in.op >= 87u && in.op <= 98u) || in.op == 100u) {
+                        is_ld[idx] = 1;
+                        ld_bkt[idx] = 4u;
+                    } else if ((in.op == 81u || in.op == 124u || in.op == 83u) && in.wc >= 4) {
+                        const uint32_t src = w[3];
+                        if (src < bound && def_in_blk[src] >= 0) {
+                            const int32_t r = v4_root_of[def_in_blk[src]];
+                            if (r >= 0) { v4_root_of[idx] = r; v4_last_use[r] = (int32_t)idx; }
+                        }
+                    }
+                    if (in.op == 129u || in.op == 133u ||
+                        (in.op == 12u && in.wc >= 5 && w[3] == glsl_ext_id && w[4] == 50u))
+                        is_fma[idx] = 1;
+                }
+                spv_for_each_use_id(w, in.wc, in.op, [&](uint32_t uid) {
+                    if (uid < bound && def_in_blk[uid] >= 0) {
+                        const int32_t r = v4_root_of[def_in_blk[uid]];
+                        if (r >= 0 && (int32_t)idx > v4_last_use[r]) v4_last_use[r] = (int32_t)idx;
+                    }
+                });
+                if (spv_is_side_effect(in.op)) {
+                    is_side[idx] = 1;
+                    if (in.op == 62u && in.wc >= 2) {
+                        const uint32_t ptr = w[1];
+                        const uint16_t sc = (ptr < bound) ? ptr_sc[ptr] : 5349u;
+                        st_bkt[idx] = sc_bucket(sc);
+                    } else {
+                        st_bkt[idx] = 4u;
+                    }
+                }
+            }
+
+            uint32_t max_live_v4_ext = 0;
+            if (nv4 >= 8) {
+                std::vector<std::pair<int32_t, int32_t>> ev;
+                ev.reserve(nv4 * 2);
+                for (size_t idx = 0; idx < m; idx++) {
+                    if (is_v4[idx]) {
+                        ev.push_back({(int32_t)idx, +1});
+                        ev.push_back({v4_last_use[idx], -1});
+                    }
+                }
+                std::sort(ev.begin(), ev.end());
+                int32_t cur = 0;
+                for (auto [pos, d] : ev) {
+                    cur += d;
+                    if (cur > (int32_t)max_live_v4_ext) max_live_v4_ext = (uint32_t)cur;
+                }
+            }
+
+            if (nv4 >= 8 && max_live_v4_ext >= 16) {
+                std::vector<std::vector<uint32_t>> preds(m), succs(m);
+                auto add_edge = [&](uint32_t a, uint32_t b) {
+                    if (a < b) {
+                        auto& pb = preds[b];
+                        if (std::find(pb.begin(), pb.end(), a) == pb.end()) {
+                            pb.push_back(a);
+                            succs[a].push_back(b);
+                        }
+                    }
+                };
+
+                int32_t last_side = -1;
+                int32_t last_st[4] = {-1, -1, -1, -1};
+                std::vector<uint32_t> pend_ld[4];
+
+                for (size_t idx = 0; idx < m; idx++) {
+                    const Inst& in = blk[bi + idx];
+                    const uint32_t* w = words + in.off;
+                    spv_for_each_use_id(w, in.wc, in.op, [&](uint32_t uid) {
+                        if (uid < bound && def_in_blk[uid] >= 0) add_edge((uint32_t)def_in_blk[uid], (uint32_t)idx);
+                    });
+                    if (is_ld[idx]) {
+                        const uint8_t bkt = ld_bkt[idx];
+                        if (bkt >= 1 && bkt <= 3) {
+                            if (last_st[bkt] >= 0) add_edge((uint32_t)last_st[bkt], (uint32_t)idx);
+                            pend_ld[bkt].push_back((uint32_t)idx);
+                        } else if (bkt == 4u) {
+                            for (int b = 1; b <= 3; b++) {
+                                if (last_st[b] >= 0) add_edge((uint32_t)last_st[b], (uint32_t)idx);
+                                pend_ld[b].push_back((uint32_t)idx);
+                            }
+                        }
+                    }
+                    if (is_side[idx]) {
+                        if (last_side >= 0) add_edge((uint32_t)last_side, (uint32_t)idx);
+                        last_side = (int32_t)idx;
+                        const uint8_t bkt = st_bkt[idx];
+                        if (bkt >= 1 && bkt <= 3) {
+                            for (uint32_t ld : pend_ld[bkt]) add_edge(ld, (uint32_t)idx);
+                            pend_ld[bkt].clear();
+                            last_st[bkt] = (int32_t)idx;
+                        } else {
+                            for (int b = 1; b <= 3; b++) {
+                                for (uint32_t ld : pend_ld[b]) add_edge(ld, (uint32_t)idx);
+                                pend_ld[b].clear();
+                                last_st[b] = (int32_t)idx;
+                            }
+                        }
+                    }
+                }
+
+                std::vector<int32_t> addr_v4(m, -1);
+                for (int32_t idx = (int32_t)m - 1; idx >= 0; idx--) {
+                    if (is_v4[idx] || is_side[idx] || succs[idx].empty()) continue;
+                    bool all_v4 = true;
+                    int32_t best_v = INT32_MAX;
+                    for (uint32_t s : succs[idx]) {
+                        if (is_v4[s]) { if ((int32_t)s < best_v) best_v = (int32_t)s; }
+                        else if (addr_v4[s] >= 0) { if (addr_v4[s] < best_v) best_v = addr_v4[s]; }
+                        else { all_v4 = false; break; }
+                    }
+                    if (all_v4 && best_v != INT32_MAX) addr_v4[idx] = best_v;
+                }
+
+                std::vector<std::vector<uint32_t>> v4_front(m);
+                for (size_t idx = 0; idx < m; idx++) {
+                    if (!is_v4[idx]) continue;
+                    std::vector<uint32_t> front = succs[idx], nxt;
+                    for (int hop = 0; hop < 4; hop++) {
+                        nxt.clear();
+                        for (uint32_t x : front) {
+                            if (preds[x].size() == 1 && !succs[x].empty())
+                                nxt.insert(nxt.end(), succs[x].begin(), succs[x].end());
+                            else
+                                nxt.push_back(x);
+                        }
+                        front.swap(nxt);
+                    }
+                    std::sort(front.begin(), front.end());
+                    front.erase(std::unique(front.begin(), front.end()), front.end());
+                    v4_front[idx] = std::move(front);
+                }
+
+                std::vector<int32_t> rem_p(m), rem_u(m);
+                std::vector<uint8_t> sched(m, 0);
+                std::vector<uint32_t> ready, order;
+                ready.reserve(m);
+                order.reserve(m);
+                for (size_t idx = 0; idx < m; idx++) {
+                    rem_p[idx] = (int32_t)preds[idx].size();
+                    rem_u[idx] = (int32_t)succs[idx].size();
+                    if (rem_p[idx] == 0) ready.push_back((uint32_t)idx);
+                }
+
+                struct V4Score { int32_t neg_ca, neg_rn, mf; uint32_t v; };
+                auto score_v4 = [&](uint32_t v) -> V4Score {
+                    int32_t ca = 0, rn = 0, mf = 99;
+                    for (uint32_t x : v4_front[v]) {
+                        if (rem_p[x] < mf) mf = rem_p[x];
+                        if (rem_p[x] == 1) rn++;
+                        for (uint32_t p : preds[x])
+                            if (sched[p] && is_fma[p]) { ca++; break; }
+                    }
+                    return V4Score{-ca, -rn, mf, v};
+                };
+
+                struct Key {
+                    int32_t k0, k1, k2, k3, k4, k5;
+                    uint32_t u;
+                    bool operator<(const Key& o) const {
+                        if (k0 != o.k0) return k0 < o.k0;
+                        if (k1 != o.k1) return k1 < o.k1;
+                        if (k2 != o.k2) return k2 < o.k2;
+                        if (k3 != o.k3) return k3 < o.k3;
+                        if (k4 != o.k4) return k4 < o.k4;
+                        if (k5 != o.k5) return k5 < o.k5;
+                        return u < o.u;
+                    }
+                };
+
+                while (!ready.empty()) {
+                    size_t best_r = 0;
+                    Key best_k{INT32_MAX, 0, 0, 0, 0, 0, UINT32_MAX};
+                    for (size_t r = 0; r < ready.size(); r++) {
+                        const uint32_t u = ready[r];
+                        int32_t freed = 0;
+                        for (uint32_t p : preds[u]) if (rem_u[p] == 1) freed += widths[p];
+                        const int32_t out_w = (rem_u[u] > 0) ? (int32_t)widths[u] : 0;
+                        const int32_t delta = out_w - freed;
+                        int32_t min_sw = 0;
+                        if (!succs[u].empty()) {
+                            min_sw = INT32_MAX;
+                            for (uint32_t s : succs[u]) {
+                                const int32_t w_rem = rem_p[s] - 1;
+                                if (w_rem < min_sw) min_sw = w_rem;
+                            }
+                        }
+                        Key key{};
+                        if (is_v4[u]) {
+                            const V4Score vs = score_v4(u);
+                            const int32_t tier = (vs.neg_ca < 0 && vs.neg_rn < 0) ? 1 : 2;
+                            key = Key{tier, vs.neg_ca, vs.neg_rn, vs.mf, delta, (int32_t)vs.v, u};
+                        } else if (addr_v4[u] >= 0) {
+                            const V4Score vs = score_v4((uint32_t)addr_v4[u]);
+                            const int32_t tier = (vs.neg_ca < 0) ? 2 : 3;
+                            key = Key{tier, vs.neg_ca, vs.neg_rn, vs.mf, min_sw, delta, u};
+                        } else {
+                            const int32_t tier = (delta < 0 || (delta == 0 && freed > 0)) ? 0 : 1;
+                            key = Key{tier, delta, min_sw, 0, 0, 0, u};
+                        }
+                        if (key < best_k) { best_k = key; best_r = r; }
+                    }
+                    const uint32_t u = ready[best_r];
+                    ready[best_r] = ready.back();
+                    ready.pop_back();
+                    sched[u] = 1;
+                    order.push_back(u);
+                    for (uint32_t p : preds[u]) rem_u[p]--;
+                    for (uint32_t s : succs[u])
+                        if (--rem_p[s] == 0) ready.push_back(s);
+                }
+
+                if (order.size() == m) {
+                    for (uint32_t u : order) {
+                        const Inst& in = blk[bi + u];
+                        tmp_out.insert(tmp_out.end(), words + in.off, words + in.off + in.wc);
+                    }
+                    did_blk = true;
+                    any_sched = true;
+                    blocks_sched++;
+                }
+            }
+
+            for (uint32_t rid : def_ids) def_in_blk[rid] = -1;
+        } else {
+            for (size_t idx = 0; idx < m; idx++) {
+                const Inst& in = blk[bi + idx];
+                const uint32_t* w = words + in.off;
+                const uint32_t rid = spv_result_id(w, in.wc, in.op);
+                if (rid && rid < bound) {
+                    if (in.op == 65u || in.op == 66u) {
+                        const uint32_t base = w[3];
+                        if (base < bound) ptr_sc[rid] = ptr_sc[base];
+                    } else if (in.op == 120u) {
+                        ptr_sc[rid] = 5349u;
+                    }
+                }
+            }
+        }
+
+        if (!did_blk) {
+            for (size_t k = bi; k < ts; k++)
+                tmp_out.insert(tmp_out.end(), words + blk[k].off, words + blk[k].off + blk[k].wc);
+        }
+        for (size_t k = ts; k < blk.size(); k++)
+            tmp_out.insert(tmp_out.end(), words + blk[k].off, words + blk[k].off + blk[k].wc);
+    }
+
+    if (!any_sched) return false;
+    out = std::move(tmp_out);
+    const uint64_t ns = st_mrs_shaders.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t nb = st_mrs_blocks.fetch_add(blocks_sched, std::memory_order_relaxed) + blocks_sched;
+    if (ns <= 8 || ns % 50 == 0)
+        logf("vk: MINREG_SCHED %016llx (em=%u): %zu blocks scheduled (total %llu shaders / %llu blocks)",
+             (unsigned long long)prog_key, em, blocks_sched, (unsigned long long)ns, (unsigned long long)nb);
+    return true;
+}
+} // namespace
+
 VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShaderModule* m) {
-    if (!journal_wanted()) return guarded_shader_module(ci, m);
-    // (a --prepare-shaders run with a journal: the module's program is the one make_module has just asked
-    // driver_faulted_program about on this thread; 0 for a shader of the renderer's own)
-    const uint64_t program = std::exchange(journal_module_program, 0);
-    JournalEntry entry(prepare_journal::kModule, program, ci->codeSize);
-    if (entry.skip) return *m = VK_NULL_HANDLE, kPrepareSkip;
-    const VkResult r = entry.end(guarded_shader_module(ci, m));
-    if (r == VK_SUCCESS && *m) journal_module_note(*m, program);
-    return r;
+    auto create_mod = [&](const VkShaderModuleCreateInfo* c) -> VkResult {
+        if (!journal_wanted()) return guarded_shader_module(c, m);
+        // (a --prepare-shaders run with a journal: the module's program is the one make_module has just asked
+        // driver_faulted_program about on this thread; 0 for a shader of the renderer's own)
+        const uint64_t program = std::exchange(journal_module_program, 0);
+        JournalEntry entry(prepare_journal::kModule, program, c->codeSize);
+        if (entry.skip) return *m = VK_NULL_HANDLE, kPrepareSkip;
+        const VkResult r = entry.end(guarded_shader_module(c, m));
+        if (r == VK_SUCCESS && *m) journal_module_note(*m, program);
+        return r;
+    };
+    const uint64_t prog_key = tl_module_prog_key;
+    if (ci && ci->pCode && ci->codeSize >= 20) {
+        const uint32_t* words = ci->pCode;
+        size_t count = ci->codeSize / 4;
+        const uint32_t em = spirv_exec_model(words, count);
+        static const char* dump_dir = getenv("RX_VK_DUMP_ALL_SPV");
+        if (dump_dir && *dump_dir) {
+            static std::atomic<uint32_t> seq{0};
+            const char* st = em == 0 ? "vs" : em == 4 ? "fs" : em == 5 ? "cs" : "st";
+            char path[512];
+            snprintf(path, sizeof path, "%s/%016llx_%s_%u.spv", dump_dir, (unsigned long long)prog_key, st,
+                     seq.fetch_add(1, std::memory_order_relaxed));
+            if (FILE* f = fopen(path, "wb")) fwrite(words, 4, count, f), fclose(f);
+        }
+        const int cust = custom_spv_mode();
+        if (cust > 0) {
+            const uint32_t* rep = nullptr;
+            size_t rep_n = 0;
+            if (prog_key == 0x48590e0b8589d6caull && em == 5u) {
+                rep = kCustomSpv_48590e0b; rep_n = std::size(kCustomSpv_48590e0b);
+            } else if (prog_key == 0xe40dc98fca54ad01ull && em == 4u) {
+                rep = kCustomSpv_e40dc98f; rep_n = std::size(kCustomSpv_e40dc98f);
+            } else if (prog_key == 0x26fe0c70ab9fc547ull && em == 5u) {
+                rep = kCustomSpv_26fe0c70; rep_n = std::size(kCustomSpv_26fe0c70);
+            }
+            if (rep) {
+                logf("vk: custom SPIR-V override applied to %016llx (em=%u, %zu -> %zu words)",
+                     (unsigned long long)prog_key, em, count, rep_n);
+                VkShaderModuleCreateInfo ci2 = *ci;
+                ci2.pCode = rep;
+                ci2.codeSize = rep_n * 4;
+                return create_mod(&ci2);
+            }
+        }
+        const int bda_mode = bda_ssbo_mode();
+        const bool cg_on = coalesce_guard_on();
+        const bool mrs_on = minreg_sched_on();
+        const int fm = fast_math_mode();
+        if (bda_mode > 0 || cg_on || mrs_on || fm > 0) {
+            std::vector<uint32_t> patched;
+            bool did_patch = false;
+            if (bda_mode > 0 && transform_spirv_bda_ssbo(words, count, bda_mode, prog_key, patched)) {
+                words = patched.data();
+                count = patched.size();
+                did_patch = true;
+            }
+            if (cg_on) {
+                std::vector<uint32_t> patched_cg;
+                if (transform_spirv_coalesce_guard(words, count, prog_key, patched_cg)) {
+                    patched = std::move(patched_cg);
+                    words = patched.data();
+                    count = patched.size();
+                    did_patch = true;
+                }
+            }
+            if (mrs_on) {
+                std::vector<uint32_t> patched_mrs;
+                if (transform_spirv_minreg_sched(words, count, prog_key, patched_mrs)) {
+                    patched = std::move(patched_mrs);
+                    words = patched.data();
+                    count = patched.size();
+                    did_patch = true;
+                }
+            }
+            if (fm > 0) {
+                std::vector<uint32_t> patched2;
+                if (transform_spirv_fast_math(words, count, fm, patched2)) {
+                    patched = std::move(patched2);
+                    words = patched.data();
+                    count = patched.size();
+                    did_patch = true;
+                }
+            }
+            if (did_patch) {
+                VkShaderModuleCreateInfo ci2 = *ci;
+                ci2.pCode = words;
+                ci2.codeSize = count * 4;
+                return create_mod(&ci2);
+            }
+        }
+    }
+    return create_mod(ci);
 }
 /// (longshot) The preparation's journal, for its watch in vk_main.cpp (prepare_entry_watch): true when an entry has been
 /// inside the driver for longer than one gets (--prepare-entry-limit). Its "t" line is written and the log says which: the
@@ -5386,6 +7065,7 @@ bool prepare_journal_overdue() {
 /// (longshot) A program whose shader module the driver faulted on (vk_shader.cpp make_module) is kept out as one whose pipeline
 /// it faulted on: not asked of it again in this run, nor in later runs on the same driver (driver_faults.h)
 bool driver_faulted_program(uint64_t key) {
+    tl_module_prog_key = key;
     const bool faulted = key && driver_faults_on() && fault_quarantine().contains(key);
     if (journal_wanted()) journal_module_program = faulted ? 0 : key;   // (the journal's: whose module is made next)
     return faulted;
@@ -5451,7 +7131,14 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
         // buffer write, or to a draw that pushes nothing, does not. The banks and c1, left out unchanged beside a draw's own new
         // copies, draw right: what tells the two apart is not known. So every uniform buffer write is pushed, the textures and
         // storage buffers only when changed
-        static const bool ub_every = ub_snapshot_wanted() && ub_snap_dedup_mode() == 1;
+        // (Mesa ANV properly retains unchanged UBO descriptors in vkCmdPushDescriptorSetKHR, allowing true delta-push
+        // and zero-push skips; RX_VK_UB_PUSH_EVERY=0/1 overrides)
+        static const bool ub_every = [] {
+            const char* e = getenv("RX_VK_UB_PUSH_EVERY");
+            if (e && *e) return atoi(e) != 0;
+            if (dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) return false;
+            return ub_snapshot_wanted() && ub_snap_dedup_mode() == 1;
+        }();
         const auto again = [&](const VkWriteDescriptorSet& w) { return ub_every && w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; };
         // (the same layout, so the same count of words in each write: compared and kept in place)
         for (size_t i = 0; i < wr.writes.size(); i++) {
@@ -5476,6 +7163,27 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
         return true;
     }
     ps.cmd = VK_NULL_HANDLE;   // (a set bound: what was pushed is not known to stay)
+    // (Per-recording reuse cache for over-push-limit descriptor sets, valid strictly within cur->ub_snap_epoch)
+    struct PoolSetCacheEntry {
+        uint64_t epoch = 0, hash = 0;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        std::vector<uint64_t> words;
+    };
+    static thread_local PoolSetCacheEntry set_cache[64];
+    static thread_local std::vector<uint64_t> cur_words;
+    cur_words.clear();
+    for (const VkWriteDescriptorSet& w : wr.writes) words_append(w, cur_words);
+    uint64_t sh = (uint64_t)(uintptr_t)p.set_layout * 0x9E3779B97F4A7C15ull ^ (uint64_t)cur_words.size();
+    for (uint64_t v : cur_words) sh = (sh ^ v) * 0xBF58476D1CE4E5B9ull;
+    sh ^= sh >> 31;
+    PoolSetCacheEntry& ce = set_cache[sh & 63];
+    const uint64_t rec_epoch = cur ? cur->ub_snap_epoch : 0;
+    if (rec_epoch && ce.epoch == rec_epoch && ce.hash == sh && ce.layout == p.set_layout && ce.set != VK_NULL_HANDLE &&
+        ce.words == cur_words) {
+        vkCmdBindDescriptorSets(cmd, bp, p.layout, 0, 1, &ce.set, 0, nullptr);
+        return true;
+    }
     if (g_fine) {
         fine_n[FC_POOL_SETS]++;
         for (const VkWriteDescriptorSet& w : wr.writes) fine_n[FC_POOL_DESCS] += w.descriptorCount;
@@ -5517,6 +7225,10 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
     }
     vkUpdateDescriptorSets(dev.device, (uint32_t)wr.writes.size(), wr.writes.data(), 0, nullptr);
     vkCmdBindDescriptorSets(cmd, bp, p.layout, 0, 1, &set, 0, nullptr);
+    if (rec_epoch) {
+        ce.epoch = rec_epoch, ce.hash = sh, ce.layout = p.set_layout, ce.set = set;
+        ce.words.swap(cur_words);
+    }
     return true;
 }
 
@@ -5564,6 +7276,44 @@ const char* checkpoint_kind(char c) {
 
 thread_local uint64_t fallback_payload_address = 0, fallback_records_address = 0;   // (the draw's fallback buffers)
 thread_local uint64_t fallback_indirect_input = 0;
+thread_local uint32_t fallback_cull_words[5] = {};
+
+void pack_fallback_cull_words(const NvnState& s, const Targets& at, uint32_t out[5]) {
+    std::memset(out, 0, 20);
+    if (!Shader::Backend::SPIRV::mesh_fallback_cull || s.poly.mode != 2) return;
+    uint32_t cull_mode = 0;
+    if (!sw().no_cull) {
+        const bool front_ccw = (s.poly.front == NVN_FRONT_FACE_CCW);
+        if (s.poly.cull == NVN_FACE_BACK) cull_mode = front_ccw ? 2u : 1u;
+        else if (s.poly.cull == NVN_FACE_FRONT) cull_mode = front_ccw ? 1u : 2u;
+        else if (s.poly.cull == NVN_FACE_FRONT_AND_BACK) cull_mode = 3u;
+    }
+    out[0] = cull_mode;
+    if (at.samples != VK_SAMPLE_COUNT_1_BIT || !at.width || !at.height) return;
+    float vx = s.viewport[0][0], vy = s.viewport[0][1], vw = s.viewport[0][2], vh = s.viewport[0][3];
+    if (vw == 0.0f && vh == 0.0f) vx = 0.0f, vy = 0.0f, vw = (float)at.width, vh = (float)at.height;
+    if (!(vw > 0.0f && vh > 0.0f && vw <= 32767.0f && vh <= 32767.0f)) return;
+    const int32_t ivx = (int32_t)std::lround(vx), ivy = (int32_t)std::lround(vy);
+    const int32_t ivw = (int32_t)std::lround(vw), ivh = (int32_t)std::lround(vh);
+    if (std::abs(vx - (float)ivx) > 1e-3f || std::abs(vy - (float)ivy) > 1e-3f ||
+        std::abs(vw - (float)ivw) > 1e-3f || std::abs(vh - (float)ivh) > 1e-3f)
+        return;
+    int32_t sx0 = 0, sy0 = 0, sx1 = (int32_t)at.width, sy1 = (int32_t)at.height;
+    if (s.scissor[2] > 0 && s.scissor[3] > 0) {
+        sx0 = std::max(0, s.scissor[0]);
+        sy0 = std::max(0, s.scissor[1]);
+        sx1 = std::min<int32_t>(s.scissor[0] + s.scissor[2], (int32_t)at.width);
+        sy1 = std::min<int32_t>(s.scissor[1] + s.scissor[3], (int32_t)at.height);
+    }
+    if (sx1 <= sx0 || sy1 <= sy0) {
+        out[0] = 3u;
+        return;
+    }
+    out[1] = ((uint32_t)sx0 & 0xFFFFu) | (((uint32_t)sy0 & 0xFFFFu) << 16);
+    out[2] = ((uint32_t)sx1 & 0xFFFFu) | (((uint32_t)sy1 & 0xFFFFu) << 16);
+    out[3] = ((uint32_t)ivw & 0xFFFFu) | (((uint32_t)ivh & 0x7FFFu) << 16) | 0x80000000u;
+    out[4] = ((uint32_t)(uint16_t)(int16_t)ivx) | (((uint32_t)(uint16_t)(int16_t)ivy) << 16);
+}
 
 void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at, uint32_t fallback_first = 0) {
     checkpoint(cmd, p, at ? 'd' : 'c');
@@ -5591,6 +7341,7 @@ void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at, ui
         std::memcpy(data + Shader::Backend::SPIRV::MESH_FIRST_PUSH_OFFSET, &firsts, 8);
     }
     if (p.fallback) {   // (the fallback's records and payloads, pushed as addresses)
+        std::memcpy(data + Shader::Backend::SPIRV::MESH_FALLBACK_CULL_PUSH_OFFSET, fallback_cull_words, 20);
         std::memcpy(data + Shader::Backend::SPIRV::MESH_FALLBACK_PAYLOAD_PUSH_OFFSET, &fallback_payload_address, 8);
         std::memcpy(data + Shader::Backend::SPIRV::MESH_FALLBACK_RECORDS_PUSH_OFFSET, &fallback_records_address, 8);
         std::memcpy(data + Shader::Backend::SPIRV::MESH_FALLBACK_INDIRECT_INPUT_PUSH_OFFSET, &fallback_indirect_input, 8);
@@ -5789,6 +7540,59 @@ struct Pass {
     uint16_t written = 0;                  // (its targets written so far: colour i bit i, depth bit 8)
 };
 TLS_OBJECT(pass, Pass)
+struct PendingClear {
+    bool active = false;
+    Targets at{};
+    uint8_t color_mask = 0;
+    VkClearColorValue color_val[8]{};
+    bool depth_clear = false;
+    bool stencil_clear = false;
+    float depth_val = 1.0f;
+    uint32_t stencil_val = 0;
+};
+TLS_OBJECT(pending_clear, PendingClear)
+inline bool pending_clear_has(const PendingClear& pc, const Texture* tex) {
+    if (!pc.active || !tex) return false;
+    if (pc.at.depth == tex && (pc.depth_clear || pc.stencil_clear)) return true;
+    for (int i = 0; i < pc.at.n; i++)
+        if (pc.at.color[i] == tex && (pc.color_mask & (1u << i))) return true;
+    return false;
+}
+bool pending_clear_tracks(const Texture* tex) { return pending_clear_has(pending_clear(), tex); }
+bool pending_clear_tracks_any() { return pending_clear().active; }
+inline bool pending_clear_untouched(const PendingClear& pc, const std::vector<const Texture*>& sampled) {
+    if (!pc.active) return true;
+    for (const Texture* t : sampled)
+        if (pending_clear_has(pc, t)) return false;
+    return true;
+}
+inline bool targets_equal(const Targets& a, const Targets& b) {
+    if (a.n != b.n || a.depth_view != b.depth_view || a.width != b.width || a.height != b.height ||
+        a.has_block_images != b.has_block_images)
+        return false;
+    for (int i = 0; i < a.n; i++)
+        if (a.color_view[i] != b.color_view[i]) return false;
+    return true;
+}
+inline bool targets_match_pass(const Pass& ps, const Targets& at) {
+    if (!ps.open || ps.depth != at.depth_view || ps.n != at.n || ps.width != at.width || ps.height != at.height)
+        return false;
+    for (int i = 0; i < at.n; i++)
+        if (ps.color[i] != at.color_view[i]) return false;
+    return true;
+}
+inline bool load_op_clear_on() {
+    static const bool on = !env_on("RX_VK_NO_LOAD_OP_CLEAR");
+    return on;
+}
+void begin_pass(VkCommandBuffer cmd, const Targets& at);
+void flush_pending_clears(VkCommandBuffer cmd) {
+    PendingClear& pc = pending_clear();
+    if (!pc.active) return;
+    const Targets at = pc.at;
+    begin_pass(cmd, at);
+    end_pass(cmd);
+}
 /// (vk_replay.cpp maybe_split) whether this thread's command buffer is inside a render pass: a part that ends with none open
 /// ends no pass of the game's early (nothing written out and read back in)
 }   // namespace
@@ -5826,10 +7630,12 @@ struct IndexBind {
 int64_t st_desc_reused;
 
 thread_local uint64_t targets_serial = ~0ull;   // (the state's render targets resolved once per NOP_SET_RT)
+thread_local uint64_t targets_dgen = ~0ull;
 thread_local Targets cached_targets;
 
 Targets targets(NvnState& s) {
-    if (targets_serial == s.rt_serial) return cached_targets;
+    const uint64_t cur_dgen = texture_destroy_generation();
+    if (targets_serial == s.rt_serial && targets_dgen == cur_dgen) return cached_targets;
     Targets at;
     at.n = std::clamp(s.rt.n, 0, 8);
     for (int i = 0; i < at.n; i++) {
@@ -5881,6 +7687,7 @@ Targets targets(NvnState& s) {
         }
     }
     targets_serial = s.rt_serial;
+    targets_dgen = texture_destroy_generation();
     cached_targets = at;
     return at;
 }
@@ -5908,6 +7715,18 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
                 ps.height == at.height;
     for (int i = 0; i < at.n && same; i++) same = ps.color[i] == at.color_view[i];
     if (same) return;
+    PendingClear consumed{};
+    {
+        PendingClear& pc = pending_clear();
+        if (pc.active) {
+            if (targets_equal(pc.at, at)) {
+                consumed = pc;
+                pc.active = false;
+            } else {
+                flush_pending_clears(cmd);
+            }
+        }
+    }
     end_pass(cmd);
     if (at.has_block_images) {
         full_barrier(cmd, "barrier (before BC slice loads)");
@@ -5920,11 +7739,20 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     }
     work_since_barrier = true;
     VkRenderingAttachmentInfo ca[8]{};
+    int fused_clears = 0;
+    uint16_t fused_written = 0;
     for (int i = 0; i < at.n; i++) {
         ca[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         ca[i].imageView = at.color_view[i];
         ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        if (consumed.active && (consumed.color_mask & (1u << i))) {
+            ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            ca[i].clearValue.color = consumed.color_val[i];
+            fused_written |= (uint16_t)(1u << i);
+            fused_clears++;
+        } else {
+            ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         ps.color[i] = at.color_view[i];
         ps.block_image[i] = at.block_image[i];
@@ -5934,11 +7762,22 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     }
     for (int i = at.n; i < 8; i++) ps.color[i] = VK_NULL_HANDLE;
     VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingAttachmentInfo sa{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (at.depth) {
         da.imageView = at.depth_view;
         da.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        da.loadOp = (consumed.active && consumed.depth_clear) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        da.clearValue.depthStencil = {consumed.depth_val, consumed.stencil_val};
+        sa.imageView = at.depth_view;
+        sa.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        sa.loadOp = (consumed.active && consumed.stencil_clear) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        sa.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        sa.clearValue.depthStencil = {consumed.depth_val, consumed.stencil_val};
+        if (consumed.active && (consumed.depth_clear || consumed.stencil_clear)) {
+            fused_written |= (uint16_t)(1u << 8);
+            fused_clears++;
+        }
         texture_written(at.depth, "a pass's depth target");
         texture_rendered(at.depth);
     }
@@ -5952,12 +7791,12 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     ri.colorAttachmentCount = (uint32_t)at.n;
     ri.pColorAttachments = ca;
     if (at.depth && depth_aspect(at.depth_format)) ri.pDepthAttachment = &da;
-    if (at.depth && has_stencil(at.depth_format)) ri.pStencilAttachment = &da;
+    if (at.depth && has_stencil(at.depth_format)) ri.pStencilAttachment = &sa;
     gprof_begin(cmd);
     ps.draws = 0, ps.format0 = at.n ? at.color_format[0] : at.depth_format;
     ps.wm_or = 0, ps.wm_n = 0;
-    ps.clears = 0, ps.first_prog = 0;
-    ps.sampled.clear(), ps.sampled_targets = 0, ps.written = 0;
+    ps.clears = fused_clears, ps.first_prog = 0;
+    ps.sampled.clear(), ps.sampled_targets = 0, ps.written = fused_written;
     vkCmdBeginRendering(cmd, &ri);
     ps.open = true;
     st_passes++;
@@ -6583,11 +8422,28 @@ void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float
     if (!mask) return;
     const Targets at = targets(s);
     if (index < 0 || index >= at.n || !at.color_view[index]) return;
-    clear_after_draws(cmd);
-    begin_pass(cmd, at);
     const uint32_t lw = at.width, lh = at.height;
     const VkRect2D rect = clear_rect(s, lw, lh);
     if (!rect.extent.width || !rect.extent.height) return;
+    clear_after_draws(cmd);
+    if (load_op_clear_on() && mask == 0xF && !at.has_block_images &&
+        rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == lw && rect.extent.height == lh) {
+        if (pass().open && !targets_match_pass(pass(), at)) end_pass(cmd);
+        if (!pass().open) {
+            PendingClear& pc = pending_clear();
+            if (pc.active && !targets_equal(pc.at, at)) flush_pending_clears(cmd);
+            if (!pc.active) {
+                pc = PendingClear{};
+                pc.active = true;
+                pc.at = at;
+            }
+            pc.color_mask |= (uint8_t)(1u << index);
+            std::memcpy(&pc.color_val[index], rgba, 16);
+            st_clears++;
+            return;
+        }
+    }
+    begin_pass(cmd, at);
     st_clears++, pass().clears++;
     if (mask == 0xF) {
         VkClearAttachment ca{};
@@ -6627,10 +8483,33 @@ void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool dep
         static int logged;
         if (logged++ < 4) logf("vk: stencil clear with write mask %#x: cleared whole", stencil_mask);
     }
-    clear_after_draws(cmd);
-    begin_pass(cmd, at);
     const VkRect2D rect = clear_rect(s, at.width, at.height);
     if (!rect.extent.width || !rect.extent.height) return;
+    clear_after_draws(cmd);
+    if (load_op_clear_on() && !at.has_block_images &&
+        rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == at.width && rect.extent.height == at.height) {
+        if (pass().open && !targets_match_pass(pass(), at)) end_pass(cmd);
+        if (!pass().open) {
+            PendingClear& pc = pending_clear();
+            if (pc.active && !targets_equal(pc.at, at)) flush_pending_clears(cmd);
+            if (!pc.active) {
+                pc = PendingClear{};
+                pc.active = true;
+                pc.at = at;
+            }
+            if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                pc.depth_clear = true;
+                pc.depth_val = std::clamp(depth, 0.0f, 1.0f);
+            }
+            if (aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
+                pc.stencil_clear = true;
+                pc.stencil_val = stencil & 0xFF;
+            }
+            st_clears++;
+            return;
+        }
+    }
+    begin_pass(cmd, at);
     VkClearAttachment ca{};
     ca.aspectMask = aspect;
     ca.clearValue.depthStencil = {std::clamp(depth, 0.0f, 1.0f), stencil & 0xFF};
@@ -6648,6 +8527,7 @@ namespace {
 } // namespace
 
 void draw_flush_recording(int slot) {
+    ub_reads_flush();
     const RecordingRes& r = res[slot];
     // Earlier descriptors still name streams we outgrew; later retained streams were not used this recording.
     // (none when the slot's first stream could not be made: draw_begin_recording)
@@ -6666,6 +8546,7 @@ VkCommandBuffer demote_cmd_outside_pass() {
 }
 } // namespace
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
+    ub_reads_flush();
     rec_cmd = cmd;
     texture_set_demote_cmd_fn(demote_cmd_outside_pass);
     mesh_conv_begin_recording();   // (RX_VK_MESH_CONV read for the recording; the last batch let go)
@@ -6760,6 +8641,8 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     r.ub_snap_epoch = ++ub_snap_epochs;   // (the uniform copies of the slot's last recording are no longer given out)
     cur = &r;
     pass() = Pass{};
+    pending_clear() = PendingClear{};
+    mfb_batch_end();
     work_since_barrier = false;
     bound().reset();
     descriptors_disturbed();
@@ -7008,7 +8891,10 @@ TLS_OBJECT(dump_mesh_indirect, std::vector<std::pair<uint64_t, uint64_t>>)   // 
 } // namespace
 void end_pass(VkCommandBuffer cmd) {
     Pass& ps = pass();   // (once: the accessor is a call and a thread-local read at each use. The same object for the thread's life: draw_begin_recording resets it in place)
-    if (!ps.open) return;
+    if (!ps.open) {
+        if (pending_clear().active) flush_pending_clears(cmd);
+        return;
+    }
     vkCmdEndRendering(cmd);
     ps.open = false;
     if (ps.has_block_images) {
@@ -8230,6 +10116,10 @@ struct FallbackBuffers {
 };
 // (grown pairs stay: a command buffer recorded before the growth may still read them)
 TLS_OBJECT(fallback_buffers, std::vector<FallbackBuffers>)
+constexpr size_t kMaxMfbBatchSlots = 12;
+using FallbackBatchSlots = std::array<std::vector<FallbackBuffers>, kMaxMfbBatchSlots - 1>;
+TLS_OBJECT(fallback_batch_slots, FallbackBatchSlots)
+thread_local size_t fallback_buffers_req_slot = 0;
 thread_local VkBuffer fallback_draw_records = VK_NULL_HANDLE;   // (the last fallback_record's: its header is the draw's command)
 
 uint32_t fallback_task_groups(const Program& p) {
@@ -8262,7 +10152,7 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     // (the map, a slot a started mesh workgroup, and a payload a task workgroup, its threads' meshlets sharing it)
     const uint64_t threads = std::max(1u, p.fallback_task_threads);
     const uint64_t payload = p.fallback_task ? capacity * 4 + (capacity + threads - 1) / threads * (uint64_t)p.fallback_payload_words * 4 : 0;
-    auto& sets = fallback_buffers();
+    auto& sets = fallback_buffers_req_slot == 0 ? fallback_buffers() : fallback_batch_slots()[fallback_buffers_req_slot - 1];
     for (auto it = sets.rbegin(); it != sets.rend(); ++it) {
         if (it->records && it->records_bytes >= records && (!payload || (it->payload && it->payload_bytes >= payload))) {
             out = &*it;
@@ -8311,6 +10201,13 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     sets.push_back(f);
     out = &sets.back();
     return true;
+}
+bool fallback_buffers_slot(size_t slot, const Program& p, FallbackBuffers*& out) {
+    if (slot >= kMaxMfbBatchSlots) return false;
+    fallback_buffers_req_slot = slot;
+    const bool ok = fallback_buffers_of(p, out);
+    fallback_buffers_req_slot = 0;
+    return ok;
 }
 
 bool fallback_compute_pipelines(Program& p) {
@@ -8420,6 +10317,7 @@ bool fallback_compute_pipelines(Program& p) {
             return r;
         }();
         if (si.pNext && fallback_lanes::lanes_of(st.lane_free, lanes_wanted) != 32) si.pNext = &lanes_size;
+        else if (mesa_intel && st.info.wg_warp32) pin_subgroup_8(si, 32);
         compute_describe(p, st);
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = si;
@@ -9053,7 +10951,490 @@ static bool fallback_list_held(uint64_t list) {
     return false;
 }
 
-void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+namespace {
+void fallback_stage_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src, VkAccessFlags2 src_acc,
+                            VkPipelineStageFlags2 dst, VkAccessFlags2 dst_acc, const char* why,
+                            VkBuffer buf = VK_NULL_HANDLE, VkDeviceSize size = 0) {
+    GprofSpan gp(cmd, why);
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    if (buf != VK_NULL_HANDLE) {
+        VkBufferMemoryBarrier2 b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+        b.srcStageMask = src, b.srcAccessMask = src_acc;
+        b.dstStageMask = dst, b.dstAccessMask = dst_acc;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = buf, b.offset = 0, b.size = size;
+        d.bufferMemoryBarrierCount = 1, d.pBufferMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &d);
+        return;
+    }
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = src, b.srcAccessMask = src_acc;
+    b.dstStageMask = dst, b.dstAccessMask = dst_acc;
+    d.memoryBarrierCount = 1, d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+}
+
+struct MfbBatchItem {
+    Program* prog = nullptr;
+    FallbackBuffers* fb = nullptr;
+    DrawArgs d{};
+    size_t stage_task = 0;
+    size_t stage_mesh = 0;
+    BufferRef ind_args{};
+    uint32_t ind_n = 0;
+    uint32_t ind_stride = 8;
+    uint64_t mesh_conv_off = 0;
+    uint64_t indirect_input = 0;
+    uint32_t cull_words[5]{};
+    DescWriter dw{};
+    VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    std::vector<const Texture*> sampled;
+    std::vector<uint64_t> fp;
+    bool fp_dummy = false;
+    bool fp_on = false;
+    uint64_t samp = 0;
+    uint64_t destroy = 0;
+};
+
+struct MfbBatchState {
+    std::vector<MfbBatchItem> items;
+    int count = 0;
+    Targets at{};
+    uint64_t dgen_start = 0;
+    uint16_t written_mask = 0;
+    uint16_t sampled_targets_mask = 0;
+    bool flushed = false;
+};
+TLS_OBJECT(mfb_batch, MfbBatchState)
+
+std::atomic<int64_t> st_mfb_batches{0};
+std::atomic<int64_t> st_mfb_batched_draws{0};
+std::atomic<int64_t> st_mfb_clears_kept{0};
+
+bool alloc_batch_desc_set(const Program& p, MfbBatchItem& item) {
+    if (p.push || item.dw.writes.empty()) {
+        item.desc_set = VK_NULL_HANDLE;
+        return true;
+    }
+    if (g_fine) {
+        fine_n[FC_POOL_SETS]++;
+        for (const VkWriteDescriptorSet& w : item.dw.writes) fine_n[FC_POOL_DESCS] += w.descriptorCount;
+    }
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = cur->extra.empty() ? cur->pool : cur->extra.back();
+    if (!ai.descriptorPool) return false;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &p.set_layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(dev.device, &ai, &set) != VK_SUCCESS) {
+        const VkDescriptorPool pool = make_pool();
+        if (!pool) return false;
+        ai.descriptorPool = pool;
+        if (vkAllocateDescriptorSets(dev.device, &ai, &set) != VK_SUCCESS) {
+            vkDestroyDescriptorPool(dev.device, pool, nullptr);
+            return false;
+        }
+        try {
+            cur->extra.push_back(pool);
+            pools_extra.fetch_add(1, std::memory_order_relaxed);
+        } catch (const std::exception&) {
+            vkDestroyDescriptorPool(dev.device, pool, nullptr);
+            return false;
+        }
+    }
+    cur->pool_sets++;
+    for (auto& w : item.dw.writes) {
+        w.dstSet = set;
+        switch (w.descriptorType) {
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: cur->pool_descs[0] += w.descriptorCount; break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: cur->pool_descs[1] += w.descriptorCount; break;
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: cur->pool_descs[2] += w.descriptorCount; break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: cur->pool_descs[3] += w.descriptorCount; break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: cur->pool_descs[4] += w.descriptorCount; break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: cur->pool_descs[5] += w.descriptorCount; break;
+            default: break;
+        }
+    }
+    vkUpdateDescriptorSets(dev.device, (uint32_t)item.dw.writes.size(), item.dw.writes.data(), 0, nullptr);
+    item.desc_set = set;
+    return true;
+}
+
+bool bind_batch_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program& p, const MfbBatchItem& item) {
+    if (item.dw.writes.empty()) return true;
+    if (item.desc_set) {
+        pushed()[bp == VK_PIPELINE_BIND_POINT_COMPUTE].cmd = VK_NULL_HANDLE;
+        vkCmdBindDescriptorSets(cmd, bp, p.layout, 0, 1, &item.desc_set, 0, nullptr);
+        return true;
+    }
+    std::swap(dw(), const_cast<DescWriter&>(item.dw));
+    const bool ok = bind_descriptors(cmd, bp, p);
+    std::swap(dw(), const_cast<DescWriter&>(item.dw));
+    dw().prog = nullptr;
+    return ok;
+}
+} // namespace
+
+int mfb_batch_limit() {
+    static const int cfg = [] {
+        if (!dev.mesh_fallback && !dev.task_mesh_fallback) return 0;
+        const char* e = getenv("RX_VK_MFB_BATCH");
+        if (e) {
+            const int n = std::clamp(atoi(e), 0, 12);
+            logf("vk: RX_VK_MFB_BATCH=%d (override)", n);
+            return n;
+        }
+        uint64_t used = 0, budget = 0;
+        const bool have = vram_usage(&used, &budget);
+        const uint64_t budget_mb = have ? (budget >> 20) : 0;
+        const int def = budget_mb >= 6000 ? 4 : budget_mb >= 4000 ? 2 : 0;
+        if (def >= 2)
+            logf("vk: RX_VK_MFB_BATCH=%d (default, VRAM allowance %llu MB)", def, (unsigned long long)budget_mb);
+        return def;
+    }();
+    if (cfg < 2) return 0;
+    static const bool disabled_env =
+        (getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0) ||
+        env_on("RX_VK_BARRIER_EVERY_DRAW") ||
+        (getenv("RX_VK_NO_MESH") && atoi(getenv("RX_VK_NO_MESH")) != 0) ||
+        (getenv("RX_VK_SKIP_PROG") && strcmp(getenv("RX_VK_SKIP_PROG"), "-") != 0) ||
+        (getenv("RX_VK_SKIP_CODE") && *getenv("RX_VK_SKIP_CODE"));
+    if (disabled_env || dump_on() || probe_on() || stats_frame_now()) return 0;
+    return cfg;
+}
+
+void mfb_batch_begin() {
+    MfbBatchState& b = mfb_batch();
+    b.count = 0;
+    b.dgen_start = texture_destroy_generation();
+    b.written_mask = 0;
+    b.sampled_targets_mask = 0;
+    b.flushed = false;
+}
+
+void mfb_batch_end() {
+    MfbBatchState& b = mfb_batch();
+    b.count = 0;
+    b.flushed = false;
+}
+
+int mfb_batch_add(NvnState& s, const DrawArgs& d) {
+    MfbBatchState& b = mfb_batch();
+    const int limit = mfb_batch_limit();
+    if (limit < 2 || b.count >= limit || !d.mesh || d.count_addr || mesh_batch.live()) return -1;
+    Targets at = bare_targets(s, targets(s));
+    if (!at.width || !at.height) return -1;
+    if (b.count > 0 && !targets_equal(b.at, at)) return -1;
+    uint8_t types[8];
+    color_types_of(at, types);
+    const Program* cp;
+    {
+        PROF_HOT(PROF_PROGRAM);
+        cp = program_for(s, ProgramKind::Mesh, types);
+    }
+    if (!cp || !cp->ready.load(std::memory_order_acquire) || cp->failed) return -1;
+    if (!cp->fallback || skip_live(cp->key) || cp->key == 0x3427a1dbefd5e02cull) return -1;
+    Program& p = const_cast<Program&>(*cp);
+    if (writes_memory(p)) return -1;
+    if (p.fallback_task && !d.indirect) {
+        const int batch_size = (int)fallback_task_groups(p);
+        if (!batch_size || d.groups[0] > batch_size) return -1;
+    }
+    if (p.compute_state.load(std::memory_order_acquire) != 2 || p.fallback_compute.empty()) return -1;
+    size_t stages[2] = {p.stages.size(), p.stages.size()};
+    for (size_t i = 0; i < p.stages.size(); i++) {
+        if (p.stages[i].vk_stage != VK_SHADER_STAGE_COMPUTE_BIT) continue;
+        if (stages[0] == p.stages.size()) stages[0] = i;
+        else stages[1] = i;
+    }
+    const size_t st_task = p.fallback_task ? stages[0] : p.stages.size();
+    const size_t st_mesh = p.fallback_task ? stages[1] : stages[0];
+    if (p.fallback_task && (st_task >= p.fallback_compute.size() || !p.fallback_compute[st_task])) return -1;
+    if (st_mesh >= p.fallback_compute.size() || !p.fallback_compute[st_mesh]) return -1;
+    if (!p.layout) ensure_layout(p);
+    const VkPrimitiveTopology topo = pipeline_topology(p, kMeshDrawTopology);
+    PipeEntry* pe = graphics_pipeline(p, s, at, topo, types);
+    if (!pe || !pe->ready.load(std::memory_order_acquire) || !pe->pipeline.load(std::memory_order_acquire)) return -1;
+    const FallbackRole role = fallback_role_of(p, s, at, d);
+    if (role == FallbackRole::DepthOnly && fallback_list_held(d.indirect)) return -1;
+
+    BufferRef ind_args{};
+    uint32_t ind_n = 0, ind_stride = 8;
+    uint64_t indirect_input = 0;
+    if (d.indirect) {
+        const uint32_t word = mesh_count_word();
+        ind_n = (uint32_t)std::clamp(d.max, 1, (int)mesh_conv::kMaxRecords);
+        ind_stride = d.stride > 0 ? (uint32_t)d.stride : 8;
+        ind_args = gpu_buffer_bind(d.indirect, (uint64_t)(ind_n - 1) * ind_stride + 4 * (word + 1), false);
+        if (!ind_args) return -1;
+        if (p.fallback_task) {
+            const BufferRef input = gpu_buffer_bind(d.indirect, 8, false);
+            const VkDeviceAddress input_base = input ? fallback_buffer_address(input.buffer) : 0;
+            indirect_input = input_base ? input_base + input.offset : 0;
+        }
+    }
+
+    const int slot_idx = b.count;
+    FallbackBuffers* fb = nullptr;
+    if (!fallback_buffers_slot((size_t)slot_idx, p, fb)) return -1;
+
+    const uint64_t dgen_before = texture_destroy_generation();
+    {
+        PROF_HOT(PROF_DESC);
+        FINE_N(FC_BUILDS, 1);
+        trace_tex_hit = nullptr, trace_tex_mask = 0;
+        ub_prog_key = p.key;
+        build_descriptors(s, p);
+        ub_prog_key = 0;
+        FINE_N(FC_WRITES, (int64_t)dw().writes.size());
+    }
+    const uint64_t dgen_after = texture_destroy_generation();
+    if (dgen_after != dgen_before) {
+        if (slot_idx > 0) {
+            dw().prog = nullptr;
+            return -1;
+        }
+        at = bare_targets(s, targets(s));
+        b.dgen_start = dgen_after;
+    } else if (slot_idx > 0 && dgen_after != b.dgen_start) {
+        dw().prog = nullptr;
+        return -1;
+    }
+    for (const auto& w : dw().writes) {
+        if (w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+            for (uint32_t k = 0; k < w.descriptorCount; k++) {
+                if (!w.pImageInfo[k].sampler) {
+                    dw().prog = nullptr;
+                    return -1;
+                }
+            }
+        }
+    }
+
+    uint16_t item_writes = 0;
+    for (int i = 0; i < at.n; i++)
+        if (at.color[i] && target_write_mask(p, s, i)) item_writes |= (uint16_t)(1u << i);
+    if (at.depth && s.ds.dw) item_writes |= 1u << 8;
+
+    uint16_t item_sampled_targets = 0;
+    for (const Texture* t : draw_sampled()) {
+        int k = at.depth == t ? 8 : -1;
+        for (int i = 0; i < at.n && k < 0; i++)
+            if (at.color[i] == t) k = i;
+        if (k >= 0) {
+            item_sampled_targets |= (uint16_t)(1u << k);
+            if (slot_idx > 0 && (b.written_mask >> k & 1) && !(item_writes >> k & 1)) {
+                dw().prog = nullptr;
+                return -1;
+            }
+        }
+    }
+    if (slot_idx > 0 && writes_sampled_target(item_writes, b.sampled_targets_mask)) {
+        dw().prog = nullptr;
+        return -1;
+    }
+
+    if ((size_t)slot_idx >= b.items.size()) b.items.resize((size_t)slot_idx + 1);
+    MfbBatchItem& it = b.items[slot_idx];
+    it.prog = &p;
+    it.fb = fb;
+    it.d = d;
+    it.stage_task = st_task;
+    it.stage_mesh = st_mesh;
+    it.ind_args = ind_args;
+    it.ind_n = ind_n;
+    it.ind_stride = ind_stride;
+    it.mesh_conv_off = 0;
+    it.indirect_input = indirect_input;
+    pack_fallback_cull_words(s, at, it.cull_words);
+    it.desc_set = VK_NULL_HANDLE;
+    std::swap(it.dw, dw());
+    dw().prog = nullptr;
+    std::swap(it.sampled, draw_sampled());
+    it.fp_on = desc_fp_on;
+    if (desc_fp_on) {
+        it.fp.swap(desc_fp());
+        it.fp_dummy = desc_fp_dummy;
+        it.samp = desc_samp_seen;
+        it.destroy = desc_destroy_seen;
+    } else {
+        it.fp.clear();
+        it.fp_dummy = false;
+        it.samp = 0;
+        it.destroy = 0;
+    }
+
+    if (slot_idx == 0) b.at = at;
+    b.written_mask |= item_writes;
+    b.sampled_targets_mask |= item_sampled_targets;
+    b.count++;
+    return slot_idx;
+}
+
+bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
+    MfbBatchState& b = mfb_batch();
+    if (b.count < 2) return false;
+
+    bool any_indirect = false;
+    bool any_task = false;
+    for (int i = 0; i < b.count; i++) {
+        MfbBatchItem& it = b.items[i];
+        any_indirect |= (it.d.indirect != 0);
+        any_task |= it.prog->fallback_task;
+        if (!alloc_batch_desc_set(*it.prog, it)) return false;
+    }
+
+    if (any_indirect) {
+        for (int i = 0; i < b.count; i++) {
+            MfbBatchItem& it = b.items[i];
+            if (!it.d.indirect) continue;
+            uint64_t start = 0;
+            if (!mesh_ring_slot(it.ind_n, &it.mesh_conv_off, &start)) return false;
+        }
+    }
+
+    if (pass().open) {
+        end_pass(cmd);
+    } else if (pending_clear().active) {
+        bool untouched = true;
+        for (int i = 0; i < b.count && untouched; i++)
+            untouched = pending_clear_untouched(pending_clear(), b.items[i].sampled);
+        if (!untouched) {
+            flush_pending_clears(cmd);
+        } else {
+            st_mfb_clears_kept.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    const uint32_t ind_word = mesh_count_word();
+    full_barrier(cmd, "barrier (mfb batch pre)");
+
+    {
+        GprofSpan gp(cmd, "mfb batch conv+fill");
+        const bool need_fill_slice = any_indirect && !mesh_ring_filled.load(std::memory_order_acquire);
+        if (need_fill_slice) {
+            for (int i = 0; i < b.count; i++) {
+                const MfbBatchItem& it = b.items[i];
+                if (it.d.indirect) vkCmdFillBuffer(cmd, mesh_ring, it.mesh_conv_off, (uint64_t)it.ind_n * mesh_conv::kRecord, 1u);
+            }
+            fallback_stage_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                   "barrier (mfb batch ring fill)");
+        }
+        static constexpr uint32_t kInitHeader[8] = {0, 1, 0, 0, 0, 0, 1, 1};
+        VkBufferCopy small[16];
+        std::vector<VkBufferCopy> heap;
+        for (int i = 0; i < b.count; i++) {
+            const MfbBatchItem& it = b.items[i];
+            if (it.d.indirect) {
+                VkBufferCopy* regions = small;
+                if (it.ind_n > 16) {
+                    heap.resize(it.ind_n);
+                    regions = heap.data();
+                }
+                for (uint32_t r = 0; r < it.ind_n; r++)
+                    regions[r] = {it.ind_args.offset + (uint64_t)r * it.ind_stride + 4 * ind_word,
+                                  it.mesh_conv_off + (uint64_t)r * mesh_conv::kRecord, 4};
+                vkCmdCopyBuffer(cmd, it.ind_args.buffer, mesh_ring, it.ind_n, regions);
+            }
+            vkCmdUpdateBuffer(cmd, it.fb->records, 0, sizeof(kInitHeader), kInitHeader);
+            if (it.fb->records_bytes >= Shader::Backend::SPIRV::MESH_FALLBACK_POOL_OFFSET + Shader::Backend::SPIRV::MESH_FALLBACK_POOL_BYTES)
+                vkCmdFillBuffer(cmd, it.fb->records, Shader::Backend::SPIRV::MESH_FALLBACK_POOL_OFFSET,
+                                Shader::Backend::SPIRV::MESH_FALLBACK_POOL_HEADER_BYTES, 0);
+            if (Shader::Backend::SPIRV::MeshFallbackCounters() && !it.fb->warp_counters_cleared &&
+                it.fb->records_bytes >= Shader::Backend::SPIRV::MeshFallbackRecordsBytes() + Shader::Backend::SPIRV::WARP_COUNTER_BYTES) {
+                vkCmdFillBuffer(cmd, it.fb->records, Shader::Backend::SPIRV::MeshFallbackRecordsBytes(),
+                                Shader::Backend::SPIRV::WARP_COUNTER_BYTES, 0);
+                it.fb->warp_counters_cleared = true;
+            }
+        }
+    }
+
+    fallback_stage_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                           VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+                           "barrier (mfb batch header)");
+
+    const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+    VkPipeline last_cs_pipe = VK_NULL_HANDLE;
+
+    if (any_task) {
+        for (int i = 0; i < b.count; i++) {
+            const MfbBatchItem& it = b.items[i];
+            const Program& p = *it.prog;
+            if (!p.fallback_task) continue;
+            if (!bind_batch_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p, it)) continue;
+            fallback_payload_address = it.fb->payload_address;
+            fallback_records_address = it.fb->records_address;
+            fallback_indirect_input = it.indirect_input;
+            push_constants(cmd, p, nullptr, it.d.first_task);
+            const VkPipeline pipe = p.fallback_compute[it.stage_task];
+            char label[64] = "mfb";
+            if (gprof_on()) snprintf(label, sizeof label, "mfb_task prog %016llx", (unsigned long long)p.key);
+            GprofSpan gp(cmd, label);
+            if (pipe != last_cs_pipe) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+                last_cs_pipe = pipe;
+            }
+            if (it.d.indirect) {
+                vkCmdDispatchIndirect(cmd, mesh_ring, it.mesh_conv_off);
+            } else {
+                const uint32_t groups = (uint32_t)std::clamp(it.d.groups[0], 0, (int)capacity);
+                const uint32_t most = (uint32_t)std::max(1u, capacity / std::max(1u, p.fallback_task_threads));
+                const uint32_t n = std::min(groups, most);
+                if (n) vkCmdDispatch(cmd, n, 1, 1);
+            }
+        }
+        fallback_stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                               VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+                               "barrier (mfb batch task->mesh)");
+    }
+
+    for (int i = 0; i < b.count; i++) {
+        const MfbBatchItem& it = b.items[i];
+        const Program& p = *it.prog;
+        if (!bind_batch_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p, it)) continue;
+        fallback_payload_address = it.fb->payload_address;
+        fallback_records_address = it.fb->records_address;
+        fallback_indirect_input = it.indirect_input;
+        std::memcpy(fallback_cull_words, it.cull_words, sizeof fallback_cull_words);
+        push_constants(cmd, p, nullptr, it.d.first_task);
+        const VkPipeline pipe = p.fallback_compute[it.stage_mesh];
+        char label[64] = "mfb";
+        if (gprof_on()) snprintf(label, sizeof label, "mfb_mesh prog %016llx", (unsigned long long)p.key);
+        GprofSpan gp(cmd, label);
+        if (pipe != last_cs_pipe) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+            last_cs_pipe = pipe;
+        }
+        if (p.fallback_task) {
+            vkCmdDispatchIndirect(cmd, it.fb->records, (VkDeviceSize)Shader::Backend::SPIRV::MESH_FALLBACK_DISPATCH_WORD * 4);
+        } else if (it.d.indirect) {
+            vkCmdDispatchIndirect(cmd, mesh_ring, it.mesh_conv_off);
+        } else {
+            const uint32_t groups = (uint32_t)std::clamp(it.d.groups[0], 0, (int)capacity);
+            if (groups) vkCmdDispatch(cmd, groups, 1, 1);
+        }
+    }
+
+    full_barrier(cmd, "barrier (mfb batch post)");
+    fallback_warp_counters(cmd, *b.items[0].fb);
+
+    dw().prog = nullptr;
+    b.flushed = true;
+    const int64_t nb = st_mfb_batches.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int64_t nd = st_mfb_batched_draws.fetch_add(b.count, std::memory_order_relaxed) + b.count;
+    if (nb == 1 || nb % 600 == 0)
+        logf("vk: mfb batch: %lld batches, %lld batched draws (avg %.2f/batch), %lld pending clears kept, bda_ssbo: %llu shaders / %llu calls",
+             (long long)nb, (long long)nd, (double)nd / (double)nb,
+             (long long)st_mfb_clears_kept.load(std::memory_order_relaxed),
+             (unsigned long long)st_bda_ssbo_shaders.load(std::memory_order_relaxed),
+             (unsigned long long)st_bda_ssbo_calls.load(std::memory_order_relaxed));
+    return true;
+}
+
+static void draw_impl(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, const MfbBatchItem* pre) {
 #ifdef TRACY_ENABLE
     HT_SCOPE_DRAW("draw");
 #endif
@@ -9062,7 +11443,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     PROF_HOT(PROF_DRAW);
     FINE_N(FC_DRAWS, 1);
     stats_tick();
-    mesh_indirect_convert(cmd, d);   // (EvilOOT: before the pass opens; sets mesh_conv_buf for the mesh draw below)
+    if (!pre) mesh_indirect_convert(cmd, d);   // (EvilOOT: before the pass opens; sets mesh_conv_buf for the mesh draw below)
     VkPrimitiveTopology topo = kMeshDrawTopology;
     if (!d.mesh && !topology(d.prim, topo)) {
         static int logged[32];
@@ -9073,7 +11454,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         static int logged;
         if (logged++ < 5) logf("vk: a draw with patches");
     }
-    const Targets at = bare_targets(s, targets(s));
+    Targets at = bare_targets(s, targets(s));
     if (!at.width || !at.height) SKIP_HERE();
     // (longshot) the scene's camera and depth for the temporal upscalers: NVIDIA DLSS and AMD FSR 4 (vk_temporal.cpp) and AMD
     // FSR 3.1 (vk_fsr3_inputs.cpp). The vertex stage's uniform buffer 3 (NVN's binding 0)
@@ -9388,22 +11769,26 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 if (d.is_written) return true;
         return false;
     }();
-    const bool same_desc = !no_reuse && !early_rebind && cb.desc.valid && cb.desc.prog == &p && cb.desc.bind == s.bind_gen &&
+    if (pre && pre->prog != &p) pre = nullptr;
+    const bool same_desc = !pre && !no_reuse && !early_rebind && cb.desc.valid && cb.desc.prog == &p && cb.desc.bind == s.bind_gen &&
                            cb.desc.ub == ub_gen && cb.desc.dgen == dgen &&
                            (slotgen ? cb.desc.fp_on && desc_slots_kept(cb.desc, reg_gen) : cb.desc.reg == reg_gen) &&
                            (!p.fallback || dw().prog == &p);
-    if (p.fallback && !same_desc && dw().prog != &p && cb.desc.valid && cb.desc.prog == &p) {
+    if (!pre && p.fallback && !same_desc && dw().prog != &p && cb.desc.valid && cb.desc.prog == &p) {
         static std::atomic<int> told{0};
         if (told++ < 3) logf("vk: fallback: %016llx's descriptors built again after a dispatch", (unsigned long long)p.key);
     }
     if (same_desc && slotgen && cb.desc.reg != reg_gen) st_desc_slotgen_saves++;   // (the global check would have rebuilt)
-    if (!same_desc) {
+    if (pre) {
+        gfx_sampled() = pre->sampled;
+    } else if (!same_desc) {
         PROF_HOT(PROF_DESC);
         FINE_N(FC_BUILDS, 1);
         trace_tex_hit = nullptr, trace_tex_mask = 0;
         ub_prog_key = p.key;   // (the Grass distance row: uniform_range)
         build_descriptors(s, p);   // (textures first used here are uploaded by the recording's upload command buffer)
         ub_prog_key = 0;
+        if (texture_destroy_generation() != dgen) at = bare_targets(s, targets(s));
         FINE_N(FC_WRITES, (int64_t)dw().writes.size());
         static std::string last_logged;
         if (dump_on()) {
@@ -9422,7 +11807,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (dump_on()) log_dump_draw(s, p, d);
     PROF_HOT(PROF_CMDS);
     texture_watch_prog(p.key);
-    if (!same_desc) gfx_sampled() = draw_sampled();
+    if (!pre && !same_desc) gfx_sampled().swap(draw_sampled());
     // (longshot) NVIDIA DLAA before the game's bloom and tone map: the frame's draws into the scene and those that read it, and
     // at the bloom's first draw DLAA on the scene, before this draw reads it (vk_temporal.cpp, pre_bloom.h). Its passes and
     // its actor motion's draws bound a pipeline, a viewport, vertex streams and descriptors of their own: this draw sets
@@ -9506,13 +11891,23 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // (RX_VK_MESH_CONV=2: a draw that may write memory comes before the batch's later draws: their counts are read again)
     if (mesh_batch.live() && writes_memory(p)) mesh_batch_drop();
     const FallbackRole fallback_role = p.fallback && d.mesh ? fallback_role_of(p, s, at, d) : FallbackRole::None;
-    if (fallback_role == FallbackRole::DepthOnly && fallback_list_held(d.indirect)) SKIP_HERE();
-    if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) {
-        if (fallback_role == FallbackRole::Colour && p.compute_state.load(std::memory_order_acquire) == 1)
-            fallback_list_hold(d.indirect, true);
-        SKIP_HERE();
+    if (pre) {
+        fallback_draw_records = pre->fb->records;
+        fallback_records_address = pre->fb->records_address;
+        fallback_payload_address = pre->fb->payload_address;
+        fallback_indirect_input = pre->indirect_input;
+        std::memcpy(fallback_cull_words, pre->cull_words, sizeof fallback_cull_words);
+        if (fallback_role == FallbackRole::Colour) fallback_list_hold(d.indirect, false);
+    } else {
+        if (fallback_role == FallbackRole::DepthOnly && fallback_list_held(d.indirect)) SKIP_HERE();
+        if (p.fallback && d.mesh) pack_fallback_cull_words(s, at, fallback_cull_words);
+        if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) {
+            if (fallback_role == FallbackRole::Colour && p.compute_state.load(std::memory_order_acquire) == 1)
+                fallback_list_hold(d.indirect, true);
+            SKIP_HERE();
+        }
+        if (fallback_role == FallbackRole::Colour) fallback_list_hold(d.indirect, false);
     }
-    if (fallback_role == FallbackRole::Colour) fallback_list_hold(d.indirect, false);
     {
         FINE_SCOPE(FT_HAZARD);
         begin_pass(cmd, at);
@@ -9541,14 +11936,23 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             cb.vertex_set.on = false;
         }
     }
-    if (!same_desc || pre_recorded) {   // (longshot: after DLAA's commands, its pushes are gone: temporal_pre_bloom)
+    if (pre) {
+        FINE_SCOPE(FT_BINDDESC);
+        if (!bind_batch_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p, *pre)) SKIP_HERE();
+        cb.desc.valid = true, cb.desc.prog = &p, cb.desc.bind = s.bind_gen, cb.desc.reg = reg_gen;
+        cb.desc.ub = ub_gen, cb.desc.dgen = texture_destroy_generation();
+        cb.desc.fp_on = pre->fp_on;
+        if (pre->fp_on)
+            cb.desc.fp = pre->fp, cb.desc.fp_dummy = pre->fp_dummy, cb.desc.samp = pre->samp,
+            cb.desc.destroy = pre->destroy;
+    } else if (!same_desc || pre_recorded) {   // (longshot: after DLAA's commands, its pushes are gone: temporal_pre_bloom)
         FINE_SCOPE(FT_BINDDESC);
         if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p)) SKIP_HERE();
         cb.desc.valid = true, cb.desc.prog = &p, cb.desc.bind = s.bind_gen, cb.desc.reg = reg_gen;
-        cb.desc.ub = ub_gen, cb.desc.dgen = dgen;
+        cb.desc.ub = ub_gen, cb.desc.dgen = texture_destroy_generation();
         cb.desc.fp_on = desc_fp_on;
         if (desc_fp_on)   // (Descriptor reuse: what its handles resolved; the next such draw may keep it through other slots' churn)
-            cb.desc.fp = desc_fp(), cb.desc.fp_dummy = desc_fp_dummy, cb.desc.samp = desc_samp_seen,
+            cb.desc.fp.swap(desc_fp()), cb.desc.fp_dummy = desc_fp_dummy, cb.desc.samp = desc_samp_seen,
             cb.desc.destroy = desc_destroy_seen;
     } else {
         st_desc_reused++;
@@ -9886,6 +12290,16 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);
     }
     st_draws++, ps.draws++;
+}
+
+void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    draw_impl(cmd, s, d, nullptr);
+}
+
+void draw_mfb_batched(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, int slot) {
+    MfbBatchState& b = mfb_batch();
+    const MfbBatchItem* pre = (b.flushed && slot >= 0 && slot < b.count) ? &b.items[slot] : nullptr;
+    draw_impl(cmd, s, d, pre);
 }
 
 /// A dispatch over 2 ms is logged, 60 times, and only while RX_VK_SLOW_DISPATCH is set. Off, the clock is not read.
@@ -13125,6 +15539,57 @@ VkPipeline compute_pipeline_from_caches(const Program& p) {
     const VkPipeline pl = compute_pipeline_cached(p, true);
     ask_start_first = false;
     return pl;
+}
+bool fallback_compute_from_caches(Program& p) {
+    if (!dev.vk13.pipelineCreationCacheControl || !p.fallback || p.compute_state.load(std::memory_order_acquire) != 0)
+        return false;
+    const bool mesa_intel = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+    static const uint32_t lanes_wanted = [mesa_intel] {
+        const uint32_t asked = fallback_lanes::parse_lanes(getenv("RX_VK_MESH_LANES"));
+        return fallback_lanes::wanted(mesa_intel, asked, dev.subgroup_min, dev.subgroup_max);
+    }();
+    static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo lanes_size = [] {
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo r{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+        r.requiredSubgroupSize = lanes_wanted;
+        return r;
+    }();
+    std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
+    bool any = false, ok = true;
+    ask_start_first = true;
+    for (size_t i = 0; i < p.stages.size() && ok; i++) {
+        const Stage& st = p.stages[i];
+        if (st.vk_stage != VK_SHADER_STAGE_COMPUTE_BIT) continue;
+        any = true;
+        VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        si.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        si.module = st.module;
+        si.pName = "main";
+        pin_subgroup(si);
+        if (si.pNext && fallback_lanes::lanes_of(st.lane_free, lanes_wanted) != 32) si.pNext = &lanes_size;
+        else if (mesa_intel && st.info.wg_warp32) pin_subgroup_8(si, 32);
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = si;
+        ci.layout = p.layout;
+        if (dev.task_mesh_fallback || env_on("RX_VK_NOOPT"))
+            ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        ci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+        if (cached_compute(&ci, &made[i]) != VK_SUCCESS) ok = false;
+    }
+    ask_start_first = false;
+    if (!ok || !any) {
+        for (VkPipeline m : made)
+            if (m) vkDestroyPipeline(dev.device, m, nullptr);
+        return false;
+    }
+    int none = 0;
+    if (!p.compute_state.compare_exchange_strong(none, 1)) {
+        for (VkPipeline m : made)
+            if (m) vkDestroyPipeline(dev.device, m, nullptr);
+        return false;
+    }
+    p.fallback_compute = std::move(made);
+    p.compute_state.store(2, std::memory_order_release);
+    return true;
 }
 VkPipeline compute_pipeline_by_module_id(const Program& p, const uint8_t* id, uint32_t size) {
     if (!dev.vk13.pipelineCreationCacheControl || !size) return VK_NULL_HANDLE;

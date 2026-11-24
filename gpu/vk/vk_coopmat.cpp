@@ -724,6 +724,10 @@ void coopmat_init() {
     Shader::Backend::SPIRV::fetch_bounds_buffers = dev.policy.fetch_bounds && !dev.features.robustBufferAccess;
     Shader::Backend::SPIRV::nan_bits = dev.policy.nan_bits;
     Shader::Backend::SPIRV::mesh_fallback_strict_fmul = dev.policy.mesh_fallback_strict_fmul;
+    Shader::Backend::SPIRV::direct_guest_stores =
+        !dev.policy.mirrors && dev.external_memory_host && !env_on("RX_VK_NO_DIRECT_GM_STORES");
+    if (Shader::Backend::SPIRV::direct_guest_stores)
+        logf("vk: global writes/atomics use direct guest page table (mirrors=0; RX_VK_NO_DIRECT_GM_STORES=1: off)");
     // (longshot) RX_VK_MMA_SOFTWARE=1: HMMA_nx2 in a shader function on subgroup shuffles, no cooperative matrices
     // (emit_spirv_warp.cpp, from Lichii): the lowering still gives HMMA_nx2 (dev.native_mma)
     if (const char* sw = std::getenv("RX_VK_MMA_SOFTWARE"); sw && std::atoi(sw)) {

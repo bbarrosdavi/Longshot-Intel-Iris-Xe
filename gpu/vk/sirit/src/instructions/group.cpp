@@ -95,4 +95,39 @@ Id Module::OpGroupNonUniformBallotFindLSB(Id result_type, Id scope, Id value) {
     return *code << OpId{spv::Op::OpGroupNonUniformBallotFindLSB, result_type} << scope << value << EndOp{};
 }
 
+Id Module::OpGroupNonUniformIAdd(Id result_type, Id scope, spv::GroupOperation op, Id value) {
+    code->Reserve(6);
+    return *code << OpId{spv::Op::OpGroupNonUniformIAdd, result_type} << scope << op << value << EndOp{};
+}
+
+Id Module::OpGroupNonUniformUMin(Id result_type, Id scope, spv::GroupOperation op, Id value) {
+    code->Reserve(6);
+    return *code << OpId{spv::Op::OpGroupNonUniformUMin, result_type} << scope << op << value << EndOp{};
+}
+
+Id Module::OpGroupNonUniformSMin(Id result_type, Id scope, spv::GroupOperation op, Id value) {
+    code->Reserve(6);
+    return *code << OpId{spv::Op::OpGroupNonUniformSMin, result_type} << scope << op << value << EndOp{};
+}
+
+Id Module::OpGroupNonUniformUMax(Id result_type, Id scope, spv::GroupOperation op, Id value) {
+    code->Reserve(6);
+    return *code << OpId{spv::Op::OpGroupNonUniformUMax, result_type} << scope << op << value << EndOp{};
+}
+
+Id Module::OpGroupNonUniformSMax(Id result_type, Id scope, spv::GroupOperation op, Id value) {
+    code->Reserve(6);
+    return *code << OpId{spv::Op::OpGroupNonUniformSMax, result_type} << scope << op << value << EndOp{};
+}
+
+Id Module::OpGroupNonUniformBitwiseOr(Id result_type, Id scope, spv::GroupOperation op, Id value) {
+    code->Reserve(6);
+    return *code << OpId{spv::Op::OpGroupNonUniformBitwiseOr, result_type} << scope << op << value << EndOp{};
+}
+
+Id Module::OpGroupNonUniformBitwiseXor(Id result_type, Id scope, spv::GroupOperation op, Id value) {
+    code->Reserve(6);
+    return *code << OpId{spv::Op::OpGroupNonUniformBitwiseXor, result_type} << scope << op << value << EndOp{};
+}
+
 } // namespace Sirit

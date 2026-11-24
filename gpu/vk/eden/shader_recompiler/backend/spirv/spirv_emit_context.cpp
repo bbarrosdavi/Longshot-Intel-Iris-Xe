@@ -631,6 +631,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
         DefineRescalingInputPushConstant();
     }
     DefineMesh(program);
+    DefineWorkgroupWarp(program);
     DefineLocalMemory(program);
     DefineSharedMemory(program);
     DefineSharedMemoryFunctions(program);
@@ -1265,6 +1266,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     if (miss_index != SIZE_MAX && Sirit::ValidId(ssbos[miss_index].U32)) {
         probe_log = ssbos[miss_index].U32;   // (RX_VK_BLOCK_PROBE, emit_spirv.cpp Traverse)
     }
+    const bool can_direct_stores{direct_guest_stores && follow_pointers && gp_level >= 3 &&
+                                 wants_guest_pages && rescaling_push_constants.value != 0 &&
+                                 miss_index == SIZE_MAX};
     const auto record_miss{[&](Id addr) {
         if (miss_index == SIZE_MAX || !Sirit::ValidId(ssbos[miss_index].U32)) {
             return;
@@ -1570,14 +1574,22 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         const Id func_id{OpFunction(void_id, spv::FunctionControlMask::DontInline, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id data{OpFunctionParameter(type)};
-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
-            OpStore(ssbo_pointer, data);
-            OpReturn();
-        });
-        if (follow_stores) guest_lookup(addr, 1U << shift, [&](Id target) {   // (longshot: through the page table, as the loads: the culling's outputs)
-            if (gp_level >= 3) OpStore(psb_member(type, target), data, spv::MemoryAccessMask::Aligned, 4U);
-            OpReturn();
-        });
+        if (can_direct_stores) {
+            AddLabel();
+            guest_lookup(addr, 1U << shift, [&](Id target) {
+                OpStore(psb_member(type, target), data, spv::MemoryAccessMask::Aligned, 4U);
+                OpReturn();
+            });
+        } else {
+            define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
+                OpStore(ssbo_pointer, data);
+                OpReturn();
+            });
+            if (follow_stores) guest_lookup(addr, 1U << shift, [&](Id target) {   // (longshot: through the page table, as the loads: the culling's outputs)
+                if (gp_level >= 3) OpStore(psb_member(type, target), data, spv::MemoryAccessMask::Aligned, 4U);
+                OpReturn();
+            });
+        }
         OpReturn();
         OpFunctionEnd();
         return func_id;
@@ -1608,15 +1620,23 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             const Id func_id{OpFunction(U32[1], spv::FunctionControlMask::DontInline, function_type)};
             const Id addr{OpFunctionParameter(U64)};
             const Id value{OpFunctionParameter(U32[1])};
-            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, [&](Id ssbo_pointer) {
-                const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-                OpReturnValue((this->*atomics[i])(U32[1], ssbo_pointer, scope, u32_zero_value, value));
-            });
-            if (follow_stores) guest_lookup(addr, 4U, [&](Id target) {   // (longshot: the culling's counters, through the page table)
-                const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-                if (gp_level >= 3) OpReturnValue((this->*atomics[i])(U32[1], psb_member(U32[1], target), scope, u32_zero_value, value));
-                else OpReturnValue(u32_zero_value);
-            });
+            if (can_direct_stores) {
+                AddLabel();
+                guest_lookup(addr, 4U, [&](Id target) {
+                    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+                    OpReturnValue((this->*atomics[i])(U32[1], psb_member(U32[1], target), scope, u32_zero_value, value));
+                });
+            } else {
+                define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, [&](Id ssbo_pointer) {
+                    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+                    OpReturnValue((this->*atomics[i])(U32[1], ssbo_pointer, scope, u32_zero_value, value));
+                });
+                if (follow_stores) guest_lookup(addr, 4U, [&](Id target) {   // (longshot: the culling's counters, through the page table)
+                    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+                    if (gp_level >= 3) OpReturnValue((this->*atomics[i])(U32[1], psb_member(U32[1], target), scope, u32_zero_value, value));
+                    else OpReturnValue(u32_zero_value);
+                });
+            }
             OpReturnValue(u32_zero_value);
             OpFunctionEnd();
             atomic_global_func_u32[i] = func_id;
@@ -1631,12 +1651,19 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
             return OpAtomicCompareExchange(U32[1], pointer, scope, u32_zero_value, u32_zero_value, value, comparator);
         }};
-        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
-                    [&](Id ssbo_pointer) { OpReturnValue(cas(ssbo_pointer)); });
-        if (follow_stores) guest_lookup(addr, 4U, [&](Id target) {
-            if (gp_level >= 3) OpReturnValue(cas(psb_member(U32[1], target)));
-            else OpReturnValue(u32_zero_value);
-        });
+        if (can_direct_stores) {
+            AddLabel();
+            guest_lookup(addr, 4U, [&](Id target) {
+                OpReturnValue(cas(psb_member(U32[1], target)));
+            });
+        } else {
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                        [&](Id ssbo_pointer) { OpReturnValue(cas(ssbo_pointer)); });
+            if (follow_stores) guest_lookup(addr, 4U, [&](Id target) {
+                if (gp_level >= 3) OpReturnValue(cas(psb_member(U32[1], target)));
+                else OpReturnValue(u32_zero_value);
+            });
+        }
         OpReturnValue(u32_zero_value);
         OpFunctionEnd();
         atomic_global_cas_func_u32 = func_id;
@@ -1683,8 +1710,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             AddLabel(continue_label);
             OpBranch(begin_label);
         }};
-        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
-                    [&](Id ssbo_pointer) { cas_loop(ssbo_pointer); }, false);
+        if (!can_direct_stores) {
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                        [&](Id ssbo_pointer) { cas_loop(ssbo_pointer); }, false);
+        }
         guest_lookup(addr, 4U, [&](Id target) {
             if (gp_level >= 3) {
                 cas_loop(psb_member(U32[1], target));
@@ -1738,13 +1767,15 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         const auto native_add{[&](Id pointer) {
             OpReturnValue(OpAtomicFAddEXT(F32[1], pointer, Const(static_cast<u32>(spv::Scope::Device)), u32_zero_value, value));
         }};
-        if (native_f32_add) {
-            define_body(&StorageDefinitions::F32, addr, storage_types.F32.element, 2, native_add, false);
-        } else {
-            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
-                        [&](Id ssbo_pointer) { cas_loop(ssbo_pointer); }, false);
+        if (!can_direct_stores) {
+            if (native_f32_add) {
+                define_body(&StorageDefinitions::F32, addr, storage_types.F32.element, 2, native_add, false);
+            } else {
+                define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                            [&](Id ssbo_pointer) { cas_loop(ssbo_pointer); }, false);
+            }
         }
-        if (follow_stores) guest_lookup(addr, 4U, [&](Id target) {
+        if (follow_stores || can_direct_stores) guest_lookup(addr, 4U, [&](Id target) {
             if (gp_level < 3) OpReturnValue(ConstantNull(F32[1]));
             else if (native_f32_add) native_add(psb_member(F32[1], target));
             else cas_loop(psb_member(U32[1], target));
@@ -1787,6 +1818,12 @@ void EmitContext::DefineRescalingInputPushConstant() {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
     }
+    if (wants_mesh_fallback && stage == Stage::Mesh) {
+        mesh_fallback_cull_words_type = TypeArray(U32[1], Const(MESH_FALLBACK_CULL_PUSH_WORDS));
+        Decorate(mesh_fallback_cull_words_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(mesh_fallback_cull_words_type);
+        mesh_fallback_cull_member_index = member_index++;
+    }
     if (wants_guest_pages) {
         members.push_back(U64);
         guest_pages_member_index = member_index++;
@@ -1822,6 +1859,11 @@ void EmitContext::DefineRescalingInputPushConstant() {
                        spv::Decoration::Offset,
                        static_cast<u32>(offsetof(RescalingLayout, down_factor)));
         MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
+    }
+    if (wants_mesh_fallback && stage == Stage::Mesh) {
+        MemberDecorate(push_constant_struct, mesh_fallback_cull_member_index,
+                       spv::Decoration::Offset, MESH_FALLBACK_CULL_PUSH_OFFSET);
+        MemberName(push_constant_struct, mesh_fallback_cull_member_index, "mfb_cull_info");
     }
     if (wants_guest_pages) {
         MemberDecorate(push_constant_struct, guest_pages_member_index, spv::Decoration::Offset, GUEST_PAGES_PUSH_OFFSET);
@@ -2252,7 +2294,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         // did not read gl_NumWorkGroups
         num_workgroups = DefineInput(*this, U32[3], false, spv::BuiltIn::NumWorkgroups);
     }
-    if (info.uses_local_invocation_id) {
+    if (info.uses_local_invocation_id || runtime_info.mesh_wg_warp32) {
         local_invocation_id = DefineInput(*this, U32[3], false, spv::BuiltIn::LocalInvocationId);
     }
     if (info.uses_invocation_id) {
@@ -2273,7 +2315,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     }
     // (longshot: a stage on the shared warp reads none of the subgroup's inputs, and declares none; its check keeps them)
     const bool subgroup_free{warp_shared && !warp_shared_check};
-    if (info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage) && !subgroup_free) {
+    if (!runtime_info.mesh_wg_warp32 && info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage) && !subgroup_free) {
         subgroup_mask_eq = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupEqMaskKHR);
         subgroup_mask_lt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLtMaskKHR);
         subgroup_mask_le = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLeMaskKHR);
@@ -2287,7 +2329,8 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             Decorate(subgroup_mask_ge, spv::Decoration::Flat);
         }
     }
-    if ((info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
+    if (!runtime_info.mesh_wg_warp32 &&
+        (info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
          (profile.warp_size_potentially_larger_than_guest &&
           (info.uses_subgroup_vote || info.uses_subgroup_mask))) &&
         profile.SupportsSubgroupStage(stage) && !subgroup_free) {
@@ -2464,6 +2507,9 @@ void EmitContext::PlanSharedWarp(const IR::Program& program) {
         program.workgroup_size[0] != 32 || program.workgroup_size[1] != 1 || program.workgroup_size[2] != 1) {
         return;
     }
+    if (runtime_info.mesh_wg_warp32) {
+        return;
+    }
     std::vector<const IR::Block*> open;
     std::unordered_set<const IR::Block*> regions;
     u32 loops{};
@@ -2490,6 +2536,8 @@ void EmitContext::PlanSharedWarp(const IR::Program& program) {
                 case IR::Opcode::ShuffleUp:
                 case IR::Opcode::ShuffleDown:
                 case IR::Opcode::ShuffleButterfly:
+                case IR::Opcode::SubgroupBroadcastFirstU32:
+                case IR::Opcode::SubgroupReduceU32:
                     site = WARP_SHUFFLE_WORDS;
                     break;
                 case IR::Opcode::QuadBroadcast:
@@ -2631,6 +2679,8 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         // and record buffers live in the pushed fallback buffers, one slot a workgroup. A mesh program with no task
         // reads the workgroup index from its own payload, as NVN's hardware provides it.
         const Id wg_pointer{TypePointer(spv::StorageClass::Workgroup, U32[1])};
+        mesh_fallback_scratch = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_fallback_scratch, "mfb_scratch");
         if (stage == Stage::Task || !runtime_info.mesh_fallback_task) {
             mesh_payload = DefineVariable(*this, payload_type, std::nullopt, spv::StorageClass::Workgroup);
             Name(mesh_payload, "isbe_payload");
@@ -2746,6 +2796,28 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     }
 
     if (mesh_fallback) {
+        if (stage == Stage::Mesh && Shader::Backend::SPIRV::mesh_fallback_cull && mesh_info.Corners() == 3 &&
+            mesh_info.max_vertices <= 256U && mesh_info.max_primitives <= 256U) {
+            bool has_all_pos = true;
+            for (u32 c = 0; c < 4; ++c) {
+                const u32 want = static_cast<u32>(IR::Attribute::PositionX) + c;
+                const auto it = std::ranges::find(mesh_info.vertex_lines, want);
+                if (it == mesh_info.vertex_lines.end()) {
+                    has_all_pos = false;
+                    break;
+                }
+                mesh_fallback_pos_lines[c] = static_cast<u32>(it - mesh_info.vertex_lines.begin());
+            }
+            if (has_all_pos) {
+                mesh_fallback_cull = true;
+                mesh_fallback_live_count =
+                    DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+                Name(mesh_fallback_live_count, "mfb_live_count");
+                mesh_fallback_tri_slots = DefineVariable(
+                    *this, TypeArray(U32[1], Const(256U)), std::nullopt, spv::StorageClass::Workgroup);
+                Name(mesh_fallback_tri_slots, "mfb_tri_slots");
+            }
+        }
         return;   // (no mesh outputs here: the epilogue writes records)
     }
 
@@ -2953,6 +3025,30 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     default:
         break;
     }
+}
+
+void EmitContext::DefineWorkgroupWarp(const IR::Program& program) {
+    if (!runtime_info.mesh_wg_warp32) {
+        return;
+    }
+    wg_size_x = program.workgroup_size[0];
+    wg_size_y = program.stage == Stage::Compute ? program.workgroup_size[1] : 1U;
+    wg_size_z = program.stage == Stage::Compute ? program.workgroup_size[2] : 1U;
+    const u32 total_threads{wg_size_x * wg_size_y * wg_size_z};
+    mesh_wg_warps = std::max(1U, (total_threads + 31U) / 32U);
+    if (!Sirit::ValidId(mesh_shared_u32)) {
+        mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
+    }
+    // Wrap Workgroup array elements in a fresh OpTypeStruct so Sirit never aliases them with
+    // ArrayStride-decorated push-constant/UBO/shared arrays of matching length.
+    // 2 ping-pong slots x mesh_wg_warps x 4 SIMD8 subgroups for ballot; 2 x mesh_wg_warps x 32 for shuffle.
+    const Id wg_word_t{TypeStruct(U32[1])};
+    mesh_wg_ballot = DefineVariable(*this, TypeArray(wg_word_t, Const(2U * mesh_wg_warps * 4U)),
+                                    std::nullopt, spv::StorageClass::Workgroup);
+    Name(mesh_wg_ballot, "wg_ballot");
+    mesh_wg_shfl = DefineVariable(*this, TypeArray(wg_word_t, Const(2U * mesh_wg_warps * 32U)),
+                                  std::nullopt, spv::StorageClass::Workgroup);
+    Name(mesh_wg_shfl, "wg_shfl");
 }
 
 } // namespace Shader::Backend::SPIRV

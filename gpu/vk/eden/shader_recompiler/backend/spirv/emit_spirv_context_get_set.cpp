@@ -502,9 +502,9 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
     const AttributeType type{ctx.runtime_info.color_output_types[index]};
     if (type == AttributeType::Float) {
         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
-        if (frag_nan_guard) {   // (amd-fix, mma_layout.h) NaN -> 0, the rest clamped to +-1e30
-            const Id clamped{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, ctx.Const(-1e30f)), ctx.Const(1e30f))};
-            value = ctx.OpSelect(ctx.F32[1], IsNan(ctx, value, 32), ctx.Const(0.0f), clamped);
+        if (frag_nan_guard) {   // (amd-fix, mma_layout.h) NaN -> 0, the rest clamped to +-65000 (finite in FP16 HDR/bloom)
+            const Id clamped{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, ctx.Const(-65000.0f)), ctx.Const(65000.0f))};
+            value = ctx.OpSelect(ctx.F32[1], IsNan(ctx, value, 32), ctx.f32_zero_value, clamped);
         }
         ctx.OpStore(pointer, value);
     } else if (type == AttributeType::UnsignedInt) {

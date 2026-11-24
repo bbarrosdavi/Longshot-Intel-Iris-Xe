@@ -33,6 +33,9 @@ struct RenderAreaLayout {
 constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescaling_textures);
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
 constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
+// (longshot) optional per-draw cull/viewport/scissor words in the push-constant gap [28..48) before GUEST_PAGES_PUSH_OFFSET (zero when unset)
+constexpr u32 MESH_FALLBACK_CULL_PUSH_OFFSET = 28;
+constexpr u32 MESH_FALLBACK_CULL_PUSH_WORDS = 5;
 // (longshot) guest memory's page table, a u64 device address pushed to every compute program that reads global memory, after the blocks
 // above. It was a constant in the SPIR-V, and the address changes from run to run: the drivers' pipeline caches never hit
 constexpr u32 GUEST_PAGES_PUSH_OFFSET = sizeof(RescalingLayout) + sizeof(RenderAreaLayout);
@@ -123,6 +126,9 @@ enum class MeshFallbackLayout : u32 { Aos = 0, Soa = 1 };
 [[nodiscard]] constexpr u32 MeshFallbackFit(u32 record_words) {
     return MESH_FALLBACK_RECORD_WORDS / (record_words ? record_words : 1);
 }
+
+// (opt/iris-xe, RX_VK_MFB_CULL) Lossless per-triangle culling + SLM compaction in MeshFallbackEpilogue.
+inline bool mesh_fallback_cull = false;
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
