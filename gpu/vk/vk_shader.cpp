@@ -1618,7 +1618,7 @@ uint64_t translator_stamp() {
         const uint32_t mfb_cull = 0x6d666263u;   // ("mfbc")
         add(&mfb_cull, sizeof mfb_cull);
     }
-    const uint32_t fnan_v2 = 0x666e6733u;   // ("fng3": single EmitSetFragColor OpNMin/OpNMax guard + fetch_bounds on)
+    const uint32_t fnan_v2 = 0x666e6734u;   // ("fng4": NaN/Inf -> 0 EmitSetFragColor + GuardFragmentOutputs + fetch_bounds on)
     add(&fnan_v2, sizeof fnan_v2);
     if (const char* e = getenv("RX_VK_LOOP_SAFETY"); e && e[0] != '0') {
         const uint32_t ls = 0x6c736166u;   // ("lsaf")
