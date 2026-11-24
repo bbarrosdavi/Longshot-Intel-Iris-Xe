@@ -218,7 +218,7 @@ def host():
     record = block(draw, "bool fallback_record(")
     clear = record.index("vkCmdFillBuffer(cmd, f->records, Shader::Backend::SPIRV::MeshFallbackRecordsBytes()")
     first_send = record.index("send(stages[0]")
-    barriers = [m.start() for m in re.finditer(r"full_barrier\(cmd\);", record)]
+    barriers = [m.start() for m in re.finditer(r"(?:full_barrier\(cmd\)|vkCmdPipelineBarrier2\(cmd, &di\));", record)]
     if not any(clear < b < first_send for b in barriers):
         raise SystemExit("the counters' clear is not ordered before the draw's stages by a barrier")
     read = record.index("fallback_warp_counters(cmd, *f);")
