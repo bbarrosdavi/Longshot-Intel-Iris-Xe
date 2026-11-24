@@ -1253,6 +1253,7 @@ std::unordered_map<uint64_t, uint32_t> ev_values;
 // (longshot) The CPU's signals, while a replay holds replay_mu: the main thread stopped for it in nvnEventSignal, ~1.7 ms
 // a frame of the critical path. They wait here for the replay's next look at the events (ev_cpu_apply).
 std::mutex ev_cpu_mu;
+std::condition_variable ev_cpu_cv;
 std::vector<std::pair<uint64_t, uint32_t>> ev_cpu_pending;
 std::atomic<bool> ev_cpu_any{false};
 // (longshot) how many signals the CPU has made, and how many of them a look at the stopped queues has been taken since
@@ -1454,23 +1455,33 @@ struct UbGapCache {
     size_t first = 0, lim = 0;
     bool on = false;
 };
-thread_local UbGapCache ub_gap_cache;
+// 4-entry ring of non-overlapping gaps: prevents thrashing when a draw reads c3/c4/SSBOs across inline UPDATE_UBs.
+constexpr size_t kUbGapSlots = 4;
+thread_local UbGapCache ub_gap_cache[kUbGapSlots];
+thread_local size_t ub_gap_next = 0;
 bool ub_gap_holds(uint64_t addr, uint64_t n, size_t first, size_t lim) {
-    return n && ub_gap_cache.on && ub_gap_cache.epoch == ub_list_epoch.load(std::memory_order_relaxed) &&
-           ub_gap_cache.first == first && ub_gap_cache.lim == lim && addr >= ub_gap_cache.lo &&
-           addr + n >= addr && addr + n <= ub_gap_cache.hi;
+    if (!n || addr + n < addr) return false;
+    if (first >= lim) return true;
+    const uint64_t epoch = ub_list_epoch.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < kUbGapSlots; i++) {
+        const UbGapCache& g = ub_gap_cache[i];
+        if (g.on && g.epoch == epoch && g.first == first && g.lim == lim && addr >= g.lo && addr + n <= g.hi)
+            return true;
+    }
+    return false;
 }
 bool ub_try_gap(size_t first, size_t lim, uint64_t addr, uint64_t n) {
     if (first > lim) return false;
+    if (first == lim) return true;
     const uint64_t epoch = ub_list_epoch.load(std::memory_order_relaxed);
     // (a background thread's range is empty: it reads nothing of the deque, not even its start, while the replay
     // thread changes it)
     using It = std::deque<UbUpdate>::const_iterator;
-    const It from = first == lim ? It{} : ub_updates.cbegin() + first, to = first == lim ? It{} : from + (lim - first);
+    const It from = ub_updates.cbegin() + first, to = from + (lim - first);
     uint64_t lo = 0, hi = 0;
     if (!ub_gap(from, to, addr, n, &lo, &hi)) return false;
     if (ub_list_epoch.load(std::memory_order_relaxed) != epoch) return false;   // (the list changed: do not keep the gap)
-    ub_gap_cache = {epoch, lo, hi, first, lim, true};
+    ub_gap_cache[ub_gap_next++ & (kUbGapSlots - 1)] = {epoch, lo, hi, first, lim, true};
     return true;
 }
 // (a draw reads the same uniform words as the draw before it. The gap is what says later updates missed the word:
@@ -1481,12 +1492,12 @@ struct UbWord {
     uint32_t v = 0;
     bool on = false;
 };
-thread_local UbWord ub_words[128];
+// 1024-entry L1-resident word cache (was 128): prevents eviction across 32/64-element handle tables & SSBOs.
+constexpr uint32_t kUbWords = 1024;
+thread_local UbWord ub_words[kUbWords];
 uint32_t ub_word_index(uint64_t addr) {
-    // Words 512 bytes or a page apart share the low seven word bits. Add higher bits to separate those strides
-    // while keeping runs of up to 64 words collision-free. Hits still compare the full address in ub_word_hit.
     const uint64_t word = addr >> 2;
-    return (uint32_t)((word + (word >> 7) + (word >> 14)) & 127);
+    return (uint32_t)((word + (word >> 10) + (word >> 20)) & (kUbWords - 1));
 }
 bool ub_word_hit(uint64_t addr, size_t lim, uint32_t* out) {
     UbWord& w = ub_words[ub_word_index(addr)];
@@ -1735,6 +1746,217 @@ bool op_is_work(uint32_t op) {
            op == NOP_DISPATCH_INDIRECT;
 }
 
+/// Pure state-only ops that can safely be scanned/replayed across consecutive NOP_DRAW_MESH draws.
+inline bool is_pure_state_op(uint32_t op) {
+    switch (op) {
+    case NOP_BEGIN: case NOP_JUMP: case NOP_CALL:
+    case NOP_VIEWPORTS: case NOP_SCISSOR: case NOP_DEPTH_RANGE:
+    case NOP_BIND_PROGRAM: case NOP_BIND_STATE:
+    case NOP_BIND_VATTR: case NOP_BIND_VSTREAM: case NOP_BIND_VBUF:
+    case NOP_BIND_BUFS: case NOP_BIND_UBO: case NOP_BIND_SSBO:
+    case NOP_BIND_TEX: case NOP_BIND_SAMP: case NOP_BIND_IMG:
+    case NOP_STENCIL: case NOP_POLY_OFFSET: case NOP_BLEND_COLOR:
+    case NOP_PRIMITIVE_RESTART: case NOP_DEPTH_CLAMP: case NOP_RASTER_DISCARD:
+    case NOP_RENDER_ENABLE: case NOP_SET_TEX_POOL: case NOP_SET_SAMP_POOL:
+    case NOP_COPY_STRIDE: case NOP_PUSH_CONST:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Apply a pure state-only op to `s`. Returns false if `op` is not a pure state op.
+bool apply_state_op(NvnState& s, uint32_t op, const uint8_t* a, uint32_t avail, bool is_probe) {
+    switch (op) {
+    case NOP_BEGIN: case NOP_JUMP: case NOP_CALL:
+        return true;
+    case NOP_VIEWPORTS: {
+        const auto v = payload<nvn_p_viewports>(a, avail);
+        for (int i = 0; i < v.n && v.first + i < 16; i++) std::memcpy(s.viewport[v.first + i], v.v[i], 16);
+        return true;
+    }
+    case NOP_SCISSOR: {
+        const auto c = payload<nvn_p_scissor>(a, avail);
+        s.scissor[0] = c.x, s.scissor[1] = c.y, s.scissor[2] = c.w, s.scissor[3] = c.h;
+        return true;
+    }
+    case NOP_DEPTH_RANGE: {
+        const auto d = payload<nvn_p_depth_range>(a, avail);
+        s.depth_near = d.n, s.depth_far = d.f;
+        return true;
+    }
+    case NOP_BIND_PROGRAM: {
+        const auto b = payload<nvn_p_bind_program>(a, avail);
+        const bool same = b.prog && s.has_prog ? std::memcmp(&s.prog, b.prog, sizeof s.prog) == 0 : !b.prog && !s.has_prog;
+        if (!same) s.bind_gen++;
+        if (b.prog) s.prog = *b.prog;
+        s.has_prog = b.prog != nullptr && b.prog->nstage > 0;
+        return true;
+    }
+    case NOP_BIND_STATE: {
+        const auto b = payload<nvn_p_bind_state>(a, avail);
+        switch (b.kind) {
+        case 0: {
+            nvn_blend_st st;
+            std::memcpy(&st, b.bytes, sizeof st);
+            s.blend[st.target & 7] = st;
+            break;
+        }
+        case 1: std::memcpy(&s.color, b.bytes, sizeof s.color); break;
+        case 2: std::memcpy(&s.chmask, b.bytes, sizeof s.chmask); break;
+        case 3: std::memcpy(&s.ms, b.bytes, sizeof s.ms); break;
+        case 4: std::memcpy(&s.poly, b.bytes, sizeof s.poly); break;
+        case 5: std::memcpy(&s.ds, b.bytes, sizeof s.ds); break;
+        default: break;
+        }
+        return true;
+    }
+    case NOP_BIND_VATTR: {
+        const auto v = payload<nvn_p_bind_vattr>(a, avail);
+        std::memset(s.vattr, 0, sizeof s.vattr);
+        for (int i = 0; i < v.n && i < 16; i++) s.vattr[i] = v.st[i];
+        s.nvattr = std::min(v.n, 16);
+        return true;
+    }
+    case NOP_BIND_VSTREAM: {
+        const auto v = payload<nvn_p_bind_vstream>(a, avail);
+        for (int i = 0; i < v.n && i < 16; i++) s.vstream[i] = v.st[i];
+        return true;
+    }
+    case NOP_BIND_VBUF: {
+        const auto v = payload<nvn_p_bind_vbuf>(a, avail);
+        for (int i = 0; i < v.n && v.first + i < 16; i++) s.vbuf[v.first + i] = v.r[i];
+        return true;
+    }
+    case NOP_BIND_BUFS: {
+        auto b = payload<nvn_p_bind_bufs>(a, avail);
+        if (!is_probe) {
+            static const bool on = env_on("RX_VK_LOG_DEFERRED");
+            static std::atomic<int> told{0};
+            if (on && b.src && b.stage == 5 && told < 400) {
+                NVNbufferRange now[16]{};
+                const int n = std::clamp(b.n, 0, 16);
+                host->gpu_read(b.src, now, (uint64_t)n * sizeof(NVNbufferRange));
+                for (int i = 0; i < n && told < 400; i++, told++)
+                    logf("vk: deferred %s stage 5 slot %d (array %#llx): submit %#llx+%#llx, now %#llx+%#llx%s",
+                         b.ssbo ? "ssbo" : "ubo", b.first + i, (unsigned long long)b.src,
+                         (unsigned long long)b.r[i].address, (unsigned long long)b.r[i].size,
+                         (unsigned long long)now[i].address, (unsigned long long)now[i].size,
+                         now[i].address != b.r[i].address || now[i].size != b.r[i].size ? "  DIFFERS" : "");
+            }
+        }
+        for (int i = 0; i < b.n && i < 16; i++) {
+            const int index = b.first + i;
+            if (b.stage < 0 || b.stage >= kNvnStages || index < 0 || index >= 16) continue;
+            if (!is_probe) {
+                static const bool on = env_on("RX_VK_LOG_MESH_BINDS");
+                static std::atomic<int> told{0};
+                if (on && b.stage >= 6 && b.r[i].size != 0x100 && told++ < 300)
+                    logf("vk: bind (many) %s stage %d index %d addr %#llx size %#llx", b.ssbo ? "ssbo" : "ubo", b.stage, index,
+                         (unsigned long long)b.r[i].address, (unsigned long long)b.r[i].size);
+            }
+            nvn_p_bind_buf& u = (b.ssbo ? s.ssbo : s.ubo)[b.stage][index];
+            if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, index, b.r[i].address, b.r[i].size)) {
+                s.bind_gen++;
+                if (b.ssbo) s.ssbo_gen[b.stage] = s.bind_gen;
+            }
+            u.stage = b.stage, u.index = index, u.addr = b.r[i].address, u.size = b.r[i].size;
+        }
+        return true;
+    }
+    case NOP_BIND_UBO: case NOP_BIND_SSBO: {
+        const auto b = payload<nvn_p_bind_buf>(a, avail);
+        if (!is_probe && b.stage >= kNvnStages) log_stage_bind(op, b.stage);
+        if (!is_probe) {
+            static const bool on = env_on("RX_VK_LOG_MESH_BINDS");
+            static std::atomic<int> told{0};
+            if (on && b.stage >= 6 && b.size != 0x100 && told++ < 300)
+                logf("vk: bind %s stage %d index %d addr %#llx size %#llx", op == NOP_BIND_UBO ? "ubo" : "ssbo", b.stage, b.index,
+                     (unsigned long long)b.addr, (unsigned long long)b.size);
+        }
+        if (b.stage >= 0 && b.stage < kNvnStages && b.index >= 0 && b.index < 16) {
+            nvn_p_bind_buf& u = (op == NOP_BIND_UBO ? s.ubo : s.ssbo)[b.stage][b.index];
+            if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, b.index, b.addr, b.size)) {
+                s.bind_gen++;
+                if (op == NOP_BIND_SSBO) s.ssbo_gen[b.stage] = s.bind_gen;
+            }
+            u = b;
+        }
+        return true;
+    }
+    case NOP_BIND_TEX: case NOP_BIND_SAMP: case NOP_BIND_IMG: {
+        nvn_p_bind_handles b;
+        std::memset(&b, 0, sizeof b);
+        std::memcpy(&b, a, std::min<size_t>(sizeof b, avail));
+        if (!is_probe && b.stage >= kNvnStages) log_stage_bind(op, b.stage);
+        if (b.stage < 0 || b.stage >= kNvnStages || b.first < 0) return true;
+        uint64_t* to = op == NOP_BIND_TEX ? s.tex[b.stage] : op == NOP_BIND_SAMP ? s.samp[b.stage] : s.img[b.stage];
+        const int lim = op == NOP_BIND_IMG ? 32 : 128;
+        int n = 0;
+        while (n < b.n && b.first + n < lim) n++;
+        if (!handles_unchanged(to + b.first, b.h, n)) {
+            s.bind_gen++;
+            s.tex_gen[b.stage] = s.bind_gen;
+        }
+        for (int k = 0; k < n; k++) to[b.first + k] = b.h[k];
+        return true;
+    }
+    case NOP_STENCIL: {
+        const auto st = payload<nvn_p_stencil>(a, avail);
+        for (int f = 0; f < 2; f++) {
+            if (!(st.face & (1 << f))) continue;
+            if (st.which == 0) s.stencil_value_mask[f] = (uint32_t)st.value_mask;
+            else if (st.which == 1) s.stencil_mask[f] = (uint32_t)st.mask;
+            else s.stencil_ref[f] = (uint32_t)st.ref;
+        }
+        return true;
+    }
+    case NOP_POLY_OFFSET: {
+        const auto o = payload<nvn_p_poly_offset>(a, avail);
+        s.poly_offset[0] = o.factor, s.poly_offset[1] = o.units, s.poly_offset[2] = o.clamp;
+        return true;
+    }
+    case NOP_BLEND_COLOR:
+        std::memcpy(s.blend_color, payload<nvn_p_blend_color>(a, avail).rgba, 16);
+        return true;
+    case NOP_PRIMITIVE_RESTART: {
+        const auto r = payload<nvn_p_restart>(a, avail);
+        s.restart = r.enable != 0, s.restart_index = (uint32_t)r.index;
+        return true;
+    }
+    case NOP_DEPTH_CLAMP:
+        s.depth_clamp = payload<nvn_p_flag>(a, avail).value != 0;
+        return true;
+    case NOP_RASTER_DISCARD:
+        s.raster_discard = payload<nvn_p_flag>(a, avail).value != 0;
+        return true;
+    case NOP_RENDER_ENABLE:
+        s.render_enabled = payload<nvn_p_flag>(a, avail).value != 0;
+        if (!is_probe && dump_on()) logf("vk: dump-op %03d RENDER_ENABLE %d", dump_seq(), (int)s.render_enabled);
+        return true;
+    case NOP_SET_TEX_POOL: case NOP_SET_SAMP_POOL:
+        s.bind_gen++;
+        for (int k = 0; k < kNvnStages; k++) s.tex_gen[k] = s.bind_gen;
+        return true;
+    case NOP_COPY_STRIDE:
+        s.copy_stride = payload<nvn_p_copy_stride>(a, avail).stride;
+        return true;
+    case NOP_PUSH_CONST: {
+        const auto u = payload<nvn_p_push_const>(a, avail);
+        if (u.size && u.size <= avail - sizeof u && (uint64_t)u.offset + u.size <= sizeof s.cs_push) {
+            const uint8_t* src = a + sizeof u;
+            const bool same = (uint64_t)u.offset + u.size <= s.cs_push_n && std::memcmp(s.cs_push + u.offset, src, u.size) == 0;
+            std::memcpy(s.cs_push + u.offset, src, u.size);
+            s.cs_push_n = std::max<uint32_t>(s.cs_push_n, u.offset + u.size);
+            if (!same) s.bind_gen++;
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* end = nullptr) {
     // (RX_VK_LOG_RB_WRITERS, RX_VK_READBACK_EARLY: each op said, as the writer of what it writes)
     static const bool rb_writers = rb_writers_on(), early = readback_early_on(), note_ops = rb_writers || early;
@@ -1947,168 +2169,16 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         // ---- state ----
         case NOP_SET_RT: s.rt = payload<nvn_p_set_rt>(a, avail), s.rt_serial++; break;
-        case NOP_VIEWPORTS: {
-            const auto v = payload<nvn_p_viewports>(a, avail);
-            for (int i = 0; i < v.n && v.first + i < 16; i++) std::memcpy(s.viewport[v.first + i], v.v[i], 16);
-            break;
-        }
-        case NOP_SCISSOR: {
-            const auto c = payload<nvn_p_scissor>(a, avail);
-            s.scissor[0] = c.x, s.scissor[1] = c.y, s.scissor[2] = c.w, s.scissor[3] = c.h;
-            break;
-        }
-        case NOP_DEPTH_RANGE: {
-            const auto d = payload<nvn_p_depth_range>(a, avail);
-            s.depth_near = d.n, s.depth_far = d.f;
-            break;
-        }
-        case NOP_BIND_PROGRAM: {
-            const auto b = payload<nvn_p_bind_program>(a, avail);
-            // (the same program bound again: its descriptors already stand)
-            const bool same = b.prog && s.has_prog ? std::memcmp(&s.prog, b.prog, sizeof s.prog) == 0 : !b.prog && !s.has_prog;
-            if (!same) s.bind_gen++;
-            if (b.prog) s.prog = *b.prog;
-            s.has_prog = b.prog != nullptr && b.prog->nstage > 0;
-            break;
-        }
-        case NOP_BIND_STATE: {
-            const auto b = payload<nvn_p_bind_state>(a, avail);
-            switch (b.kind) {
-            case 0: {
-                nvn_blend_st st;
-                std::memcpy(&st, b.bytes, sizeof st);
-                s.blend[st.target & 7] = st;
-                break;
-            }
-            case 1: std::memcpy(&s.color, b.bytes, sizeof s.color); break;
-            case 2: std::memcpy(&s.chmask, b.bytes, sizeof s.chmask); break;
-            case 3: std::memcpy(&s.ms, b.bytes, sizeof s.ms); break;
-            case 4: std::memcpy(&s.poly, b.bytes, sizeof s.poly); break;
-            case 5: std::memcpy(&s.ds, b.bytes, sizeof s.ds); break;
-            default: break;
-            }
-            break;
-        }
-        case NOP_BIND_VATTR: {
-            const auto v = payload<nvn_p_bind_vattr>(a, avail);
-            std::memset(s.vattr, 0, sizeof s.vattr);
-            for (int i = 0; i < v.n && i < 16; i++) s.vattr[i] = v.st[i];
-            s.nvattr = std::min(v.n, 16);
-            break;
-        }
-        case NOP_BIND_VSTREAM: {
-            const auto v = payload<nvn_p_bind_vstream>(a, avail);
-            for (int i = 0; i < v.n && i < 16; i++) s.vstream[i] = v.st[i];
-            break;
-        }
-        case NOP_BIND_VBUF: {
-            const auto v = payload<nvn_p_bind_vbuf>(a, avail);
-            for (int i = 0; i < v.n && v.first + i < 16; i++) s.vbuf[v.first + i] = v.r[i];
-            break;
-        }
-        case NOP_BIND_BUFS: {
-            auto b = payload<nvn_p_bind_bufs>(a, avail);
-            // (deferred binds: the ranges as the game's array held them at the submit, which the host copied into
-            // the recording then (nvn_native.c resolve_deferred). Read again here, at the replay, the array was
-            // often the next frame's already (MKW refills it as soon as the submit returns): the terrain patches
-            // took other patches' placements (holes in the far terrain, the minimap's triangles).)
-            {   // (EvilOOT, RX_VK_LOG_DEFERRED=1: compute's deferred binds, as at the submit and as the array holds them now)
-                static const bool on = env_on("RX_VK_LOG_DEFERRED");
-                static std::atomic<int> told{0};
-                if (on && b.src && b.stage == 5 && told < 400) {
-                    NVNbufferRange now[16]{};
-                    const int n = std::clamp(b.n, 0, 16);
-                    host->gpu_read(b.src, now, (uint64_t)n * sizeof(NVNbufferRange));
-                    for (int i = 0; i < n && told < 400; i++, told++)
-                        logf("vk: deferred %s stage 5 slot %d (array %#llx): submit %#llx+%#llx, now %#llx+%#llx%s", b.ssbo ? "ssbo" : "ubo",
-                             b.first + i, (unsigned long long)b.src, (unsigned long long)b.r[i].address, (unsigned long long)b.r[i].size,
-                             (unsigned long long)now[i].address, (unsigned long long)now[i].size,
-                             now[i].address != b.r[i].address || now[i].size != b.r[i].size ? "  DIFFERS" : "");
-                }
-            }
-            for (int i = 0; i < b.n && i < 16; i++) {
-                const int index = b.first + i;
-                if (b.stage < 0 || b.stage >= kNvnStages || index < 0 || index >= 16) continue;
-                {
-                    static const bool on = env_on("RX_VK_LOG_MESH_BINDS");
-                    static std::atomic<int> told{0};
-                    if (on && b.stage >= 6 && b.r[i].size != 0x100 && told++ < 300)
-                        logf("vk: bind (many) %s stage %d index %d addr %#llx size %#llx", b.ssbo ? "ssbo" : "ubo", b.stage, index,
-                             (unsigned long long)b.r[i].address, (unsigned long long)b.r[i].size);
-                }
-                nvn_p_bind_buf& u = (b.ssbo ? s.ssbo : s.ubo)[b.stage][index];
-                if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, index, b.r[i].address, b.r[i].size)) {
-                    s.bind_gen++;
-                    if (b.ssbo) s.ssbo_gen[b.stage] = s.bind_gen;
-                }
-                u.stage = b.stage, u.index = index, u.addr = b.r[i].address, u.size = b.r[i].size;
-            }
-            break;
-        }
-        case NOP_BIND_UBO: case NOP_BIND_SSBO: {
-            const auto b = payload<nvn_p_bind_buf>(a, avail);
-            if (b.stage >= kNvnStages) log_stage_bind(h.op, b.stage);
-            {   // (longshot) RX_VK_LOG_MESH_BINDS=1: what the game binds to the task and mesh stages, 80 lines
-                static const bool on = env_on("RX_VK_LOG_MESH_BINDS");
-                static std::atomic<int> told{0};
-                if (on && b.stage >= 6 && b.size != 0x100 && told++ < 300)
-                    logf("vk: bind %s stage %d index %d addr %#llx size %#llx", h.op == NOP_BIND_UBO ? "ubo" : "ssbo", b.stage, b.index,
-                         (unsigned long long)b.addr, (unsigned long long)b.size);
-            }
-            if (b.stage >= 0 && b.stage < kNvnStages && b.index >= 0 && b.index < 16) {
-                nvn_p_bind_buf& u = (h.op == NOP_BIND_UBO ? s.ubo : s.ssbo)[b.stage][b.index];
-                if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, b.index, b.addr, b.size)) {
-                    s.bind_gen++;
-                    if (h.op == NOP_BIND_SSBO) s.ssbo_gen[b.stage] = s.bind_gen;
-                }
-                u = b;
-            }
-            break;
-        }
-        case NOP_BIND_TEX: case NOP_BIND_SAMP: case NOP_BIND_IMG: {
-            nvn_p_bind_handles b;
-            std::memset(&b, 0, sizeof b);
-            std::memcpy(&b, a, std::min<size_t>(sizeof b, h.size - 8));
-            // (deferred: the handles as of the submit, as the ranges above)
-            if (b.stage >= kNvnStages) log_stage_bind(h.op, b.stage);
-            if (b.stage < 0 || b.stage >= kNvnStages || b.first < 0) break;
-            uint64_t* to = h.op == NOP_BIND_TEX ? s.tex[b.stage] : h.op == NOP_BIND_SAMP ? s.samp[b.stage] : s.img[b.stage];
-            const int lim = h.op == NOP_BIND_IMG ? 32 : 128;
-            int n = 0;
-            while (n < b.n && b.first + n < lim) n++;
-            if (!handles_unchanged(to + b.first, b.h, n)) {   // (the same handles: the draw keeps its descriptors)
-                s.bind_gen++;
-                s.tex_gen[b.stage] = s.bind_gen;
-            }
-            for (int k = 0; k < n; k++) to[b.first + k] = b.h[k];
-            break;
-        }
-        case NOP_STENCIL: {
-            const auto st = payload<nvn_p_stencil>(a, avail);
-            for (int f = 0; f < 2; f++) {
-                if (!(st.face & (1 << f))) continue;
-                if (st.which == 0) s.stencil_value_mask[f] = (uint32_t)st.value_mask;
-                else if (st.which == 1) s.stencil_mask[f] = (uint32_t)st.mask;
-                else s.stencil_ref[f] = (uint32_t)st.ref;
-            }
-            break;
-        }
-        case NOP_POLY_OFFSET: {
-            const auto o = payload<nvn_p_poly_offset>(a, avail);
-            s.poly_offset[0] = o.factor, s.poly_offset[1] = o.units, s.poly_offset[2] = o.clamp;
-            break;
-        }
-        case NOP_BLEND_COLOR: std::memcpy(s.blend_color, payload<nvn_p_blend_color>(a, avail).rgba, 16); break;
-        case NOP_PRIMITIVE_RESTART: {
-            const auto r = payload<nvn_p_restart>(a, avail);
-            s.restart = r.enable != 0, s.restart_index = (uint32_t)r.index;
-            break;
-        }
-        case NOP_DEPTH_CLAMP: s.depth_clamp = payload<nvn_p_flag>(a, avail).value != 0; break;
-        case NOP_RASTER_DISCARD: s.raster_discard = payload<nvn_p_flag>(a, avail).value != 0; break;
-        case NOP_RENDER_ENABLE:
-            s.render_enabled = payload<nvn_p_flag>(a, avail).value != 0;
-            if (dump_on()) logf("vk: dump-op %03d RENDER_ENABLE %d", dump_seq(), (int)s.render_enabled);
+        case NOP_VIEWPORTS: case NOP_SCISSOR: case NOP_DEPTH_RANGE:
+        case NOP_BIND_PROGRAM: case NOP_BIND_STATE:
+        case NOP_BIND_VATTR: case NOP_BIND_VSTREAM: case NOP_BIND_VBUF:
+        case NOP_BIND_BUFS: case NOP_BIND_UBO: case NOP_BIND_SSBO:
+        case NOP_BIND_TEX: case NOP_BIND_SAMP: case NOP_BIND_IMG:
+        case NOP_STENCIL: case NOP_POLY_OFFSET: case NOP_BLEND_COLOR:
+        case NOP_PRIMITIVE_RESTART: case NOP_DEPTH_CLAMP: case NOP_RASTER_DISCARD:
+        case NOP_RENDER_ENABLE: case NOP_SET_TEX_POOL: case NOP_SET_SAMP_POOL:
+        case NOP_COPY_STRIDE: case NOP_PUSH_CONST:
+            apply_state_op(s, h.op, a, avail, false);
             break;
         case NOP_RENDER_COND: {   // (read on the CPU for now; VK_EXT_conditional_rendering later)
             const auto r = payload<nvn_p_render_cond>(a, avail);
@@ -2128,22 +2198,6 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 logf("vk: dump-op %03d RENDER_COND mode %d at %#llx: %llu vs %llu: %s", dump_seq(), r.mode,
                      (unsigned long long)r.addr, (unsigned long long)x, (unsigned long long)y,
                      s.render_enabled ? "on" : "off");
-            break;
-        }
-        case NOP_SET_TEX_POOL: case NOP_SET_SAMP_POOL:
-            s.bind_gen++;
-            for (int k = 0; k < kNvnStages; k++) s.tex_gen[k] = s.bind_gen;
-            break;
-        case NOP_COPY_STRIDE: s.copy_stride = payload<nvn_p_copy_stride>(a, avail).stride; break;
-        case NOP_PUSH_CONST: {   // (longshot) compute push constants, kept in the state (vk_bank.cpp serves them from c0)
-            const auto u = payload<nvn_p_push_const>(a, avail);
-            if (u.size && u.size <= avail - sizeof u && (uint64_t)u.offset + u.size <= sizeof s.cs_push) {
-                const uint8_t* src = a + sizeof u;
-                const bool same = (uint64_t)u.offset + u.size <= s.cs_push_n && std::memcmp(s.cs_push + u.offset, src, u.size) == 0;
-                std::memcpy(s.cs_push + u.offset, src, u.size);
-                s.cs_push_n = std::max<uint32_t>(s.cs_push_n, u.offset + u.size);
-                if (!same) s.bind_gen++;
-            }
             break;
         }
         case NOP_BARRIER:
@@ -2209,6 +2263,152 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             break;
         }
         case NOP_DRAW_MESH: {
+            if (s.render_enabled && !s.raster_discard) {
+                const int limit = mfb_batch_limit();
+                if (limit >= 2) {
+                    int seen_mesh = 0;
+                    for (const uint8_t* q = p; q != end && seen_mesh < 2;) {
+                        nvn_op_hdr qh;
+                        std::memcpy(&qh, q, sizeof qh);
+                        if (qh.size < 8) break;
+                        if (qh.op == NOP_DRAW_MESH) {
+                            seen_mesh++;
+                            q += qh.size;
+                        } else if (is_pure_state_op(qh.op) || qh.op == NOP_UPDATE_UB) {
+                            q += qh.size;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (seen_mesh >= 2) {
+                        static thread_local NvnState ws;
+                        ws = s;
+                        const size_t saved_ub_size = ub_updates.size();
+                        const uint64_t saved_ub_gen = ub_gen;
+                        const int64_t saved_st_ub = st_ub_updates;
+                        size_t committed_ub_size = saved_ub_size;
+                        uint64_t committed_ub_gen = saved_ub_gen;
+                        int64_t committed_st_ub = saved_st_ub;
+                        mfb_batch_begin();
+                        int draw_slots[32];
+                        int total_draws = 0;
+                        int batched_active = 0;
+                        const uint8_t* batch_end = p;
+                        for (const uint8_t* q = p; q != end && batched_active < limit && total_draws < 32;) {
+                            nvn_op_hdr qh;
+                            std::memcpy(&qh, q, sizeof qh);
+                            if (qh.size < 8) break;
+                            const uint8_t* qa = q + 8;
+                            const uint32_t qavail = qh.size - 8;
+                            if (qh.op == NOP_DRAW_MESH) {
+                                if (!ws.render_enabled || ws.raster_discard) {
+                                    draw_slots[total_draws++] = -1;
+                                    q += qh.size;
+                                    if (batched_active >= 2) {
+                                        batch_end = q;
+                                        committed_ub_size = ub_updates.size();
+                                        committed_ub_gen = ub_gen;
+                                        committed_st_ub = st_ub_updates;
+                                    }
+                                    continue;
+                                }
+                                const auto qd = payload<nvn_p_draw_mesh>(qa, qavail);
+                                DrawArgs qda;
+                                qda.mesh = true;
+                                qda.groups[0] = qd.y, qda.groups[1] = 1, qda.groups[2] = 1;
+                                if (qd.kind == 0) qda.first_task = qd.x;
+                                qda.indirect = qd.indirect, qda.count_addr = qd.count_addr;
+                                qda.max = qd.max, qda.stride = qd.stride;
+                                const int slot = mfb_batch_add(ws, qda);
+                                if (slot < 0) break;
+                                draw_slots[total_draws++] = slot;
+                                batched_active++;
+                                q += qh.size;
+                                batch_end = q;
+                                committed_ub_size = ub_updates.size();
+                                committed_ub_gen = ub_gen;
+                                committed_st_ub = st_ub_updates;
+                            } else if (qh.op == NOP_UPDATE_UB) {
+                                const auto u = payload<nvn_p_update_ub>(qa, qavail);
+                                if (u.size && u.size <= qavail - sizeof u) {
+                                    if (early && memory_rb_waited_range(host->gpu_guest(u.dst), u.size)) break;
+                                    UbUpdate up{rec_value_now, u.dst, std::vector<uint8_t>(qa + sizeof u, qa + sizeof u + u.size)};
+                                    ub_updates.push_back(std::move(up));
+                                    ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
+                                    ub_gen++;
+                                    st_ub_updates++;
+                                }
+                                q += qh.size;
+                            } else if (apply_state_op(ws, qh.op, qa, qavail, true)) {
+                                q += qh.size;
+                            } else {
+                                break;
+                            }
+                        }
+                        if (batched_active >= 2 && mfb_batch_flush_compute(cmd)) {
+                            if (ub_updates.size() > committed_ub_size) {
+                                ub_updates.resize(committed_ub_size);
+                                ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            ub_gen = committed_ub_gen;
+                            st_ub_updates = committed_st_ub;
+                            int di = 0;
+                            int work_done = 0;
+                            for (const uint8_t* r = p; r < batch_end;) {
+                                nvn_op_hdr rh;
+                                std::memcpy(&rh, r, sizeof rh);
+                                const uint8_t* ra = r + 8;
+                                const uint32_t ravail = rh.size - 8;
+                                if (note_ops) memory_writer_note(rh.op, 0);
+                                if (rh.op == NOP_DRAW_MESH) {
+                                    const auto d2 = payload<nvn_p_draw_mesh>(ra, ravail);
+                                    static int logged_mesh_b;
+                                    if (logged_mesh_b++ < 8)
+                                        logf("vk: mesh draw kind %d: %d %d %d, indirect %#llx count %#llx max %d stride %d",
+                                             d2.kind, d2.x, d2.y, d2.z, (unsigned long long)d2.indirect,
+                                             (unsigned long long)d2.count_addr, d2.max, d2.stride);
+                                    DrawArgs da2;
+                                    occ_take(s, da2);
+                                    const int slot = draw_slots[di++];
+                                    if (s.render_enabled && !s.raster_discard) {
+                                        da2.mesh = true;
+                                        da2.groups[0] = d2.y, da2.groups[1] = 1, da2.groups[2] = 1;
+                                        if (d2.kind == 0) da2.first_task = d2.x;
+                                        da2.indirect = d2.indirect, da2.count_addr = d2.count_addr;
+                                        da2.max = d2.max, da2.stride = d2.stride;
+                                        draw_mfb_batched(cmd, s, da2, slot);
+                                    }
+                                    s.samples_passed += 16;
+                                    work_done++;
+                                    if (rb_writers) memory_count_work();
+                                } else if (rh.op != NOP_UPDATE_UB) {
+                                    apply_state_op(s, rh.op, ra, ravail, false);
+                                }
+                                r += rh.size;
+                            }
+                            mfb_batch_end();
+                            if (work_done > 0) {
+                                part_work += work_done - 1;
+                                maybe_split(cmd);
+                                if (early) {
+                                    static const int64_t early_gap = std::max<int64_t>(0, env_int("RX_VK_READBACK_EARLY_GAP", 16));
+                                    if (memory_split_wanted()) early_split_pending = true;
+                                    if (early_split_pending && part_work >= early_gap) early_split(cmd);
+                                }
+                            }
+                            p = batch_end;
+                            continue;
+                        }
+                        if (ub_updates.size() > saved_ub_size) {
+                            ub_updates.resize(saved_ub_size);
+                            ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        ub_gen = saved_ub_gen;
+                        st_ub_updates = saved_st_ub;
+                        mfb_batch_end();
+                    }
+                }
+            }
             const auto d = payload<nvn_p_draw_mesh>(a, avail);
             static int logged_mesh;
             if (logged_mesh++ < 8)
@@ -2694,7 +2894,11 @@ void update_blocked() {
     for (const auto& [queue, q] : qruns) n += q.blocked();
     ev_wait_in_memory.store(n && waits_on_memory_event(), std::memory_order_release);
     if (n && !blocked_n.load()) blocked_since = std::chrono::steady_clock::now();
-    blocked_n = n;
+    blocked_n.store(n, std::memory_order_release);
+    if (n && ev_cpu_any.load(std::memory_order_acquire)) {
+        std::lock_guard ek(ev_cpu_mu);
+        ev_cpu_cv.notify_one();
+    }
     if (!n) {   // (the stopped work has gone on: its releases now)
         std::vector<nvn_tex> ts;
         std::vector<nvn_prog> ps;
@@ -2723,9 +2927,28 @@ void log_order_stats() {
 // ~8 a frame. The burst's recording is tagged with the newest value among them (what is used in it is kept until
 // that one is done; the timeline is signalled at its end as far as allowed, as for any). ----
 bool burst_open = false;
+bool burst_holds_replay = false;
 uint64_t burst_value = 0;
+// Hold replay_mu across the entire burst instead of unlocking after each run_submit/resume_queue inside the burst.
+struct ReplayBurstLock {
+    bool own = false;
+    ReplayBurstLock() {
+        if (burst_open) {
+            if (!burst_holds_replay) replay_mu.lock(), burst_holds_replay = true;
+        } else {
+            replay_mu.lock();
+            own = true;
+        }
+    }
+    ~ReplayBurstLock() {
+        if (own) replay_mu.unlock();
+    }
+    ReplayBurstLock(const ReplayBurstLock&) = delete;
+    ReplayBurstLock& operator=(const ReplayBurstLock&) = delete;
+};
 void burst_begin(uint64_t value) {
     burst_open = !dump_on();
+    burst_holds_replay = false;
     burst_value = value;
     for (const auto& [queue, q] : qruns) {
         if (q.waiting) burst_value = std::max(burst_value, q.value);
@@ -2737,9 +2960,14 @@ void rb_span_close();   // (RX_VK_LOG_RB_WRITERS: below, with the readback's)
 void burst_end() {
     if (!burst_open) return;
     burst_open = false;
-    {
-        std::lock_guard lk(replay_mu);
-        if (rec_cur) rb_span_close(), finish_recording(burst_value);
+    if (rec_cur) {
+        if (!burst_holds_replay) replay_mu.lock(), burst_holds_replay = true;
+        rb_span_close();
+        finish_recording(burst_value);
+    }
+    if (burst_holds_replay) {
+        burst_holds_replay = false;
+        replay_mu.unlock();
     }
     // (the looks taken in this burst count only now: what they let on is recorded, its write-backs are in the page table
     // and its recording is submitted. Said at the look's end, a readback that came before this point found the counts
@@ -2784,6 +3012,15 @@ bool async_on();
 // keeping helper threads made on first use inside a replay off the reserved core, as Windows does)
 uint64_t replay_pin_mask() {
     static const uint64_t m = [] {
+        if (const char* e = getenv("RX_VK_REPLAY_PIN_MASK")) {
+            char* end = nullptr;
+            const uint64_t v = strtoull(e, &end, 16);
+            if (end && end != e && *end == '\0') {
+                if (v) logf("vk: replays run on logical processors %#llx while they replay (RX_VK_REPLAY_PIN_MASK)", (unsigned long long)v);
+                else logf("vk: RX_VK_REPLAY_PIN_MASK=0: replays not pinned");
+                return v;
+            }
+        }
         const uint64_t r = host->reserved_cpus ? host->reserved_cpus() : 0;
         if (r) logf("vk: replays run on logical processors %#llx while they replay", (unsigned long long)r);
         return r;
@@ -2799,9 +3036,10 @@ struct ReplayPin {
         counted = true;
         if (replay_pin_depth++) return;   // (the outermost one: a submit's replay inside its capture's)
         if (const uint64_t m = replay_pin_mask()) {
-            replay_pin_prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)m);
+            const DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)m);
+            replay_pin_prev = prev == (DWORD_PTR)m ? 0 : prev;
             static std::atomic<bool> told{false};   // (refused: a mask outside the process's. Said once, not every replay)
-            if (!replay_pin_prev && !told.exchange(true, std::memory_order_relaxed))
+            if (!prev && !told.exchange(true, std::memory_order_relaxed))
                 logf("vk: a replay was NOT kept to logical processors %#llx (error %lu): replays run where their threads may",
                      (unsigned long long)m, (unsigned long)GetLastError());
         }
@@ -2819,7 +3057,7 @@ struct ReplayPin {
 /// memory_work: its memory work first (else done as it came)
 bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, bool memory_work, int cb = 0,
                 const uint8_t* p = nullptr, bool may_stop = false) {
-    std::lock_guard lk(replay_mu);
+    ReplayBurstLock lk;
     ReplayPin pin;
     SlowWatch slow("submit");
     PROF(PROF_SUBMIT);
@@ -2902,7 +3140,7 @@ void resume_queue(uint64_t queue, bool forced) {
                 cpu_event = cpu_events.count(wait_at(q.p).gpu) != 0;
             }
             if (cpu_event) {
-                std::lock_guard lk(replay_mu);
+                ReplayBurstLock lk;
                 if (rec_cur) rb_span_close(), finish_recording(burst_open ? burst_value : q.value);   // (its mirrors synced again after)
                 memory_capture_now(q.value, completed());
                 st_resume_captures++;
@@ -3032,11 +3270,31 @@ std::atomic<int> gpu_waiters{0};   // (the game's threads in a wait for the GPU 
 std::atomic<int64_t> st_hold_gpu{0}, st_hold_gpu_forced{0};
 void sync_watch() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk order");
+    uint64_t seen_signals = 0;
     for (;;) {
-        Sleep(1);
-        if (!blocked_n.load()) continue;
+        const bool had_blocked = blocked_n.load(std::memory_order_acquire) > 0;
+        const uint64_t cur_sig = ev_cpu_signals.load(std::memory_order_acquire);
+        if (!had_blocked || cur_sig == seen_signals) {
+            std::unique_lock ek(ev_cpu_mu);
+            if (blocked_n.load(std::memory_order_acquire) > 0) {
+                ev_cpu_cv.wait_for(ek, std::chrono::milliseconds(1), [&] {
+                    return ev_cpu_signals.load(std::memory_order_acquire) != seen_signals;
+                });
+            } else {
+                ev_cpu_cv.wait_for(ek, std::chrono::milliseconds(4), [&] {
+                    return blocked_n.load(std::memory_order_acquire) > 0 &&
+                           ev_cpu_signals.load(std::memory_order_acquire) != seen_signals;
+                });
+            }
+        }
+        if (!blocked_n.load(std::memory_order_acquire)) continue;
         std::unique_lock lk(sync_order_mu, std::try_to_lock);
-        if (!lk) continue;
+        if (!lk) {
+            // Avoid busy-spinning while another thread holds sync_order_mu during replay.
+            Sleep(1);
+            continue;
+        }
+        seen_signals = ev_cpu_signals.load(std::memory_order_acquire);
         burst_begin(0);   // (a signal from the CPU the thread that made it could not act on)
         schedule();
         burst_end();
@@ -4466,7 +4724,8 @@ void blit_crop_to_rect(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t s
     b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     b.dstOffsets[0] = {(int)rect.x, (int)rect.y, 0};
     b.dstOffsets[1] = {(int)(rect.x + rect.w), (int)(rect.y + rect.h), 1};
-    vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, dst_layout, 1, &b, VK_FILTER_LINEAR);
+    const VkFilter filter = (source.w == rect.w && source.h == rect.h) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, dst_layout, 1, &b, filter);
 }
 
 /// The crop of src scaled to the whole destination (captures keep their existing dimensions).
@@ -5396,9 +5655,11 @@ static bool acknowledge_output_trial_frame(OutputTrialFrame frame) {
     return true;
 }
 
+bool fo_tracking();
+void fo_log(double frames);
 void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial);
 
-void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation = 0) {
+void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation = 0, uint64_t* wait_out = nullptr) {
     OutputTrialSource trial;
     trial.native_generation = native_generation;
     trial.generation = output_trial_generation.load(std::memory_order_acquire);
@@ -5430,6 +5691,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
     VkImage made_src = VK_NULL_HANDLE;
     int made_index = 0;
     VkImage headless_fx = VK_NULL_HANDLE;   // CRT output at the capture pixel grid, reused by both screenshot routes
+    uint64_t wait_old = 0;
     {
         std::lock_guard lk(replay_mu);
         bench_frame(presents);
@@ -5502,6 +5764,12 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
         const bool preview = trial.native_generation &&
                              trial.native_generation != output_kept_generation.load(std::memory_order_acquire);
         const bool fg_after = !preview && framegen_on() && tex && !fg_inline;
+        // Protect present source texture lifetime across fg_after (recording value+1) and prep fallback 3D motion if needed.
+        if (!preview && tex && framegen_on()) {
+            tex->last_frame = texture_frame_no();
+            tex->last_value = std::max(tex->last_value, value + 1);
+            temporal_prepare_fg_motion(r.cmd, sw, sh);
+        }
         interpolated = !preview && framegen_on() && tex && fg_inline &&
                        framegen_record(r.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample), sw,
                                        sh, crop, present_native_pq.load(std::memory_order_relaxed));
@@ -5624,6 +5892,8 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
         framegen_idle(interpolated);
         {   // (RX_VK_WAIT_GPU=<frames>: the replay no further ahead of the GPU than that)
             static uint64_t values[8];
+            static uint64_t fg_prev_value = 0;
+            static const bool env_set = getenv("RX_VK_WAIT_GPU") != nullptr;
             static const int ahead = [] {
                 const char* e = getenv("RX_VK_WAIT_GPU");
                 const long count = e ? std::strtol(e, nullptr, 10) : 0;
@@ -5631,10 +5901,19 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
                 if (count > capacity) logf("vk: RX_VK_WAIT_GPU=%ld exceeds the ring capacity; using %ld", count, capacity);
                 return (int)std::clamp<long>(count, 0, capacity);
             }();
+            // On Mesa Intel with FrameGen active and no explicit RX_VK_WAIT_GPU, cap in-flight depth to 1 frame:
+            // waits for frame N-1 right after submitting frame N so CPU input+recording overlaps GPU with zero FPS loss,
+            // protects 2-slot fg.frames[0..1], and cuts end-to-end input lag by 1 full frame.
             if (ahead > 0) {
                 const uint64_t old = values[presents % ahead];
                 values[presents % ahead] = value;
-                if (old) wait_value(old);
+                if (old) wait_old = old;
+            } else if (!env_set && interpolated && dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
+                const uint64_t old = fg_prev_value;
+                fg_prev_value = value;
+                if (old) wait_old = old;
+            } else if (!interpolated && fg_prev_value) {
+                fg_prev_value = 0;
             }
         }
         if (presents % 300 == 0) pipeline_cache_save(false);
@@ -5832,6 +6111,11 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
             pending = {true, value, presents, {}};
         }
         log_frame_stats();
+    }
+    if (!async_on() && fo_tracking() && presents % 120 == 0) fo_log(120.0);
+    if (wait_old) {
+        if (wait_out) *wait_out = wait_old;
+        else wait_value(wait_old);
     }
     if (output_trial_skip_present(t, trial.native_generation)) return;
     if (src) observe_output_preview_native(t, native_generation);
@@ -7319,7 +7603,7 @@ int presents_ahead() {   // (RX_VK_PRESENTS_AHEAD=<n>: how many presents the gam
 // between recordings, idle and in upload command buffers, by where in the frame (bh_log's second line).
 /// Whether recordings are counted: the render thread, its recordings made in order
 bool fo_tracking() {
-    static const bool on = async_on();
+    static const bool on = async_on() || env_on("RX_VK_FRAME_OVERLAP");
     return on && rec_timeline != VK_NULL_HANDLE;
 }
 struct FoSlot {
@@ -7958,15 +8242,39 @@ void present_tagged(const nvn_tex* t, const int crop[4], uint64_t generation) {
     programs_presented();   // (the programs' life: whether the game is in a load)
     FpsRender fr;
     if (!async_on()) {
-        std::lock_guard order(sync_order_mu);
-        ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
-        if (sync_waits_on()) {
-            drain(0);   // (the frame's work whole before it is shown)
-            update_blocked();
-            present_value = ++q_values;
-            return do_present(t, crop, generation);
+        uint64_t wait_old = 0;
+        {
+            std::unique_lock order(sync_order_mu);
+            if (sync_waits_on() && blocked_n.load(std::memory_order_acquire)) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold_ms());
+                while (cpu_wait_unmet()) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) break;
+                    const uint64_t sig0 = ev_cpu_signals.load(std::memory_order_acquire);
+                    order.unlock();
+                    {
+                        std::unique_lock ek(ev_cpu_mu);
+                        ev_cpu_cv.wait_until(ek, deadline, [&] {
+                            return ev_cpu_signals.load(std::memory_order_acquire) != sig0;
+                        });
+                    }
+                    order.lock();
+                }
+            }
+            ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
+            if (sync_waits_on()) {
+                drain(0);   // (the frame's work whole before it is shown)
+                update_blocked();
+                present_value = ++q_values;
+                if (fo_tracking()) fo_present.store(present_value, std::memory_order_release);
+            }
+            do_present(t, crop, generation, &wait_old);
         }
-        return do_present(t, crop, generation);
+        if (wait_old) {
+            FpsWait gpu_wait(fps_stats::kGpuWait);
+            wait_value(wait_old);
+        }
+        return;
     }
     {   // (the render thread) The present is handed over after the CPU's signal its frame's work waits for: the main
         // thread makes that signal when it has written the frame's data, and the presenting thread, its poll answered
@@ -8066,11 +8374,14 @@ void event_signal_queued(uint64_t gpu, uint32_t value) {
     HT_SCOPE("rx event_signal (game thread)");
 #endif
     if (!async_on()) {
-        std::lock_guard lk(ev_cpu_mu);
-        ev_cpu_pending.emplace_back(gpu, value);
-        ev_cpu_captures[gpu] = memory_captures_begun();   // (after the game's writes for it: cpu_signal_uncaptured)
-        ev_cpu_any.store(true, std::memory_order_release);
-        ev_cpu_signals.fetch_add(1, std::memory_order_release);   // (after it is in the list: schedule)
+        {
+            std::lock_guard lk(ev_cpu_mu);
+            ev_cpu_pending.emplace_back(gpu, value);
+            ev_cpu_captures[gpu] = memory_captures_begun();   // (after the game's writes for it: cpu_signal_uncaptured)
+            ev_cpu_any.store(true, std::memory_order_release);
+            ev_cpu_signals.fetch_add(1, std::memory_order_release);   // (after it is in the list: schedule)
+        }
+        ev_cpu_cv.notify_all();
         return;   // (sync_watch or the next submit lets the stopped ones on: not this thread, ~1.7 ms a frame of the critical path)
     }
     Job j{JOB_EVENT_SIGNAL};

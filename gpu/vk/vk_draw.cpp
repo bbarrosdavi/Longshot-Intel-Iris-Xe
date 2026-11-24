@@ -12845,7 +12845,8 @@ bool temporal_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p)
 /// HUD mark (vk_framegen.h framegen_hud_before: copied once the upscale wrote it, whichever drew it). Null unless AMD FSR
 /// 3.1's frame interpolation is asked for, or for any other dispatch
 static Texture* upscale_picture(const NvnState& s, const Program& p, uint32_t* level) {
-    if (p.stages.empty() || (!fsr3fi::frames_wanted() && !reshade::enabled.load(std::memory_order_relaxed))) return nullptr;
+    if (p.stages.empty() || (!fsr3fi::frames_wanted() && !reshade::enabled.load(std::memory_order_relaxed) && !framegen_on()))
+        return nullptr;
     const Stage& st = p.stages[0];
     const bool known = gameplay_network(p.key);
     if (!known && !(st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&

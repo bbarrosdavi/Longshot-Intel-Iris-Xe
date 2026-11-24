@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -34,19 +35,27 @@
 #include "vk_present_rect.h"
 #include "crt_policy.h"
 #include "vk_gprof.h"
+#include "vk_temporal.h"
 #include "vk_texture.h"
 
 #include "vk_builtin_spv.h"   // (RX_VK_SHADER_DIR)
 #include "shaders/fg_copy_comp_spv.h"
+#include "shaders/fg_copy_hud_comp_spv.h"
 #include "shaders/fg_flow_comp_spv.h"
+#include "shaders/fg_flow_fp16_comp_spv.h"
 #include "shaders/fg_hud_comp_spv.h"   // (AMD FSR 3.1's interpolation source with the HUD marked: hud_source)
 #include "shaders/fg_hud_composite_comp_spv.h"   // (the HUD over FSR 3.1's made frames: fsr3fi_frames)
 #include "shaders/fg_hud_layer_comp_spv.h"   // (how see-through the HUD is: hud_source)
 #include "shaders/fg_luma_comp_spv.h"
 #include "shaders/fg_median_comp_spv.h"
+#include "shaders/fg_rcas_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
+#include "shaders/fg_scale_fast_comp_spv.h"
 #include "shaders/fg_scale_pq_comp_spv.h"   // (fg_scale.comp with FG_SCALE_PQ: an RGB10A2 destination)
 #include "shaders/fg_synth_comp_spv.h"
+#include "shaders/fg_synth2_comp_spv.h"
+#include "shaders/fg_synth_mv_comp_spv.h"
+#include "shaders/fg_synth2_mv_comp_spv.h"
 #include "shaders/hdr_encode_comp_spv.h"
 #include "shaders/crt_downsample_comp_spv.h"
 #include "shaders/crt_lottes_comp_spv.h"
@@ -109,16 +118,18 @@ struct State {
     bool init = false;
     std::atomic<bool> failed{false};   // also read by Reflex's game-thread eligibility check
     uint32_t w = 0, h = 0;
-    Pipe copy, luma, flow, median, synth;
+    Pipe copy, copy_hud, luma, flow, median, synth, synth2, synth_mv, synth2_mv;
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     Img frames[2], lumas[2], flows[2];
     OutSet sets[3];   // (one shown, one waiting its place on the line, one being made: the pacer never holds the game back)
     int cur = 0, next_set = 0;
     bool have_prev = false;
+    bool have_luma[2] = {};
     int64_t last_at = 0;
     std::mutex mu;
     std::condition_variable cv;
     std::deque<Job> jobs;
+    std::atomic<int> queued_jobs{0};
     bool thread_started = false;
     OutSet* recorded = nullptr;   // (the set the last framegen_record filled, for framegen_queue)
     int64_t recorded_at = 0;
@@ -134,6 +145,8 @@ struct State {
 struct ScaleState {
     bool init = false, failed = false;
     Pipe pipe;
+    Pipe rcas;              // 1:1 RCAS fast path (10x10 FP16 SLM tile)
+    Pipe fast;              // FP16 linear + RCAS fast path for upscale=0, side=0, <=1.25x shrink
     Pipe pipe_pq;           // (fg_scale_pq, for the game's own HDR10 picture: framegen_scale's pq; made at its first use)
     bool pq_tried = false;
     VkSampler linear = VK_NULL_HANDLE;
@@ -333,7 +346,8 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
 
 // The optional interpolation is disabled after setup fails: retain none of its unused setup objects.
 void drop_setup() {
-    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth}) drop_pipe(*p);
+    for (Pipe* p : {&fg.copy, &fg.copy_hud, &fg.luma, &fg.flow, &fg.median, &fg.synth, &fg.synth2, &fg.synth_mv, &fg.synth2_mv})
+        drop_pipe(*p);
     if (fg.nearest) vkDestroySampler(dev.device, fg.nearest, nullptr);
     if (fg.linear) vkDestroySampler(dev.device, fg.linear, nullptr);
     fg.nearest = fg.linear = VK_NULL_HANDLE;
@@ -346,15 +360,24 @@ bool init() {
     const auto undo = [] { drop_setup(); return false; };
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return false;
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    const int radius = getenv("RX_VK_FRAMEGEN_RADIUS") ? std::clamp(atoi(getenv("RX_VK_FRAMEGEN_RADIUS")), 1, 16) : 8;
+    const int radius = getenv("RX_VK_FRAMEGEN_RADIUS") ? std::clamp(atoi(getenv("RX_VK_FRAMEGEN_RADIUS")), 1, 16) : 12;
     const VkSpecializationMapEntry me{0, 0, 4};
     const VkSpecializationInfo spec{1, &me, 4, &radius};
-    if (!make_pipe(fg.copy, BUILTIN_SPV_ARGS(FG_COPY_COMP_SPV), {S, I}, 16) ||
+    const bool flow_ok = dev.vk12.shaderFloat16
+        ? make_pipe(fg.flow, BUILTIN_SPV_ARGS(FG_FLOW_FP16_COMP_SPV), {S, S, I}, 0, &spec)
+        : make_pipe(fg.flow, BUILTIN_SPV_ARGS(FG_FLOW_COMP_SPV), {S, S, I}, 0, &spec);
+    if (!make_pipe(fg.copy, BUILTIN_SPV_ARGS(FG_COPY_COMP_SPV), {S, I, I, I}, 24) ||
         !make_pipe(fg.luma, BUILTIN_SPV_ARGS(FG_LUMA_COMP_SPV), {S, I}, 0) ||
-        !make_pipe(fg.flow, BUILTIN_SPV_ARGS(FG_FLOW_COMP_SPV), {S, S, I}, 0, &spec) ||
+        !flow_ok ||
         !make_pipe(fg.median, BUILTIN_SPV_ARGS(FG_MEDIAN_COMP_SPV), {S, I}, 0) ||
         !make_pipe(fg.synth, BUILTIN_SPV_ARGS(FG_SYNTH_COMP_SPV), {S, S, S, I}, 4))
         return undo();
+    (void)make_pipe(fg.synth2, BUILTIN_SPV_ARGS(FG_SYNTH2_COMP_SPV), {S, S, S, I, I}, 8);
+    if (dev.vk12.shaderFloat16) {
+        (void)make_pipe(fg.copy_hud, BUILTIN_SPV_ARGS(FG_COPY_HUD_COMP_SPV), {S, S, S, I, I}, 48);
+        (void)make_pipe(fg.synth_mv, BUILTIN_SPV_ARGS(FG_SYNTH_MV_COMP_SPV), {S, S, S, S, I}, 36);
+        (void)make_pipe(fg.synth2_mv, BUILTIN_SPV_ARGS(FG_SYNTH2_MV_COMP_SPV), {S, S, S, S, I, I}, 36);
+    }
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     si.maxLod = 0.25f;
@@ -387,6 +410,10 @@ bool init_scale() {
         si.maxLod = 0.25f;
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
         if (vkCreateSampler(dev.device, &si, nullptr, &scale.linear) == VK_SUCCESS) {
+            if (dev.vk12.shaderFloat16) {
+                (void)make_pipe(scale.rcas, BUILTIN_SPV_ARGS(FG_RCAS_COMP_SPV), {S, I}, 4);
+                (void)make_pipe(scale.fast, BUILTIN_SPV_ARGS(FG_SCALE_FAST_COMP_SPV), {S, I}, 4);
+            }
             scale.failed = false;
             return true;
         }
@@ -449,6 +476,7 @@ void drop_size() {
     fg.w = fg.h = 0;
     fg.mult = 0;
     fg.have_prev = false;
+    fg.have_luma[0] = fg.have_luma[1] = false;
     fg.recorded = nullptr;
 }
 
@@ -495,9 +523,22 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
     return true;
 }
 
+void compute_barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+}
+
 /// One pass: pipe over w x h in 8x8 groups, the bindings in order (a sampler when one is given: a sampled image)
 void pass(VkCommandBuffer cmd, const Pipe& p, std::initializer_list<std::pair<VkImageView, VkSampler>> bindings,
-          uint32_t w, uint32_t h, const void* push = nullptr, uint32_t push_bytes = 0) {
+          uint32_t w, uint32_t h, const void* push = nullptr, uint32_t push_bytes = 0,
+          const char* span_name = nullptr, bool narrow_compute = false) {
     VkDescriptorImageInfo ii[8];
     VkWriteDescriptorSet ws[8];
     uint32_t n = 0;
@@ -510,11 +551,14 @@ void pass(VkCommandBuffer cmd, const Pipe& p, std::initializer_list<std::pair<Vk
         ws[n].pImageInfo = &ii[n];
         n++;
     }
+    const bool timed = span_name && gprof_begin(cmd);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, n, ws);
     if (push_bytes) vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
     vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
-    full_barrier(cmd);
+    if (timed) gprof_end(cmd, span_name);
+    if (narrow_compute) compute_barrier(cmd);
+    else full_barrier(cmd);
 }
 
 // The fixed CRT profiles need no history or LUTs. Only the selected pipeline is made, and no CRT
@@ -754,8 +798,11 @@ void display_main() {
     int64_t next_show = 0, shown_at = 0, slot = 0;   // (slot: the time the last frame was given, for fifo_slot)
     int64_t fifo_refresh = 0;   // (the last set on the line's refresh, ns: take's catch-up under FIFO)
     int hist[7] = {};   // (<2 ms apart: two presents the screen hardly tells apart)
+    int64_t step_sum[4] = {};
+    int step_cnt[4] = {};
     static const char* timeline_env = getenv("RX_VK_FG_TIMELINE");
     const bool timeline_off = timeline_env && env_value_off(timeline_env);
+    static const bool conserve_pace = env_on_or("RX_VK_FG_CONSERVE", dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ? 1 : 0);
     // (a set the display thread has taken: how it is shown; presented ahead, its copies, how many went to the GPU so far
     // (copied), whether its first one went as the set came (as_came: within 3 ms of framegen_queue), and when that one was
     // seen done (ready_at, while the set before was shown))
@@ -790,6 +837,8 @@ void display_main() {
         // copy's own time to submit (the game's held submits, the queue's lock) is the pipeline's and counts in the delay:
         // timed from after it, a CPU that takes 3 ms to submit would leave every set out, and the delay would stay at 0)
         if (k == 0) s.as_came = t0 - j.queued <= 3000000 && now_ns() - t0 <= 3000000;
+        // On iGPUs allow up to 25 ms for swapchain acquire/submit so fg.late_ns updates instead of sticking at 0.
+        if (k == 0 && conserve_pace) s.as_came = t0 - j.queued <= 25000000 && now_ns() - t0 <= 25000000;
     };
     // The copies of a set presented ahead still to go to the GPU, in order, for as many of its frames as `room` (the spare
     // swapchain images not held by the set before)
@@ -803,7 +852,14 @@ void display_main() {
         s.j = j;
         if (last_at) {
             const int64_t d = j.at - last_at;
-            if (d > 0 && d < 100000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 50000000)) / 8;
+            if (conserve_pace) {
+                if (d > 0 && d < 200000000) {
+                    const int64_t cd = std::clamp<int64_t>(d, 4000000, 140000000);
+                    interval = (interval * 5 + cd) / 6;
+                }
+            } else if (d > 0 && d < 100000000) {
+                interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 50000000)) / 8;
+            }
         }
         last_at = j.at;
         if (!stat.since) stat.since = j.at;
@@ -812,8 +868,11 @@ void display_main() {
             // one build gives both sides. A present call, not the screen: under FIFO a present can still wait in the swapchain's
             // queue, which main's path fills more, so this reads main's side low, never the timeline's high)
             logf("vk: frame interpolation: %d frames shown on time, %d late (over 2 ms); shown apart: <2 ms %d, 2-7 %d, 7-9 %d, "
-                 "9-12 %d, 12-17 %d, 17-25 %d, over 25 %d; the game's frames presented %.1f ms after the game handed them over",
+                 "9-12 %d, 12-17 %d, 17-25 %d, over 25 %d; steps (ms): k0=%.1f k1=%.1f k2=%.1f; the game's frames presented %.1f ms after the game handed them over",
                  stat.on_time, stat.late, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6],
+                 step_cnt[0] ? step_sum[0] / 1e6 / step_cnt[0] : 0.0,
+                 step_cnt[1] ? step_sum[1] / 1e6 / step_cnt[1] : 0.0,
+                 step_cnt[2] ? step_sum[2] / 1e6 / step_cnt[2] : 0.0,
                  stat.games ? stat.game_ns / 1e6 / stat.games : 0.0);
             if (stat.by_time)
                 logf("vk: frame interpolation: %d sets on the game's timeline, %d taken early, %d with copies later than "
@@ -825,6 +884,8 @@ void display_main() {
                      stat.ready ? stat.ready_ns / 1e6 / stat.ready : 0.0,
                      fg.late_ns.load(std::memory_order_relaxed) / 1e6);
             memset(hist, 0, sizeof hist);
+            memset(step_sum, 0, sizeof step_sum);
+            memset(step_cnt, 0, sizeof step_cnt);
             stat = {0, 0, 0, j.at, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         }
         // (longshot) The pacer. The game hands over frames 12 to 28 ms apart around a mean of 19, and shown as they came that
@@ -842,6 +903,7 @@ void display_main() {
         // whole, all its frames
         if (!s.auto_timed && dev.swap_mode == VK_PRESENT_MODE_FIFO_KHR && on_line(j.set) &&
             present_ahead_wanted(true, j.set->made + 1, dev.swap_spare.load(std::memory_order_relaxed)) &&
+            (!conserve_pace || (fifo_refresh > 0 && j.set->frame_ns > 0 && j.set->frame_ns < (int64_t)(j.set->made + 1) * fifo_refresh)) &&
             (s.first = fifo_catch_up(j.set->made, j.set->due, slot, left, fifo_refresh, now_ns())))
             s.shown -= s.first, stat.caught += s.first;
         s.step = interval / std::max(s.shown, 1);
@@ -866,17 +928,16 @@ void display_main() {
         // after the copies: once a second it asks Windows, which is not the first copy's time, taken in copy)
         const int mhz = s.line ? display_refresh_mhz() : 0;
         s.refresh = mhz > 0 ? (int64_t)(1e12 / mhz) : 0;
+        if (conserve_pace && !s.refresh && s.auto_timed) {
+            const int amhz = display_refresh_mhz();
+            if (amhz > 0) s.refresh = (int64_t)(1e12 / amhz);
+        }
         fifo_refresh = s.line ? s.refresh : 0;   // (the catch-up's: the last set's on the timeline; 0 off it or unknown)
     };
-    // (longshot) While a set on the game's timeline waits for its frames' times, the next one is taken as soon as it comes,
-    // its copies to the GPU then for as many of its frames as the swapchain has images beside the ones this set still holds
-    // (left: its frames still to be presented; vk_main.cpp asks for two sets' images, but an NVIDIA surface has 6 spare,
-    // under two sets of 4); the rest as this set's presents give images back. Taken once this set's frames were shown, the
-    // copies queued behind the parts of the game's next frame submitted meanwhile: they were done that much later, the set
-    // past its times, and the GPU's delay (pace_delay) grew with its own lateness. Not within 3 ms of this set's next frame
-    // (its copies take that long to submit)
     const auto take_early = [&](int left, int64_t until) {
         if (held != 1 || !taken[0].line || until - now_ns() < 3000000) return;
+        // Below 33 FPS on iGPUs, never call present_image() inside the pacing wait loop (10-18 ms acquire/copy blows past due).
+        if (conserve_pace && taken[0].j.set->frame_ns > 30000000) return;
         const int spare = (int)dev.swap_spare.load(std::memory_order_relaxed);
         Job j;
         {
@@ -886,6 +947,7 @@ void display_main() {
             const int shown = j.set->made + 1;
             if (!on_line(j.set) || shown < 2 || shown > spare || spare - left < 1) return;
             fg.jobs.pop_front();
+            fg.queued_jobs.fetch_sub(1, std::memory_order_relaxed);
         }
         take(taken[1], j, spare - left, left);
         taken[1].early = true;
@@ -899,6 +961,7 @@ void display_main() {
                 fg.cv.wait(lk, [] { return !fg.jobs.empty(); });
                 j = fg.jobs.front();
                 fg.jobs.pop_front();
+                fg.queued_jobs.fetch_sub(1, std::memory_order_relaxed);
             }
             take(taken[0], j, (int)dev.swap_spare.load(std::memory_order_relaxed), 0);
             held = 1;
@@ -909,16 +972,14 @@ void display_main() {
         // (taken early: its copies that the set before left no images for)
         copy_up_to(s, (int)dev.swap_spare.load(std::memory_order_relaxed));
         const bool first = s.ahead && s.pending[0].used;   // (its first copy made ahead)
-        if (first) vkWaitForFences(dev.device, 1, &s.pending[0].done, VK_TRUE, 100000000ull);   // (100 ms at most)
-        // (longshot) A fixed multiplier's set on the game's timeline, presented ahead (its first copy's end waited for): its own
-        // delay and how late its first frame can be shown against its time, a millisecond to spare, set the delay of the sets
-        // after it (pace_delay). The copy's end as seen while the set before was shown (ready_at, taken early), else now: a set
-        // taken early was often done well before the set before it ended. Only from a set whose first copy went to the GPU
-        // as it came (as_came): one that waited, for images or for the display thread, had its copies behind more of the
-        // game's work the later the set before was shown, so the delay grew with its own lateness (at 4x a set waited for
-        // the images of the one before once the delay passed 3/4 of a game frame, and the delay went up to a whole one).
-        // Not from a set after a long game frame either (over 1.5 smoothed ones: its first frame's time came early by the
-        // difference, which is not the GPU's)
+        const int last_copy = s.shown - 1;
+        // On Mesa Intel (conserve_pace), wait on the LAST copy's fence so 100% of copies in this set have signaled
+        // swap_rendered before present_commit(), preventing Wayland MAILBOX/FIFO from stalling or dropping made frames.
+        if (conserve_pace && s.ahead && last_copy >= 0 && s.pending[last_copy].used)
+            vkWaitForFences(dev.device, 1, &s.pending[last_copy].done, VK_TRUE, 500000000ull);
+        else if (first)
+            vkWaitForFences(dev.device, 1, &s.pending[0].done, VK_TRUE, 100000000ull);   // (100 ms at most)
+        const int64_t done_at = now_ns();
         if (s.line) {
             stat.by_time++;
             stat.early += s.early;
@@ -933,6 +994,42 @@ void display_main() {
                                      std::memory_order_relaxed);
             }
         }
+        int64_t nom_step = 0, set_step = 0, emerg_min = 0;
+        if (conserve_pace) {
+            // Uniform Conservation-Law pacing with 60 Hz non-VRR floor, unconditional backlog drain (q_now >= 1),
+            // and gentle dead-air phase convergence (slack_ns > 3 ms) for minimum handover latency with 0 late frames.
+            const int64_t base_frame = std::clamp<int64_t>(
+                (s.line && j.set->frame_ns > 0) ? j.set->frame_ns : interval, 12000000, 140000000);
+            nom_step = base_frame / std::max(s.shown, 1);
+            const int q_now = (held - 1) + fg.queued_jobs.load(std::memory_order_relaxed);
+            const int64_t age_ns = done_at - j.at;
+            const int64_t slack_ns = (shown_at > 0) ? (shown_at + nom_step - done_at) : 0;
+            int num = 50;
+            if (q_now >= 2) num = 32;
+            else if (q_now == 1) num = 40;
+            else if (slack_ns > 8000000) num = 45;
+            else if (slack_ns > 3000000 || age_ns > base_frame * 9 / 10) num = 47;
+            const bool keep_refresh_floor = s.refresh > 0 && nom_step >= s.refresh && q_now == 0 && slack_ns <= 8000000;
+            const int64_t min_step = keep_refresh_floor
+                ? s.refresh
+                : (s.refresh > 0 && nom_step >= s.refresh
+                       ? s.refresh * 85 / 100
+                       : std::max<int64_t>(4000000, nom_step * 78 / 100));
+            set_step = std::clamp<int64_t>(nom_step * num / 50, min_step, 50000000);
+            if (s.refresh > 0 && nom_step >= s.refresh && q_now == 0 && num == 50) {
+                if (set_step > s.refresh && set_step - s.refresh <= 1500000)
+                    set_step = (set_step + s.refresh) / 2;
+                else if (set_step > 2 * s.refresh && set_step - 2 * s.refresh <= 1500000)
+                    set_step = (set_step + 2 * s.refresh) / 2;
+                else if (age_ns < base_frame * 9 / 10 && 2 * s.refresh > set_step && 2 * s.refresh - set_step <= 1500000)
+                    set_step = (set_step + 2 * s.refresh) / 2;
+            }
+            emerg_min = (s.refresh > 0 && nom_step >= s.refresh * 115 / 100)
+                ? s.refresh
+                : (s.refresh > 0 && nom_step >= s.refresh
+                       ? s.refresh * 85 / 100
+                       : std::max<int64_t>(4000000, nom_step * 78 / 100));
+        }
         const bool timed = s.timed;
         for (int k = 0; k < s.shown; k++) {
             const int f = s.first ? fifo_pick(j.set->made + 1, s.shown, k) : k;   // (the set's frame: the catch-up's picks)
@@ -942,6 +1039,13 @@ void display_main() {
             // held thread is counted)
             int64_t own = due;
             int64_t now = now_ns();
+            if (conserve_pace) {
+                int64_t step_k = set_step;
+                if (k > 0 && (held - 1) + fg.queued_jobs.load(std::memory_order_relaxed) >= 2)
+                    step_k = std::min(step_k, std::max(emerg_min, nom_step * 40 / 50));
+                due = (pace && shown_at > 0) ? std::max(now, shown_at + step_k) : now;
+                own = due;
+            }
             if (s.refresh && dev.swap_mode == VK_PRESENT_MODE_FIFO_KHR) {   // (one a refresh at most)
                 if (slot > 0) own = std::max(due, slot + s.refresh);
                 const int64_t at = fifo_slot(due, slot, s.refresh, now);
@@ -949,8 +1053,8 @@ void display_main() {
                 due = at;
             }
             if (due < now) due = now;
-            if (!timed && due > j.at + interval + s.step) due = j.at + interval + s.step;
-            if (timed && due > now + 100000000) due = now;   // (a game frame time gone wrong: not held back)
+            if (!conserve_pace && !timed && due > j.at + interval + s.step) due = j.at + interval + s.step;
+            if (!conserve_pace && timed && due > now + 100000000) due = now;   // (a game frame time gone wrong: not held back)
             const int64_t slot_was = slot;
             slot = due;
             // (the wait in steps of 2 ms at most while the next set may still be taken early: at 2x it comes while this set's
@@ -958,10 +1062,12 @@ void display_main() {
             // end still to be seen, ready_at. Its copies that had no images go to the GPU as this set's presents give them back)
             for (;;) {
                 take_early(s.shown - k, due);
-                const bool may_see = held == 2 && !taken[1].ready_at && taken[1].pending[0].used;
-                if (may_see && vkWaitForFences(dev.device, 1, &taken[1].pending[0].done, VK_TRUE, 0) == VK_SUCCESS)
+                const int nlast = (conserve_pace && held == 2) ? taken[1].shown - 1 : 0;
+                const bool may_see = held == 2 && !taken[1].ready_at && nlast >= 0 && taken[1].pending[nlast].used;
+                if (may_see && vkWaitForFences(dev.device, 1, &taken[1].pending[nlast].done, VK_TRUE, 0) == VK_SUCCESS)
                     taken[1].ready_at = now_ns();
-                if (held == 2 && taken[1].copied < taken[1].shown && due - now_ns() >= 3000000)
+                const bool slow_igpu = conserve_pace && s.j.set->frame_ns > 30000000;
+                if (!slow_igpu && held == 2 && taken[1].copied < taken[1].shown && due - now_ns() >= 3000000)
                     copy_up_to(taken[1], (int)dev.swap_spare.load(std::memory_order_relaxed) - (s.shown - k));
                 now = now_ns();
                 if (due - now <= 1000000) break;
@@ -992,6 +1098,7 @@ void display_main() {
                 const int64_t d = t - shown_at;
                 hist[d < 2000000 ? 0 : d < 7000000 ? 1 : d < 9000000 ? 2 : d < 12000000 ? 3 : d < 17000000 ? 4
                      : d < 25000000 ? 5 : 6]++;
+                if (k >= 0 && k < 4 && d < 200000000) step_sum[k] += d, step_cnt[k]++;
             }
             shown_at = t;
             next_show = t + s.step;
@@ -1227,8 +1334,20 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         full_barrier(cmd);
         pc.side = 1;
     }
-    pass(cmd, pipe, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}, {wide.side == 1 ? scale.small.view : src, scale.linear}},
-         dw, dh, &pc, sizeof pc);
+    if (!pq && opts.upscale == 0 && opts.sharpness > 0 && wide.side == 0 && source.x == 0 && source.y == 0 &&
+        source.w == dw && source.h == dh && scale.rcas.pipe) {
+        const float sharp = opts.sharpness / 100.0f;
+        pass(cmd, scale.rcas, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}}, dw, dh, &sharp, sizeof sharp,
+             "fg_rcas");
+    } else if (!pq && opts.upscale == 0 && wide.side == 0 &&
+               source.w <= dw * 5 / 4 && source.h <= dh * 5 / 4 && scale.fast.pipe) {
+        const float sharp = opts.sharpness / 100.0f;
+        pass(cmd, scale.fast, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}}, dw, dh, &sharp, sizeof sharp,
+             "fg_scale_fast");
+    } else {
+        pass(cmd, pipe, {{src, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}, {wide.side == 1 ? scale.small.view : src, scale.linear}},
+             dw, dh, &pc, sizeof pc);
+    }
     static const bool report = env_on("RX_VK_UPSCALE_LOG");
     static bool reported = false;
     if (report && !reported) {
@@ -1499,10 +1618,11 @@ bool hud_source(VkCommandBuffer cmd, int cur, uint32_t sw, uint32_t sh, int x0, 
 } // namespace
 
 void framegen_hud_before(VkCommandBuffer cmd, Texture* picture, uint32_t level) {
+    static const bool mv_off = env_on("RX_VK_FG_NO_MV");
     if (!picture || level || !picture->image || picture->samples != VK_SAMPLE_COUNT_1_BIT || picture->levels != 1 ||
         picture->layers != 1 || picture->type != VK_IMAGE_TYPE_2D ||
         (picture->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && picture->format != VK_FORMAT_R16G16B16A16_SFLOAT) ||
-        !framegen_on() || !fsr3fi::frames_wanted())
+        !framegen_on() || (!fsr3fi::frames_wanted() && (mv_off || temporal_wanted())))
         return;
     std::lock_guard lk(hud.mu);
     if (hud.failed) return;
@@ -1612,9 +1732,11 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         std::thread(display_main).detach();
     }
     const int64_t now = now_ns(), before = fg.last_at;
-    const bool gap = fg.last_at && now - fg.last_at > 100000000;   // (a loading hitch: nothing to blend)
-    if (fg.last_at && !gap)
-        fg.game_ns = fg.game_ns ? (fg.game_ns * 7 + (now - fg.last_at)) / 8 : now - fg.last_at;
+    const bool gap = fg.last_at && now - fg.last_at > 250000000;   // (a loading hitch: nothing to blend)
+    if (fg.last_at && !gap) {
+        const int64_t span = now - fg.last_at;
+        fg.game_ns = !fg.game_ns ? span : (fg.game_ns * 5 + span) / 6;
+    }
     fg.last_at = now;
     OutSet* set;
     {
@@ -1628,7 +1750,6 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     // menu runs on the display thread, and the set's last image would be one that was never made)
     const int cur = fg.cur, prev = cur ^ 1, m = fg.mult;
     const bool auto_rate = opts.framegen == 1;   // (read once, for the same reason)
-    const bool blend = fg.have_prev && !gap;
     set->reflex_id = reflex_frame();   // (NVIDIA Reflex: the game frame this set shows, vk_reflex.cpp)
     set->antilag_id = antilag_frame();   // (AMD Anti-Lag 2: the same, vk_antilag.cpp)
     static uint64_t sequence = 0;
@@ -1636,11 +1757,113 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     const uint32_t uw = (uint32_t)w, uh = (uint32_t)h;
     const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
     full_barrier(cmd);
-    const int32_t pc[4] = {x0, y0, w, h};
-    pass(cmd, fg.copy, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
-    pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
+    TemporalMotion tm{};
+    static const bool mv_off = env_on("RX_VK_FG_NO_MV");
+    const bool have_mv = !mv_off && temporal_last_motion(tm);
+    // On a 3D camera cut / first 3D frame (tm.reset == true), never fall back to optical flow; present the cut cleanly.
+    const bool camera_cut = !have_mv && tm.reset;
+    const bool blend = fg.have_prev && !gap && !camera_cut;
+    const bool dlss_held = blend && m > 1 && dlss_fg_holds();
+    const bool fsr_wanted = fsr3fi::frames_wanted() != 0;
+    const bool use_mv = have_mv && blend && m > 1 && !dlss_held && !fsr_wanted && fg.synth_mv.pipe && tm.depth_view;
+    VkImageView exact_before_view = tm.hud_before_view;
+    VkImageView exact_after_view = tm.hud_after_view;
+    bool exact_square = tm.hud_square;
+    bool exact_hud =
+        fg.copy_hud.pipe && !mv_off && m > 1 && !dlss_held && !fsr_wanted &&
+        exact_before_view && exact_after_view && tm.hud_after_tex && tm.hud_after_image &&
+        tm.hud_w == sw && tm.hud_h == sh &&
+        texture_alive(tm.hud_after_gpu, tm.hud_after_tex, tm.hud_after_image);
+    // In dlss=0 mode (Game upscaler / Off stretch / upscale_stub), framegen_hud_before() captured hud.before[k] right
+    // after the gameplay upscale wrote the pre-HUD picture: copy post-HUD hud.picture into hud.after[k] for exact HUD masking.
+    if (!exact_hud && fg.copy_hud.pipe && !mv_off && m > 1 && !dlss_held && !fsr_wanted) {
+        std::lock_guard lk(hud.mu);
+        hud_free_dead();
+        const bool fresh = hud.fresh;
+        hud.fresh = false;
+        const int hk = hud.k;
+        if (fresh && !hud.failed && hud.picture && hud.before[hk].view && hud.pw == sw && hud.ph == sh &&
+            texture_alive(hud.gpu, hud.tex, hud.picture) &&
+            hud_image(cmd, hud.after[hk], sw, sh, hud.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            full_barrier(cmd);
+            const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                                {sw, sh, 1}};
+            vkCmdCopyImage(cmd, hud.picture, VK_IMAGE_LAYOUT_GENERAL, hud.after[hk].image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            full_barrier(cmd);
+            exact_before_view = hud.before[hk].view;
+            exact_after_view = hud.after[hk].view;
+            exact_square = false;
+            exact_hud = true;
+            hud.k ^= 1;
+        }
+    }
+    const bool use_copy_hud = exact_hud;
+    const bool need_luma = !dlss_held && (!fsr_wanted || auto_rate) && !use_mv && !use_copy_hud;
+    const int game_slot = blend ? (m - 1) : 0;
+    const bool direct_game = !auto_rate && m > 1 && !dlss_held && !fsr_wanted;
+    const VkImageView game_dst_view = direct_game ? set->frame[game_slot].view : fg.frames[cur].view;
+    struct MvPush {
+        float t0, t1;
+        float uv_scale[2];
+        float uv_max[2];
+        float mv_scale[2];
+        float depth_sign;
+    };
+    const auto make_mv_push = [&](float t0, float t1) -> MvPush {
+        const float rw = (float)std::max(tm.render_w, 1u), rh = (float)std::max(tm.render_h, 1u);
+        const float tw = (float)std::max(tm.tex_w, std::max(tm.render_w, 1u)),
+                    th = (float)std::max(tm.tex_h, std::max(tm.render_h, 1u));
+        return {t0, t1, {rw / tw, rh / th}, {(rw - 0.5f) / tw, (rh - 0.5f) / th}, {(float)uw / rw, (float)uh / rh},
+                exact_hud ? 1.0f : -1.0f};
+    };
+    if (use_copy_hud) {
+        const MvPush mvp = make_mv_push(0.0f, 0.0f);
+        const struct {
+            int32_t offset[2];
+            int32_t size[2];
+            int32_t write_game;
+            int32_t hud_mode;
+            float uv_scale[2];
+            float uv_max[2];
+            float mv_scale[2];
+        } hpc{{x0, y0}, {w, h}, direct_game ? 1 : 0,
+              exact_hud ? (1 | (exact_square ? 4 : 0)) : 2,
+              {mvp.uv_scale[0], mvp.uv_scale[1]}, {mvp.uv_max[0], mvp.uv_max[1]}, {mvp.mv_scale[0], mvp.mv_scale[1]}};
+        static_assert(sizeof hpc == 48);
+        const VkImageView aux0 = exact_hud ? exact_before_view : fg.frames[prev].view;
+        const VkImageView aux1 = exact_hud ? exact_after_view : tm.view;
+        pass(cmd, fg.copy_hud,
+             {{src, fg.nearest},
+              {aux0, fg.nearest},
+              {aux1, fg.nearest},
+              {fg.frames[cur].view, VK_NULL_HANDLE},
+              {game_dst_view, VK_NULL_HANDLE}},
+             uw, uh, &hpc, sizeof hpc, "fg_copy_hud", true);
+        fg.have_luma[cur] = false;
+    } else {
+        // Fused fg_copy: reads src ONCE, writes fg.frames[cur], optionally writes set->frame[game_slot] directly,
+        // and computes quarter-size luma in SLM (skipping separate fg_luma).
+        const int32_t pc[6] = {x0, y0, w, h, direct_game ? 1 : 0, need_luma ? 1 : 0};
+        pass(cmd, fg.copy,
+             {{src, fg.nearest},
+              {fg.frames[cur].view, VK_NULL_HANDLE},
+              {game_dst_view, VK_NULL_HANDLE},
+              {fg.lumas[cur].view, VK_NULL_HANDLE}},
+             uw, uh, pc, sizeof pc, "fg_copy", true);
+        fg.have_luma[cur] = need_luma;
+    }
+    if (use_mv) {
+        static uint64_t mv_told = 0;
+        const uint64_t mv_sig = (uint64_t)tm.render_w << 48 | (uint64_t)tm.render_h << 32 | (uint64_t)uw << 16 |
+                                (uh ^ (exact_hud ? 1u : 0u));
+        if (mv_told != mv_sig) {
+            mv_told = mv_sig;
+            logf("vk: frame interpolation: using exact 3D camera+actor motion vectors + depth (%ux%u -> %ux%u, HUD mask: %s, skipping fg_flow)",
+                 tm.render_w, tm.render_h, uw, uh, exact_hud ? "exact before/after" : "static-guard");
+        }
+    }
     // (AMD FSR 3.1's source with the HUD marked, when it is asked: read by fsr3fi_frames below)
-    hud_source(cmd, cur, sw, sh, x0, y0, uw, uh, native_pq);
+    if (fsr_wanted) hud_source(cmd, cur, sw, sh, x0, y0, uw, uh, native_pq);
     set->made = 0;
     set->shown = -1;
     set->by_time = false;   // (a reused set: only a fixed multiplier's below sets it)
@@ -1663,30 +1886,61 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         for (int k = 0; k < n; k++)
             if (t[k] <= 0.999f) made_t[made_n] = t[k], made_slot[made_n++] = k;
         const int fsr_n = blend ? made_n : 0;
-        const bool fsr = fsr3fi::frames_wanted() &&
+        const bool fsr = fsr_wanted &&
                          fsr3fi_frames(cmd, *set, cur, uw, uh, sequence, native_pq, made_t, made_slot, fsr_n) == fsr_n &&
                          fsr_n > 0;
         bool flow = false;
+        if (!fsr && use_mv && made_n > 0) {
+            flow = true;
+            int mi = 0;
+            for (; mi + 1 < made_n && fg.synth2_mv.pipe; mi += 2) {
+                const MvPush mvp = make_mv_push(made_t[mi], made_t[mi + 1]);
+                pass(cmd, fg.synth2_mv, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                         {tm.view, fg.nearest}, {tm.depth_view, fg.nearest},
+                                         {set->frame[made_slot[mi]].view, VK_NULL_HANDLE},
+                                         {set->frame[made_slot[mi + 1]].view, VK_NULL_HANDLE}},
+                     uw, uh, &mvp, sizeof mvp, "fg_synth2_mv", true);
+            }
+            for (; mi < made_n; mi++) {
+                const MvPush mvp = make_mv_push(made_t[mi], 0.0f);
+                pass(cmd, fg.synth_mv, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                        {tm.view, fg.nearest}, {tm.depth_view, fg.nearest},
+                                        {set->frame[made_slot[mi]].view, VK_NULL_HANDLE}},
+                     uw, uh, &mvp, sizeof mvp, "fg_synth_mv", true);
+            }
+        }
         for (int k = 0; k < n; k++) {
             set->game[k] = t[k] > 0.999f;
             set->due[k] = at[k] + fg.game_ns;
             if (set->game[k]) {
+                full_barrier(cmd);
                 const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                     {0, 0, 0}, {uw, uh, 1}};
                 vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[k].image,
                                VK_IMAGE_LAYOUT_GENERAL, 1, &c);
                 continue;
             }
-            if (fsr) continue;   // (made above, into this slot)
+            if (fsr || use_mv) continue;   // (made above, into this slot)
             if (!flow) {
                 flow = true;
+                if (!fg.have_luma[prev]) {
+                    pass(cmd, fg.luma, {{fg.frames[prev].view, fg.nearest}, {fg.lumas[prev].view, VK_NULL_HANDLE}},
+                         qw, qh, nullptr, 0, "fg_luma", true);
+                    fg.have_luma[prev] = true;
+                }
+                if (!fg.have_luma[cur]) {
+                    pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}},
+                         qw, qh, nullptr, 0, "fg_luma", true);
+                    fg.have_luma[cur] = true;
+                }
                 pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
-                                    {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
-                pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
+                                    {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch, nullptr, 0, "fg_flow", true);
+                pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}},
+                     cw, ch, nullptr, 0, "fg_median", true);
             }
             pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
-                                 {fg.flows[1].view, fg.nearest}, {set->frame[k].view, VK_NULL_HANDLE}},
-                 uw, uh, &t[k], 4);
+                                 {fg.flows[1].view, fg.linear}, {set->frame[k].view, VK_NULL_HANDLE}},
+                 uw, uh, &t[k], 4, "fg_synth", true);
         }
         set->shown = n;
         set->made = n > 0 && !set->game[n - 1] ? n : std::max(0, n - 1);   // (for framegen_made_image: any made)
@@ -1715,7 +1969,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     // (longshot) Where DLSS-G did not make them, AMD FSR 3.1's frame interpolation where it is asked (vk_fsr3fi.h): the set's
     // made frames at k/m, 1/2 at 2x, 1/3 and 2/3 at 3x. Given every present it is asked, with none to make too (nothing to
     // blend from), so the next set has its history; any it does not make stays with the interpolation below
-    if (!held && set->made == 0 && m > 1 && fsr3fi::frames_wanted()) {
+    if (!held && set->made == 0 && m > 1 && fsr_wanted) {
         float made_t[kMaxMult];
         int made_slot[kMaxMult];
         for (int k = 1; k < m; k++) made_t[k - 1] = (float)k / (float)m, made_slot[k - 1] = k - 1;
@@ -1724,14 +1978,52 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
             set->made = fsr_n, maker = FgMaker::Fsr3;
     }
     if (!held && set->made == 0 && blend && m > 1) {
-        pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
-                            {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
-        pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
-        for (int k = 1; k < m; k++) {
-            const float t = (float)k / (float)m;
-            pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
-                                 {fg.flows[1].view, fg.nearest}, {set->frame[k - 1].view, VK_NULL_HANDLE}},
-                 uw, uh, &t, 4);
+        if (use_mv) {
+            int k = 1;
+            for (; k + 1 < m && fg.synth2_mv.pipe; k += 2) {
+                const MvPush mvp = make_mv_push((float)k / (float)m, (float)(k + 1) / (float)m);
+                pass(cmd, fg.synth2_mv, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                         {tm.view, fg.nearest}, {tm.depth_view, fg.nearest},
+                                         {set->frame[k - 1].view, VK_NULL_HANDLE},
+                                         {set->frame[k].view, VK_NULL_HANDLE}},
+                     uw, uh, &mvp, sizeof mvp, "fg_synth2_mv", true);
+            }
+            for (; k < m; k++) {
+                const MvPush mvp = make_mv_push((float)k / (float)m, 0.0f);
+                pass(cmd, fg.synth_mv, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                        {tm.view, fg.nearest}, {tm.depth_view, fg.nearest},
+                                        {set->frame[k - 1].view, VK_NULL_HANDLE}},
+                     uw, uh, &mvp, sizeof mvp, "fg_synth_mv", true);
+            }
+        } else {
+            if (!fg.have_luma[prev]) {
+                pass(cmd, fg.luma, {{fg.frames[prev].view, fg.nearest}, {fg.lumas[prev].view, VK_NULL_HANDLE}},
+                     qw, qh, nullptr, 0, "fg_luma", true);
+                fg.have_luma[prev] = true;
+            }
+            if (!fg.have_luma[cur]) {
+                pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}},
+                     qw, qh, nullptr, 0, "fg_luma", true);
+                fg.have_luma[cur] = true;
+            }
+            pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
+                                {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch, nullptr, 0, "fg_flow", true);
+            pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}},
+                 cw, ch, nullptr, 0, "fg_median", true);
+            int k = 1;
+            for (; k + 1 < m && fg.synth2.pipe; k += 2) {
+                const float ts[2] = {(float)k / (float)m, (float)(k + 1) / (float)m};
+                pass(cmd, fg.synth2, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                      {fg.flows[1].view, fg.linear}, {set->frame[k - 1].view, VK_NULL_HANDLE},
+                                      {set->frame[k].view, VK_NULL_HANDLE}},
+                     uw, uh, ts, sizeof ts, "fg_synth2", true);
+            }
+            for (; k < m; k++) {
+                const float t = (float)k / (float)m;
+                pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+                                     {fg.flows[1].view, fg.linear}, {set->frame[k - 1].view, VK_NULL_HANDLE}},
+                     uw, uh, &t, 4, "fg_synth", true);
+            }
         }
         set->made = m - 1;
         maker = FgMaker::BuiltIn;
@@ -1750,10 +2042,14 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         set->extra_ns = extra;
         set->by_time = true;
     }
-    const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
-                        {uw, uh, 1}};
-    vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[set->made].image,
-                   VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    // Skip redundant full-res vkCmdCopyImage when fused fg_copy/fg_copy_hud already wrote set->frame[game_slot] directly.
+    if (!(direct_game && set->made == game_slot)) {
+        full_barrier(cmd);
+        const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                            {uw, uh, 1}};
+        vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[set->made].image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
     full_barrier(cmd);
     fg.have_prev = true;
     fg.cur = prev;
@@ -1766,6 +2062,7 @@ void framegen_queue(uint64_t value) {
     if (!fg.recorded) return;
     std::lock_guard lk(fg.mu);
     fg.jobs.push_back({fg.recorded, fg.recorded_at, value, now_ns()});
+    fg.queued_jobs.fetch_add(1, std::memory_order_relaxed);
     fg.recorded = nullptr;
     fg.cv.notify_all();
 }

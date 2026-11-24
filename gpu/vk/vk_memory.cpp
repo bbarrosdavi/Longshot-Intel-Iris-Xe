@@ -1153,6 +1153,7 @@ int memory_gpu_written(uint64_t guest, uint64_t size) {
 bool memory_gpu_writes_any() { return !gpu_writes.empty(); }
 void memory_stamp_gpu(uint64_t guest, uint64_t size) {
     if (!size) return;
+    draw_flush_ub_reads();
     memory_gpu_writes_note(guest, size);
     memory_stamp(guest, size);
     if (mem_check_on()) mem_check_gpu_wrote(guest, size);   // (RX_VK_MEM_CHECK: the page's newest GPU write)
