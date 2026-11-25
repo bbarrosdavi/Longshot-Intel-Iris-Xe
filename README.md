@@ -35,9 +35,17 @@ project.
 **[Join us on Discord](https://discord.gg/magicbean)!**
 
 > [!NOTE]
-> **Intel Iris Xe / Gen12 Optimization Fork (`opt/iris-xe`, rebased onto `upstream/main @ 209389fa`):** This fork makes **Longshot** playable, visually clean, and responsive on **Intel Iris Xe / Gen12 integrated GPUs (Linux Mesa ANV)** while incorporating all upstream advances (+326 commits: guest page-table global loads, mesh-fallback attribute pool & shared-warp, adaptive `sim_turf`, async recorder parts, and ASTC GPU decoding) — delivering **23.3 Base FPS** in Hyrule Castle Courtyard (`+35.5%` vs pure upstream `17.2 fps`, `+12.0%` vs `v1.0-iris-xe` `20.8 fps`), **17.3 Base FPS** in Kakariko Gate (`88.2 ms` max frame, `3.9 GB` VRAM — `-1.04 GiB` `other buffers` via shared fallback slots), and artifact-free 3D-MV FrameGen (`Auto`/`2x`/`3x`).
+> **Intel Iris Xe / Gen12 Optimization Fork (`main`, rebased onto `upstream/main @ 209389fa`):** This fork makes **Longshot** playable, visually clean, and crash-free on **Intel Iris Xe / Gen12 integrated GPUs (Linux Mesa ANV)** while incorporating all +326 upstream commits — delivering **23.3 Base FPS** in Hyrule Castle Courtyard (`+35.5%` vs pure upstream `17.2 fps`, `+12.0%` vs `v1.0-iris-xe` `20.8 fps`), **17.3 Base FPS** in Kakariko Gate (`88.2 ms` max frame, `3.9 GB` VRAM — `-1.04 GiB` `other buffers` via shared fallback slots), **20–25 Displayed FPS** live across 5 areas at `1080p` with artifact-free 3D-MV FrameGen (`Auto`/`2x`/`3x`), single-heap iGPU UMA DMA-BUF unpinning (`system_heap_usage()`, eliminating OOM crashes on 16 GB laptops), and a zero-cache-invalidation fix for the **Mesa ANV 26.2.4 `3DSTATE_SBE` `PointCoord` sky/sun blowout**.
 >
-> 📄 Full benchmarks, investigations & engineering write-up: [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md) · Upstream PR summary: [`PR_INTEL_IRIS_XE.md`](PR_INTEL_IRIS_XE.md)
+> 📄 Full benchmarks & engineering write-up: [`docs/intel_iris_xe_optimization.md`](docs/intel_iris_xe_optimization.md) · Official Upstream PR Draft: [`PR_INTEL_IRIS_XE.md`](PR_INTEL_IRIS_XE.md) · Release & Videos: [`v2.0-iris-xe`](https://github.com/bbarrosdavi/Longshot-Intel-Iris-Xe/releases/tag/v2.0-iris-xe)
+>
+> ### Live 1080p Gameplay Showcase on Intel Iris Xe (Core i5-1235U, 96 EU, 26W, Linux Mesa ANV 26.2.4)
+>
+> [![Watch 1080p Live Showcase on Intel Iris Xe — 5 Areas](docs/images/iris-xe/08_iris_xe_showcase_thumb.jpg)](https://github.com/bbarrosdavi/Longshot-Intel-Iris-Xe/releases/download/v2.0-iris-xe/longshot_iris_xe_showcase_1080p.mp4)
+>
+> 🎬 **[Watch Full 1080p 5-Area Showcase (55s MP4)](https://github.com/bbarrosdavi/Longshot-Intel-Iris-Xe/releases/download/v2.0-iris-xe/longshot_iris_xe_showcase_1080p.mp4)** · **[Compact 720p Preview (<10 MB MP4)](https://github.com/bbarrosdavi/Longshot-Intel-Iris-Xe/releases/download/v2.0-iris-xe/longshot_iris_xe_showcase_720p_under10mb.mp4)**
+>
+> Individual 20s 1080p VAAPI captures: [1. Hyrule Market](https://github.com/bbarrosdavi/Longshot-Intel-Iris-Xe/releases/download/v2.0-iris-xe/01_hyrule_market.mp4) · [2. Kakariko Village (Clean Sky/Sun)](https://github.com/bbarrosdavi/Longshot-Intel-Iris-Xe/releases/download/v2.0-iris-xe/02_kakariko_village.mp4) · [3. Hyrule Field](https://github.com/bbarrosdavi/Longshot-Intel-Iris-Xe/releases/download/v2.0-iris-xe/03_hyrule_field.mp4) · [4. Kokiri Forest](https://github.com/bbarrosdavi/Longshot-Intel-Iris-Xe/releases/download/v2.0-iris-xe/04_kokiri_forest.mp4) · [5. Zora's Domain](https://github.com/bbarrosdavi/Longshot-Intel-Iris-Xe/releases/download/v2.0-iris-xe/05_zoras_domain.mp4)
 >
 > | Before — Unoptimized Upstream (`~9 FPS`, black/rainbow corruption) | After — Optimized Build (`23.3 Base / 46+ FG FPS`, Kokiri Forest) |
 > |:---:|:---:|
