@@ -257,6 +257,11 @@ extern thread_local bool upload_defer_ok;
 void pass_start_barrier(VkCommandBuffer cmd);
 /// Pass starts with the fragment-stage barrier, since the start
 int64_t pass_barriers_relaxed();
+/// Compute-narrowed dispatch barrier (compute-to-compute when preceded only by a dispatch) and MFB pre/post barriers
+void note_compute_dispatch(VkCommandBuffer cmd);
+void dispatch_barrier(VkCommandBuffer cmd, bool indirect);
+void mfb_pre_barrier(VkCommandBuffer cmd, bool batch);
+void mfb_post_barrier(VkCommandBuffer cmd, bool interrupted_pass, bool batch);
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
 /// (longshot) whether texture_read_texels' walk of r at that row stride (0: the region's own) and its own image stride
 /// stays within avail bytes of the data it is given (overflow-checked: the stride is the game's)

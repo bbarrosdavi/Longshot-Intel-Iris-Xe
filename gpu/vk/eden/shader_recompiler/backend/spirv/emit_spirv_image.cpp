@@ -877,7 +877,14 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     const auto [image, is_integer] = Image(ctx, index, info);
     if (!is_integer) {
-        color = ctx.OpBitcast(ctx.F32[4], color);
+        if (frag_nan_guard) {
+            const Id exp_mask{ctx.Const(0x7f800000u, 0x7f800000u, 0x7f800000u, 0x7f800000u)};
+            const Id non_finite{ctx.OpIEqual(ctx.TypeVector(ctx.U1, 4), ctx.OpBitwiseAnd(ctx.U32[4], color, exp_mask), exp_mask)};
+            color = ctx.OpBitcast(ctx.F32[4], color);
+            color = ctx.OpSelect(ctx.F32[4], non_finite, ctx.ConstantNull(ctx.F32[4]), color);
+        } else {
+            color = ctx.OpBitcast(ctx.F32[4], color);
+        }
     }
     ctx.OpImageWrite(image, coords, color);
 }

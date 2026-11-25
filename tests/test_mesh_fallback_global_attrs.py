@@ -187,7 +187,7 @@ def host():
                      r"Shader::Backend::SPIRV::MESH_FALLBACK_POOL_HEADER_BYTES, 0\)", record)
     if not fill:
         raise SystemExit("fallback_record does not clear the pool's header before the draw")
-    barriers = [m.start() for m in re.finditer(r"(?:full_barrier\(cmd\)|vkCmdPipelineBarrier2\(cmd, &di\));", record)]
+    barriers = [m.start() for m in re.finditer(r"(?:full_barrier\(cmd\)|mfb_(?:pre|post)_barrier\([^;]+\)|vkCmdPipelineBarrier2\(cmd, &di\));", record)]
     if not any(b > fill.start() for b in barriers) or not any(b < fill.start() for b in barriers):
         raise SystemExit("the pool's clear is not between the barriers that order it after the draw before and before this one")
     # (before the draw's stages, with a barrier between: a clear after them, unordered, could land while the mesh stage takes and

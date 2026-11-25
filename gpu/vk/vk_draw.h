@@ -80,6 +80,11 @@ bool mfb_batch_flush_compute(VkCommandBuffer cmd);
 void draw_mfb_batched(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, int slot);
 void mfb_batch_end();
 void draw_flush_ub_reads();
+/// (Intel Mesa ANV) True when a shader reading BuiltIn PointCoord has already drawn in the current command buffer
+/// with a different program: ANV leaks 3DSTATE_SBE::PointSpriteTextureCoordinateEnable across pipelines within a
+/// command buffer, overwriting Location 0 with PointCoord (0.5) on later POINT_LIST draws (e.g. OoT's 1x1 sun
+/// visibility pass edd4d7c51103645d, turning G=0..1 into 25*0.5=12.5 and blowing out the sky lens flare).
+bool draw_anv_point_sbe_dirty(uint64_t prog_serial);
 /// (longshot) the occlusion queries draw() left unbegun since the last call, by why: the draw returned before drawing, its
 /// vertex input was not all bound, a mesh fallback's task batches (vk_replay.cpp's RX_VK_OCC_LOG line)
 void occ_draw_counts(uint64_t out[3]);

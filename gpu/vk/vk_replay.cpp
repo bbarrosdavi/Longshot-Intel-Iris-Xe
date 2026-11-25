@@ -1679,6 +1679,7 @@ void log_stage_bind(uint32_t op, int stage) {
 void maybe_split(VkCommandBuffer& cmd);
 // (longshot) A part's end that waits for the next plain draw (maybe_split, split_part): see part_ends_before_draw
 void split_part(VkCommandBuffer& cmd);
+void split_part_forced(VkCommandBuffer& cmd);
 bool part_end_wanted = false;
 void early_split(VkCommandBuffer& cmd);   // (RX_VK_READBACK_EARLY: a part's end after a readback's writer)
 bool early_split_pending = false;   // (RX_VK_READBACK_EARLY: a writer of a waited-for range is in the part being recorded)
@@ -2229,6 +2230,12 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             DrawArgs da;
             occ_take(s, da);   // (longshot: RX_VK_OCC_QUERIES)
             if (s.render_enabled && !s.raster_discard) {
+                if (d.prim == NVN_DRAW_PRIMITIVE_POINTS && draw_anv_point_sbe_dirty(s.prog.serial)) {
+                    static std::atomic<int> anv_sbe_logged{0};
+                    if (anv_sbe_logged++ < 1)
+                        logf("vk: Intel ANV: starting fresh command buffer before POINT_LIST draw to reset leaked 3DSTATE_SBE PointCoord state");
+                    split_part_forced(cmd);
+                }
                 da.prim = d.prim, da.first = d.first, da.count = d.count;
                 da.base_instance = d.base_instance, da.instances = d.instances;
                 draw(cmd, s, da);
@@ -2241,6 +2248,12 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             DrawArgs da;
             occ_take(s, da);   // (longshot: RX_VK_OCC_QUERIES)
             if (s.render_enabled && !s.raster_discard) {
+                if (d.prim == NVN_DRAW_PRIMITIVE_POINTS && draw_anv_point_sbe_dirty(s.prog.serial)) {
+                    static std::atomic<int> anv_sbe_logged{0};
+                    if (anv_sbe_logged++ < 1)
+                        logf("vk: Intel ANV: starting fresh command buffer before POINT_LIST draw to reset leaked 3DSTATE_SBE PointCoord state");
+                    split_part_forced(cmd);
+                }
                 da.prim = d.prim, da.indexed = true, da.itype = d.itype, da.count = d.count;
                 da.base_vertex = d.base_vertex, da.base_instance = d.base_instance, da.instances = d.instances;
                 da.ibuf = d.ibuf;
@@ -2254,6 +2267,12 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             DrawArgs da;
             occ_take(s, da);   // (longshot: RX_VK_OCC_QUERIES)
             if (s.render_enabled && !s.raster_discard) {
+                if (d.prim == NVN_DRAW_PRIMITIVE_POINTS && draw_anv_point_sbe_dirty(s.prog.serial)) {
+                    static std::atomic<int> anv_sbe_logged{0};
+                    if (anv_sbe_logged++ < 1)
+                        logf("vk: Intel ANV: starting fresh command buffer before POINT_LIST draw to reset leaked 3DSTATE_SBE PointCoord state");
+                    split_part_forced(cmd);
+                }
                 da.prim = d.prim, da.indexed = d.indexed != 0, da.itype = d.itype;
                 da.indirect = d.indirect, da.count_addr = d.count_addr, da.max = d.max, da.stride = d.stride;
                 da.ibuf = d.ibuf;
@@ -2546,7 +2565,9 @@ void maybe_split(VkCommandBuffer& cmd) {
 std::atomic<int64_t> st_early_splits{0};   // (RX_VK_READBACK_EARLY: parts ended after a readback's writer)
 bool early_end_asked = false;   // (early_split asked for the part's end: counted in st_early_splits once it is made)
 
-/// The recording's part ends here and the submission goes on in a new one (maybe_split says when)
+thread_local bool split_part_forced_now = false;
+/// The recording's part ends here and the submission goes on in a new one (maybe_split says when;
+/// split_part_forced also splits during frame dumps and past kMaxParts, e.g. for Intel ANV's 3DSTATE_SBE PointCoord leak reset)
 void split_part(VkCommandBuffer& cmd) {
 #ifdef TRACY_ENABLE
     HT_SCOPE("split_part");
@@ -2554,7 +2575,7 @@ void split_part(VkCommandBuffer& cmd) {
     part_end_wanted = false;
     // (asked for in another command buffer of the submission: what maybe_split refuses is refused here too, and it asks
     // again at the next draw it would cut after)
-    if (!rec_cur || rec_parts + 1 >= kMaxParts || dump_on()) return;
+    if (!rec_cur || (!split_part_forced_now && (rec_parts + 1 >= kMaxParts || dump_on()))) return;
     end_pass(cmd);
     // (a part's end does not write the stream's uniform updates recorded so far into guest memory, nor start a new window
     // of them: the submission's last part writes them all, as an unsplit submission does (finish_recording). A uniform binding is not what changes: one overlapping an update gets an overlay copy built
@@ -2584,6 +2605,11 @@ void split_part(VkCommandBuffer& cmd) {
     if (early_end_asked) st_early_splits++;
     early_split_pending = early_end_asked = false;   // (the writer's part has ended, by its count or after it)
     if (readback_early_on()) (void)memory_split_wanted();
+}
+void split_part_forced(VkCommandBuffer& cmd) {
+    split_part_forced_now = true;
+    split_part(cmd);
+    split_part_forced_now = false;
 }
 
 /// (RX_VK_READBACK_EARLY) The part ends after a writer of a range a read has waited for (replay(), at least

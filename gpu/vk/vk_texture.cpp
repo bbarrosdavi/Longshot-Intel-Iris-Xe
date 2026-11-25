@@ -3332,6 +3332,13 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
 
 } // namespace
 
+namespace {
+thread_local VkCommandBuffer last_compute_only_cmd = VK_NULL_HANDLE;
+thread_local uint64_t last_compute_only_epoch = 0;
+thread_local VkCommandBuffer last_disp_barrier_cmd = VK_NULL_HANDLE;
+thread_local uint64_t last_disp_barrier_epoch = 0;
+} // namespace
+
 thread_local uint64_t work_epoch = 0;   // (vk_work.h: the recording thread's own)
 thread_local bool other_work_since_barrier = true;   // (vk_work.h; true at the start: nothing known)
 namespace {
@@ -3368,6 +3375,8 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
 
 namespace {
 std::atomic<int64_t> st_pass_relaxed{0};
+thread_local VkCommandBuffer last_mfb_post_cmd = VK_NULL_HANDLE;
+thread_local uint64_t last_mfb_post_epoch = 0;
 } // namespace
 int64_t pass_barriers_relaxed() { return st_pass_relaxed.load(std::memory_order_relaxed); }
 // (longshot) The barrier a draw pass starts with. Full (ALL_COMMANDS to ALL_COMMANDS) where anything but draw passes was
@@ -3387,6 +3396,13 @@ void pass_start_barrier(VkCommandBuffer cmd) {
         if (on) logf("vk: RX_VK_PASS_BARRIER=full: every draw pass starts with a full barrier");
         return on;
     }();
+    if (!always_full && cmd == last_mfb_post_cmd && work_epoch == last_mfb_post_epoch) {
+        // Consume once for the immediately resumed pass; intentionally do NOT clear other_work_since_barrier
+        // so any subsequent pass after this one still gets a full barrier (Gen12 hang safety invariant).
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        last_mfb_post_cmd = VK_NULL_HANDLE;
+        return;
+    }
     if (always_full || other_work_since_barrier || cmd != last_barrier_cmd || work_epoch == last_barrier_epoch) {
         full_barrier(cmd, "barrier (pass start)");
         return;
@@ -3409,6 +3425,9 @@ void pass_start_barrier(VkCommandBuffer cmd) {
 
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     last_barrier_cmd = VK_NULL_HANDLE;   // (a new recording: its command buffers start afresh, whatever their handles held)
+    last_mfb_post_cmd = VK_NULL_HANDLE;
+    last_compute_only_cmd = VK_NULL_HANDLE;
+    last_disp_barrier_cmd = VK_NULL_HANDLE;
     up_cmd = upload;
     if (value != rec_value) epoch++;   // (a submission's parts check a texture's memory once: nothing is collected between)
     rec_value = value;
@@ -3416,6 +3435,103 @@ void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     up_astc_texels = 0;
     memory_table_begin();
     memory_rb_recording_begun();   // (which readback pages its uploads may refresh: memory_rb_refresh)
+}
+
+void note_compute_dispatch(VkCommandBuffer cmd) {
+    last_compute_only_cmd = cmd;
+    last_compute_only_epoch = work_epoch;
+}
+
+void dispatch_barrier(VkCommandBuffer cmd, bool indirect) {
+    (void)indirect;
+    static const bool full_disp = env_on("RX_VK_DISP_FULL_BARRIER");
+    static const bool dedupe_off = env_on("RX_VK_BARRIER_DEDUPE_OFF");
+    if (!dedupe_off && ((cmd == last_barrier_cmd && work_epoch == last_barrier_epoch) ||
+                        (cmd == last_disp_barrier_cmd && work_epoch == last_disp_barrier_epoch))) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (full_disp) {
+        full_barrier(cmd, "barrier (dispatch)");
+        return;
+    }
+    const bool c2c = cmd == last_compute_only_cmd && work_epoch == last_compute_only_epoch;
+    st_barriers_made.fetch_add(1, std::memory_order_relaxed);
+    GprofSpan gp(cmd, c2c ? "barrier (dispatch c2c)" : "barrier (dispatch narrow)");
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    if (c2c) {
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    } else {
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    }
+    b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
+                      VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT |
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    last_disp_barrier_cmd = cmd;
+    last_disp_barrier_epoch = work_epoch;
+}
+
+void mfb_pre_barrier(VkCommandBuffer cmd, bool batch) {
+    static const bool full_mfb = env_on("RX_VK_MFB_FULL_BARRIER");
+    static const bool dedupe_off = env_on("RX_VK_BARRIER_DEDUPE_OFF");
+    if (!dedupe_off && cmd == last_barrier_cmd && work_epoch == last_barrier_epoch) {
+        st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (full_mfb) {
+        full_barrier(cmd, batch ? "barrier (mfb batch pre)" : "barrier (mfb pre)");
+        return;
+    }
+    st_barriers_made.fetch_add(1, std::memory_order_relaxed);
+    GprofSpan gp(cmd, batch ? "barrier (mfb batch pre)" : "barrier (mfb pre)");
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    // Always synchronize ALL prior GPU writes (including interrupted render pass RT/depth/FS writes)
+    // while only stalling compute/transfer/indirect on the destination side.
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                     VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                      VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                      VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    last_disp_barrier_cmd = cmd;
+    last_disp_barrier_epoch = work_epoch;
+}
+
+void mfb_post_barrier(VkCommandBuffer cmd, bool interrupted_pass, bool batch) {
+    static const bool full_mfb = env_on("RX_VK_MFB_FULL_BARRIER");
+    if (full_mfb || !interrupted_pass) {
+        full_barrier(cmd, batch ? "barrier (mfb batch post)" : "barrier (mfb post)");
+        return;
+    }
+    st_pass_relaxed.fetch_add(1, std::memory_order_relaxed);
+    GprofSpan gp(cmd, batch ? "barrier (mfb batch post+pass)" : "barrier (mfb post+pass)");
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+                     VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
+    last_mfb_post_cmd = cmd;
+    last_mfb_post_epoch = work_epoch;
 }
 VkCommandBuffer upload_command_buffer() {
     return upload_cmd();

@@ -5469,7 +5469,7 @@ int bda_ssbo_mode() {
         const bool intel_mesa = dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
         const char* e = getenv("RX_VK_BDA_SSBO");
         const int v = e && *e ? atoi(e) : (intel_mesa ? 1 : 0);
-        if (v) logf("vk: RX_VK_BDA_SSBO=%d (1=FS BDA->SSBO, 2=+CS loads, 3=+CS stores/atomics)", v);
+        if (v) logf("vk: RX_VK_BDA_SSBO=%d (1=FS+safe CS BDA->SSBO, 2=+CS loads, 3=+CS stores/atomics)", v);
         return v;
     }();
     return m;
@@ -5652,20 +5652,25 @@ bool transform_spirv_bda_ssbo(const uint32_t* words, size_t count, int mode, uin
     // Fast path for the 230 5-BDA-call PBR Fragment Shaders: reuse the dominating %290 relative offset into %ssbo1 so
     // NIR DCE eliminates the duplicate light_idx*96+32 multiply, c0_1[164] load, and all 5 64-bit OpIAddCarry chains.
     bool handled_fs_reuse290 = false;
-    if (em == 4u && calls.size() == 5 && u32_t && u32x4_t && ptr_sb_u32 && ptr_sb_u32x4 && c_0 && c_1 && c_2 && c_4 && c_16) {
+    const FuncInfo* entry_fn = nullptr;
+    for (const auto& f : funcs) {
+        if (entry_ids.count(f.id)) { entry_fn = &f; break; }
+    }
+    if (em == 4u && entry_fn && calls.size() == 5 && u32_t && u32x4_t && ptr_sb_u32 && ptr_sb_u32x4 && c_0 && c_1 && c_2 && c_4 && c_16) {
         auto it_ssbo1 = ssbo_vars.find("ssbo1");
         if (it_ssbo1 != ssbo_vars.end()) {
             const uint32_t ssbo1_u32 = it_ssbo1->second.count(u32_t) ? it_ssbo1->second[u32_t] : 0u;
             const uint32_t ssbo1_u32x4 = it_ssbo1->second.count(u32x4_t) ? it_ssbo1->second[u32x4_t] : 0u;
-            if (ssbo1_u32 && ssbo1_u32x4 && calls[0].rtype == u32_t && calls[1].rtype == u32x4_t &&
+            if (ssbo1_u32 && ssbo1_u32x4 && calls[0].off > entry_fn->start_off && calls[4].off < entry_fn->end_off &&
+                calls[0].rtype == u32_t && calls[1].rtype == u32x4_t &&
                 calls[2].rtype == u32x4_t && calls[3].rtype == u32x4_t && calls[4].rtype == u32x4_t) {
                 const uint32_t call0_off = calls[0].off;
                 uint32_t rel_16_id = 0, idx_16_u32_id = 0, best_off = 0;
                 for (uint32_t id = 1; id < defs.size(); id++) {
                     const Def& d = defs[id];
-                    if (d.op == 65 && d.wc == 6 && d.off < call0_off && d.off >= best_off && words[d.off + 3] == ssbo1_u32) {
+                    if (d.op == 65 && d.wc == 6 && d.off > entry_fn->start_off && d.off < call0_off && d.off >= best_off && words[d.off + 3] == ssbo1_u32) {
                         const uint32_t idx_id = words[d.off + 5];
-                        if (const Def* shr = get_def(idx_id); shr && shr->op == 194 && shr->wc == 5) {
+                        if (const Def* shr = get_def(idx_id); shr && shr->op == 194 && shr->wc == 5 && shr->off > entry_fn->start_off) {
                             idx_16_u32_id = idx_id;
                             rel_16_id = words[shr->off + 3];
                             best_off = d.off;
@@ -6957,8 +6962,8 @@ VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShad
         if (r == VK_SUCCESS && *m) journal_module_note(*m, program);
         return r;
     };
-    const uint64_t prog_key = tl_module_prog_key;
-    if (ci && ci->pCode && ci->codeSize >= 20) {
+    const uint64_t prog_key = std::exchange(tl_module_prog_key, 0);
+    if (prog_key != 0 && ci && ci->pCode && ci->codeSize >= 20) {
         const uint32_t* words = ci->pCode;
         size_t count = ci->codeSize / 4;
         const uint32_t em = spirv_exec_model(words, count);
@@ -7858,6 +7863,28 @@ struct CmdBound {
     }
 };
 TLS_OBJECT(bound, CmdBound)
+// (Intel Mesa ANV) Per-command-buffer tracker for the 3DSTATE_SBE PointSpriteTextureCoordinateEnable leak:
+// reset ONLY in draw_begin_recording() when a fresh VkCommandBuffer starts (never in bound().reset()).
+thread_local bool anv_point_coord_dirty = false;
+thread_local uint64_t anv_point_coord_prog = 0;
+inline void note_anv_point_coord(const Program& p, uint64_t prog_serial) {
+    if (dev.driver_id != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) return;
+    bool uses_pc = p.fallback && p.fallback_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    if (!uses_pc) {
+        for (const Stage& st : p.stages) {
+            if (st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT &&
+                (st.info.loads[Shader::IR::Attribute::PointSpriteS] ||
+                 st.info.loads[Shader::IR::Attribute::PointSpriteT])) {
+                uses_pc = true;
+                break;
+            }
+        }
+    }
+    if (uses_pc) {
+        anv_point_coord_dirty = true;
+        anv_point_coord_prog = prog_serial;
+    }
+}
 /// (Descriptor reuse) Whether every slot the last build resolved still holds what it did: no registration since touched a
 /// slot this draw samples, so its descriptors stand through the streaming's churn. A build that sampled an unregistered slot
 /// keeps the old check: a registration is the only thing that could make such a handle resolve, and no slot version moved.
@@ -8638,6 +8665,8 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     pending_clear() = PendingClear{};
     mfb_batch_end();
     work_since_barrier = false;
+    anv_point_coord_dirty = false;
+    anv_point_coord_prog = 0;
     bound().reset();
     descriptors_disturbed();
     static thread_local uint64_t hits_value = ~0ull;   // (resolved targets last a submission, through its parts: no CPU write is
@@ -10502,6 +10531,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     fallback_payload_address = f->payload_address;
     fallback_records_address = f->records_address;
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+    const bool interrupted_pass = pass().open;
     end_pass(cmd);
     // (RX_VK_PASS_TIMING: the fills, barriers and dispatches below as one span of their own, "fallback prog <key>", not glue
     // between the spans; its barriers are in it, not among the "barrier" spans. After end_pass, which closes the pass's span)
@@ -10509,7 +10539,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     if (gprof_on()) snprintf(label, sizeof label, "fallback prog %016llx", (unsigned long long)p.key);
     GprofSpan span(cmd, label);
     // (the shared pair: the last fallback draw on it, of any program of this thread, has read it before it is reset)
-    full_barrier(cmd);
+    mfb_pre_barrier(cmd, false);
     const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
     // (the records' header: the draw's command with no vertices and one instance, the allocator at 0, and the mesh dispatch
     // with no workgroups, its y and z 1. The records past it need nothing: the draw reaches only those taken this time; nor
@@ -10593,7 +10623,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     } else {
         if (!send(stages[0], true)) return false;
     }
-    full_barrier(cmd);   // (the records and the draw's command, which the draw reads as indirect arguments)
+    mfb_post_barrier(cmd, interrupted_pass && !Shader::Backend::SPIRV::MeshFallbackCounters(), false);   // (the records and the draw's command, which the draw reads as indirect arguments)
     fallback_warp_counters(cmd, *f);
     return true;
 }
@@ -11372,7 +11402,8 @@ bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
         }
     }
 
-    if (pass().open) {
+    const bool interrupted_pass = pass().open;
+    if (interrupted_pass) {
         end_pass(cmd);
     } else if (pending_clear().active) {
         bool untouched = true;
@@ -11386,7 +11417,7 @@ bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
     }
 
     const uint32_t ind_word = mesh_count_word();
-    full_barrier(cmd, "barrier (mfb batch pre)");
+    mfb_pre_barrier(cmd, true);
 
     {
         GprofSpan gp(cmd, "mfb batch conv+fill");
@@ -11497,7 +11528,7 @@ bool mfb_batch_flush_compute(VkCommandBuffer cmd) {
         }
     }
 
-    full_barrier(cmd, "barrier (mfb batch post)");
+    mfb_post_barrier(cmd, interrupted_pass && !Shader::Backend::SPIRV::MeshFallbackCounters(), true);
     fallback_warp_counters(cmd, *b.items[0].fb);
 
     dw().prog = nullptr;
@@ -12032,10 +12063,12 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p)) SKIP_HERE();
         cb.desc.valid = true, cb.desc.prog = &p, cb.desc.bind = s.bind_gen, cb.desc.reg = reg_gen;
         cb.desc.ub = ub_gen, cb.desc.dgen = texture_destroy_generation();
-        cb.desc.fp_on = desc_fp_on;
-        if (desc_fp_on)   // (Descriptor reuse: what its handles resolved; the next such draw may keep it through other slots' churn)
-            cb.desc.fp.swap(desc_fp()), cb.desc.fp_dummy = desc_fp_dummy, cb.desc.samp = desc_samp_seen,
-            cb.desc.destroy = desc_destroy_seen;
+        if (!same_desc) {
+            cb.desc.fp_on = desc_fp_on;
+            if (desc_fp_on)   // (Descriptor reuse: what its handles resolved; the next such draw may keep it through other slots' churn)
+                cb.desc.fp.swap(desc_fp()), cb.desc.fp_dummy = desc_fp_dummy, cb.desc.samp = desc_samp_seen,
+                cb.desc.destroy = desc_destroy_seen;
+        }
     } else {
         st_desc_reused++;
     }
@@ -12120,6 +12153,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (p.fallback) {   // (longshot: the generated vertex stage reads the records; one vertex a corner)
             occ.issue();
             vkCmdDrawIndirect(cmd, fallback_draw_records, 0, 1, sizeof(VkDrawIndirectCommand));   // (its count: the records taken)
+            note_anv_point_coord(p, s.prog.serial);
             st_mesh++;
             st_draws++, ps.draws++;
             return;
@@ -12371,7 +12405,13 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         occ.issue();
         vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);
     }
+    note_anv_point_coord(p, s.prog.serial);
     st_draws++, ps.draws++;
+}
+
+bool draw_anv_point_sbe_dirty(uint64_t prog_serial) {
+    return dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA &&
+           anv_point_coord_dirty && anv_point_coord_prog != prog_serial;
 }
 
 void draw_mfb_batched(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d, int slot) {
@@ -15259,7 +15299,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     }
     // (dispatches after other work wait for it: the WebGPU renderer's dispatches were ordered the same way by
     // wgpu's own tracking, and MKW's compute chains read what the one before wrote)
-    if (work_since_barrier) full_barrier(cmd, "barrier (dispatch)");
+    if (work_since_barrier) dispatch_barrier(cmd, indirect != 0);
     work_since_barrier = true;
     if (!p.stages.empty() && p.stages[0].info.uses_cooperative_matrix) {   // (the game's networks, once each: what they read and write)
         static std::mutex mu;
@@ -15364,6 +15404,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         } else {
             vkCmdDispatch(cmd, x, y, z);
         }
+        note_compute_dispatch(cmd);
     }
     sim_turf_sample_demand(cmd, s, p);
     route_network_drawn(s, p);

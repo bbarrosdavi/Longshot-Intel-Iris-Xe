@@ -1618,8 +1618,12 @@ uint64_t translator_stamp() {
         const uint32_t mfb_cull = 0x6d666263u;   // ("mfbc")
         add(&mfb_cull, sizeof mfb_cull);
     }
-    const uint32_t fnan_v2 = 0x666e6734u;   // ("fng4": NaN/Inf -> 0 EmitSetFragColor + GuardFragmentOutputs + fetch_bounds on)
+    const uint32_t fnan_v2 = 0x666e6736u;   // ("fng6": single 3-op NaN/Inf -> 0 +-64000 FragColor + ImageWrite NaN/Inf guard + fetch_bounds on)
     add(&fnan_v2, sizeof fnan_v2);
+    if (const char* e = getenv("RX_VK_GP_FAST32"); !e || atoi(e) != 0) {
+        const uint32_t gp32 = 0x67703335u;   // ("gp35": 32-bit page-table lookup + page_load)
+        add(&gp32, sizeof gp32);
+    }
     if (const char* e = getenv("RX_VK_LOOP_SAFETY"); e && e[0] != '0') {
         const uint32_t ls = 0x6c736166u;   // ("lsaf")
         add(&ls, sizeof ls);

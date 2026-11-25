@@ -845,6 +845,11 @@ bool system_heap_usage(uint64_t* used, uint64_t* budget) {
     uint64_t u = 0, t = 0;
     for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
         if (!(dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) u += b[h].usage, t += b[h].budget;
+    // (opt/iris-xe) Single-heap integrated GPUs (e.g. Intel Mesa ANV) mark their unified system-RAM heap DEVICE_LOCAL;
+    // fall back to all heaps when no non-DEVICE_LOCAL heap exists so imports_give_back() and Linux pressure unpin idle imports.
+    if (t == 0 && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++) u += b[h].usage, t += b[h].budget;
+    }
     *used = u, *budget = t;
     return dev.memory_budget && t != 0;
 }

@@ -261,7 +261,7 @@ PCS = [
     dict(name="Iris Xe, ANV",
          facts=(0x8086, 0x9A49, "INTEL_OPEN_SOURCE_MESA", 0, "INTEGRATED_GPU", "Mesa 26.0.1", "Mesa Intel(R) Xe Graphics (TGL GT2)", 0, 0,
                 11850, 10000, 15800, 8, 8, 4, 0, 1, 1, 0, 0, 1, 1, 32, 32, 0xFF),
-         on="acquire_ahead fetch_bounds networks_left_out gather_offset position_invariant split_before_draw dma_buf_imports "
+         on="bc_small_runs acquire_ahead fetch_bounds networks_left_out gather_offset position_invariant split_before_draw dma_buf_imports "
             "allowance_at_count_rule ub_snapshot global_table_loop small_vram_textures astc_bc_all linux_hold_caps_budget "
             "threaded_auto_render threaded_auto_recorder drop_modules_small_ram native_zstd_keep_core",
          num=(0, 0, 20000, 1, 85, 16, 2560, 2048, 768, 512, 512, -1, 256, 0, 64, 32, 90, 1, 2, 2, 4, 4, 2)),

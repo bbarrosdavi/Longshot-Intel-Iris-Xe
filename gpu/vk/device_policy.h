@@ -630,7 +630,8 @@ inline DevicePolicy device_policy(const DeviceFacts& f) {
     p.readback_late_newest = f.handheld();
     p.acquire_ahead = true;   // (every driver; not under frame generation or FIFO: vk_replay.cpp acquire_ahead_wanted)
     p.pcache_small_pc = !f.windows && f.driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && (f.ram >> 20) && (f.ram >> 20) <= 20480;
-    p.bc_small_runs = f.radv() || f.driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY || f.amd_win();
+    p.bc_small_runs = f.radv() || f.driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY || f.amd_win() ||
+                      f.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
 
     // sizes
     p.small_vram_textures = small_vram_textures(allowed, integrated, f.ram);

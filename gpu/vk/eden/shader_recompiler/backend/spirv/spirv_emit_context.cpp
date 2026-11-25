@@ -1230,8 +1230,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                            ? OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
                                                        Const(guest_pages_member_index)))
                            : Constant(U64, u64{0})};   // (pushed: the table's device address, 0 for none)
-        if (kFast32Windows && fast_page_table_32) {
-            // (opt/iris-xe) Bit-identical 32-bit window check + index arithmetic: avoids ~15 emulated 64-bit integer ops on Intel Gen12.
+        if (kFast32Windows && fast_page_table_32 && stage != Stage::Fragment) {
+            // (opt/iris-xe) Bit-identical 32-bit window check + index arithmetic on non-fragment stages:
+            // avoids ~15 emulated 64-bit integer ops on Intel Gen12 compute/mesh while keeping PBR fragment register pressure low.
             const Id addr_lo{OpUConvert(U32[1], addr)};
             const Id addr_hi{OpUConvert(U32[1], OpShiftRightLogical(U64, addr, Const(32U)))};
             const Id in_a{OpIEqual(U1, OpBitwiseAnd(U32[1], addr_hi, Const(0xfffffffeU)), Const(0x10U))};
